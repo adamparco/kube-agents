@@ -84,6 +84,8 @@ func sessionGrants(pod string) (Grants, error) {
 	g := Grants{
 		Publish: []string{
 			lib.TaskEventsSubject(pod, "*"),
+			"a2a.broker.propose.*." + pod,
+			capability.Subject("hop." + pod + ".*"),
 		},
 		Subscribe: []string{inbox},
 	}
@@ -103,6 +105,16 @@ func sessionGrants(pod string) (Grants, error) {
 			consumerAPI("DELETE", name),
 		)
 	}
+	brokerEventsConsumer := pod + "-broker-events"
+	brokerConsumerAPI := func(op string) string {
+		return fmt.Sprintf("$JS.API.CONSUMER.%s.BROKER.%s", op, brokerEventsConsumer)
+	}
+	g.Publish = append(g.Publish,
+		brokerConsumerAPI("CREATE")+".a2a.broker.events.*.*",
+		brokerConsumerAPI("INFO"),
+		brokerConsumerAPI("MSG.NEXT"),
+		brokerConsumerAPI("DELETE"),
+	)
 	// The capability path: ask, and be answered. Two subjects, and the shape
 	// of both is the mechanism rather than a convention.
 	//
@@ -122,13 +134,9 @@ func sessionGrants(pod string) (Grants, error) {
 	// publish into the gateway's inbox, where the gateway reads JetStream
 	// replies. See capability.ReplyPrefix.
 	//
-	// Deliberately NOT granted: `$KV.cap.hop.<pod>.*`, the write a broker
-	// would use to attenuate a capability before forwarding it. The rules
-	// for that write exist and are tested (capability.Minter.Attenuate), but
-	// nothing in the product calls them — there is no second hop, because
-	// the gateway's delegate flow mints the successor's root itself. A grant
-	// for a client that does not exist is a standing authorization, not
-	// documentation of a plan; it lands with the hop that needs it.
+	// `$KV.cap.hop.<pod>.*` lets the session mint attenuated capability hops
+	// in its own namespace (capability.Minter.MintHop) when proposing an
+	// action to the Action Broker.
 	//
 	// Both of these are unreachable today: validSessionName has already
 	// accepted the pod name as a dot-free DNS-1123 label, and every such

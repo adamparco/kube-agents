@@ -152,6 +152,22 @@ func coveredBy(pointer string, classified []string) bool {
 		if pointer == c || strings.HasPrefix(pointer, c+"/") {
 			return true
 		}
+		if isPodServiceAccountAlias(pointer, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPodServiceAccountAlias recognizes Kubernetes PodSpec's deprecated `serviceAccount` field,
+// which the API server automatically populates to mirror `serviceAccountName` on dry-run and apply.
+func isPodServiceAccountAlias(got, classified string) bool {
+	for _, prefix := range []string{"/spec", "/spec/template/spec", "/spec/jobTemplate/spec/template/spec"} {
+		sa := prefix + "/serviceAccount"
+		saName := prefix + "/serviceAccountName"
+		if (got == sa && classified == saName) || (got == saName && classified == sa) {
+			return true
+		}
 	}
 	return false
 }

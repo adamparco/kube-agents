@@ -38,9 +38,13 @@ func ensureApprovals(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.Appro
 	if ar.Status.Approvals != nil {
 		return
 	}
+	required := roster.EffectiveMinApprovals()
+	if ar.Spec.AttributionUnverified && !roster.SelfApprovalAllowed() && required < 2 {
+		required = 2
+	}
 	deadline := metav1.NewTime(ar.CreationTimestamp.Add(roster.EffectiveTTL()))
 	ar.Status.Approvals = &agentv1alpha1.ActionApprovals{
-		Required:  roster.EffectiveMinApprovals(),
+		Required:  required,
 		ExpiresAt: &deadline,
 	}
 }
@@ -90,6 +94,13 @@ func ApplyReject(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.ApprovalR
 		Comment:   reason,
 	})
 	ar.Status.Phase = agentv1alpha1.PhaseRejected
+}
+
+// ApplyUncontest clears ar.Status.Contested to false. Per vap-agent-scope-journal.yaml validation 4,
+// isChatOpsGateway may only CLEAR contested (variables.newContested == false) and must not touch
+// applied, verification, timestamps, or undoneBy.
+func ApplyUncontest(ar *agentv1alpha1.ActionRecord) {
+	ar.Status.Contested = false
 }
 
 // Write patches exactly the fields ApplyApprove/ApplyReject touched — approvals and phase, the

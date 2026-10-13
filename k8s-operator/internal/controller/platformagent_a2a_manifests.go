@@ -108,6 +108,7 @@ const (
 	// spelled as the provision script creates them. A KV bucket is a stream
 	// called KV_<bucket>, so the bucket name and the prefix are held apart.
 	a2aTasksStream         = "TASKS"
+	a2aBrokerStream        = "BROKER"
 	a2aTopicsStateStream   = "TOPICS-STATE"
 	a2aTopicsJournalStream = "TOPICS-JOURNAL"
 	a2aRuntimeStateBucket  = "runtime-state"
@@ -1345,6 +1346,45 @@ func a2aVerifierNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-verifier-netpol"
 }
 
+const a2aBrokerServiceAccountAnnotation = "kubeagents.x-k8s.io/broker-service-account"
+
+func a2aBrokerName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-broker"
+}
+
+func a2aBrokerServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	if agent != nil && agent.Annotations != nil {
+		if sa := strings.TrimSpace(agent.Annotations[a2aBrokerServiceAccountAnnotation]); sa != "" {
+			return sa
+		}
+	}
+	if sa := strings.TrimSpace(os.Getenv("A2A_BROKER_SERVICE_ACCOUNT")); sa != "" {
+		return sa
+	}
+	return a2aBrokerName(agent)
+}
+
+func (r *PlatformAgentReconciler) resolveA2ABrokerServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
+	if agent == nil || r == nil || r.Client == nil {
+		return agent
+	}
+	if agent.Annotations != nil && strings.TrimSpace(agent.Annotations[a2aBrokerServiceAccountAnnotation]) != "" {
+		return agent
+	}
+	var dep appsv1.Deployment
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-broker"}, &dep); err == nil {
+		if sa := strings.TrimSpace(dep.Spec.Template.Spec.ServiceAccountName); sa != "" {
+			cp := agent.DeepCopy()
+			if cp.Annotations == nil {
+				cp.Annotations = make(map[string]string, 1)
+			}
+			cp.Annotations[a2aBrokerServiceAccountAnnotation] = sa
+			return cp
+		}
+	}
+	return agent
+}
+
 // a2aCredsSecretName is the Secret holding the static users' passwords.
 func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
 	return agentv1alpha1.A2ACredsSecretName(agent.Name)
@@ -1442,7 +1482,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // to hit now; seed keeps the scoped grant because the hand-applied seed tooling
 // still connects with it. Nothing yet binds that third spelling to this list.
 var a2aProvisionedStreams = []string{
-	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
+	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "BROKER",
 	"KV_runtime-state", "KV_session-state", "KV_cap",
 }
 
@@ -1624,6 +1664,10 @@ func a2aBridgeJetStreamGrants() []string {
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
+		"$JS.API.STREAM.INFO." + a2aBrokerStream,
+		"$JS.API.CONSUMER.CREATE." + a2aBrokerStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aBrokerStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aBrokerStream + ".>",
 		"$JS.API.STREAM.INFO." + kvRuntimeState,
 		"$JS.API.CONSUMER.CREATE." + kvRuntimeState + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvRuntimeState + ".*",
@@ -1652,6 +1696,17 @@ func a2aAgentJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".>",
 		"$JS.API.STREAM.INFO." + a2aTopicsJournalStream,
 		"$JS.API.DIRECT.GET." + a2aTopicsJournalStream + ".>",
+	}
+}
+
+// a2aBrokerJetStreamGrants is the Action Broker's publish allow-list for the
+// JetStream API on the BROKER stream.
+func a2aBrokerJetStreamGrants() []string {
+	return []string{
+		"$JS.API.STREAM.INFO." + a2aBrokerStream,
+		"$JS.API.CONSUMER.CREATE." + a2aBrokerStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aBrokerStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aBrokerStream + ".>",
 	}
 }
 
@@ -1787,6 +1842,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
+		"$JS.API.STREAM.INFO." + a2aBrokerStream,
+		"$JS.API.CONSUMER.CREATE." + a2aBrokerStream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aBrokerStream + ".*",
+		"$JS.API.DIRECT.GET." + a2aBrokerStream + ".>",
 		"$JS.API.STREAM.INFO." + kvSessionState,
 		"$JS.API.DIRECT.GET." + kvSessionState + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>",
@@ -2510,6 +2569,10 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"app": a2aVerifierName(agent),
 					}}},
+					// The Action Broker.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aBrokerName(agent),
+					}}},
 					// Session pods, by the spawner's labels (see
 					// a2aSessionComponent above).
 					{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}},
@@ -2822,6 +2885,12 @@ $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE 
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
   --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
+
+# BROKER: a2a.broker.>, 72h window, 1GiB cap, 256 msgs/subject.
+$NATS stream info BROKER >/dev/null 2>&1 || $NATS stream add BROKER --allow-direct \
+  --subjects='a2a.broker.>' --storage=file --retention=limits \
+  --max-age=72h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-msgs-per-subject=256 --max-consumers=64 --defaults
 
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
@@ -4822,7 +4891,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
 	// has a callout with nothing to say.
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent)
+	authMapAgent := r.resolveA2ABrokerServiceAccount(ctx, agent)
+	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(authMapAgent)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}

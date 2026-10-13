@@ -125,20 +125,18 @@ func (p *Pipeline) Resume(ctx context.Context, ar *agentv1alpha1.ActionRecord) (
 			s.brakeEffect))
 	}
 
-	// stepUndoPlan's buildRecord path is for a record that does not exist yet; this one already
-	// does. Persist the fresh snapshot and plan onto it directly instead — Create would be a no-op
-	// against an existing name (journal.Store.Create's AlreadyExists branch), silently discarding
-	// exactly the re-snapshot 06 §4.4 requires.
+	// ActionRecord.spec is immutable after creation (CEL self == oldSelf, 06 §4.3), so we
+	// update the in-memory record with the freshly captured pre-state and undo plan rather
+	// than issuing a spec patch that the API server would reject.
 	freshRecord := p.buildRecord(s)
-	if err := p.cfg.Records.UpdateForResume(ctx, ar, freshRecord.Spec.PreState, freshRecord.Spec.Undo); err != nil {
-		return nil, fmt.Errorf("pipeline: resume: %s: %w", ar.Name, err)
-	}
+	ar.Spec.PreState = freshRecord.Spec.PreState
+	ar.Spec.Undo = freshRecord.Spec.Undo
 	s.record = ar
 
 	if err := tr.Skip(broker.StepGate, "resumed: already approved, see status.approvals"); err != nil {
 		return nil, err
 	}
-	if err := tr.Skip(broker.StepSnapshot, "resumed: pre-state and undo plan already persisted via UpdateForResume"); err != nil {
+	if err := tr.Skip(broker.StepSnapshot, "resumed: pre-state and undo plan refreshed for execution"); err != nil {
 		return nil, err
 	}
 
@@ -149,6 +147,7 @@ func (p *Pipeline) Resume(ctx context.Context, ar *agentv1alpha1.ActionRecord) (
 	for _, step := range []func(context.Context, *state) (*broker.Result, error){p.stepExecute, p.stepVerify, p.stepJournal} {
 		res, err := step(ctx, s)
 		if err != nil {
+			_ = p.cfg.Records.SetPhase(ctx, s.record, agentv1alpha1.PhaseFailed, err.Error())
 			return nil, err
 		}
 		if res != nil {

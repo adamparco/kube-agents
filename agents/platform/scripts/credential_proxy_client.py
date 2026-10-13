@@ -822,8 +822,18 @@ def execute(
                 file=sys.stderr,
             )
             print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+            escalation = payload.get("escalation")
+            if isinstance(escalation, dict):
+                cli_hint = escalation.get("cliHint")
+                if cli_hint:
+                    print(f"Hint: {cli_hint}", file=sys.stderr)
             return EXIT_SECURITY_POLICY_BLOCKED
         print(payload.get("error", str(exc)), file=sys.stderr)
+        escalation = payload.get("escalation")
+        if isinstance(escalation, dict):
+            cli_hint = escalation.get("cliHint")
+            if cli_hint:
+                print(f"Hint: {cli_hint}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)

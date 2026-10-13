@@ -43,7 +43,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	brokerv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	brokercontroller "github.com/gke-labs/kube-agents/k8s-operator/internal/broker/controller"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	agentwebhook "github.com/gke-labs/kube-agents/k8s-operator/internal/webhook"
 	// +kubebuilder:scaffold:imports
@@ -58,6 +60,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(agentv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(brokerv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -313,6 +316,23 @@ func main() {
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "platformagent")
+		os.Exit(1)
+	}
+	journalRec := &brokercontroller.JournalReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}
+	if err := journalRec.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "journal")
+		os.Exit(1)
+	}
+	brakeRec := &brokercontroller.BrakeReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("brake-controller"),
+	}
+	if err := brakeRec.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "brake")
 		os.Exit(1)
 	}
 	// status.usage's counters, read from the agent pods' metrics listeners on

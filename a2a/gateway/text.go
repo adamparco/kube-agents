@@ -337,3 +337,122 @@ func truncateRunes(s string, n int) string {
 func marshalMessage(m lib.Message) ([]byte, error) {
 	return json.Marshal(m)
 }
+
+// ApprovalVerb enumerates the deterministic zero-inference ChatOps verbs.
+type ApprovalVerb string
+
+const (
+	ApprovalVerbApprove   ApprovalVerb = "approve"
+	ApprovalVerbReject    ApprovalVerb = "reject"
+	ApprovalVerbUndo      ApprovalVerb = "undo"
+	ApprovalVerbUncontest ApprovalVerb = "uncontest"
+)
+
+// ApprovalCommand is a parsed zero-inference ChatOps command intercepted at the gateway edge.
+type ApprovalCommand struct {
+	Verb      ApprovalVerb
+	ActionID  string
+	Namespace string
+	Reason    string
+}
+
+// CanonicalText formats the command in the canonical "<verb> <action-id> [reason]" form
+// consumed by k8s-operator/internal/broker/approval.ParseCommand.
+func (c ApprovalCommand) CanonicalText() string {
+	if c.Reason != "" {
+		return fmt.Sprintf("%s %s %s", c.Verb, c.ActionID, c.Reason)
+	}
+	return fmt.Sprintf("%s %s", c.Verb, c.ActionID)
+}
+
+func splitActionTarget(raw string) (actionID, namespace string) {
+	if id, ns, ok := strings.Cut(raw, "/"); ok {
+		return id, ns
+	}
+	return raw, ""
+}
+
+// ParseApprovalCommand inspects inbound chat text for a deterministic ChatOps command.
+// When matched is true, handleInbound MUST NOT route the message to an LLM session.
+func ParseApprovalCommand(raw string) (*ApprovalCommand, bool, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, false, nil
+	}
+	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+		s = strings.TrimSpace(s[:idx])
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return nil, false, nil
+	}
+
+	// Strip a leading @mention token (e.g. "<@U12345> /approve ..." or "@kage /approve ...")
+	// if the second token is a recognized command trigger.
+	if len(fields) >= 2 && (strings.HasPrefix(fields[0], "<@") || strings.HasPrefix(fields[0], "@")) {
+		if isApprovalTrigger(fields[1]) {
+			fields = fields[1:]
+		}
+	}
+
+	first := fields[0]
+	if !isApprovalTrigger(first) {
+		return nil, false, nil
+	}
+
+	var verbStr string
+	var rest []string
+	if first == "/kage" || first == "kage" {
+		if len(fields) < 2 {
+			return nil, true, fmt.Errorf("usage: /approve <action-id>, /reject <action-id> [reason], /undo <action-id> [reason], or /uncontest <action-id>")
+		}
+		verbStr = strings.TrimPrefix(fields[1], "/")
+		rest = fields[2:]
+	} else {
+		verbStr = strings.TrimPrefix(first, "/")
+		rest = fields[1:]
+	}
+
+	verb := ApprovalVerb(verbStr)
+	switch verb {
+	case ApprovalVerbApprove, ApprovalVerbUncontest:
+		if len(rest) == 0 {
+			return nil, true, fmt.Errorf("approval: missing <action-id>; want \"/%s <action-id>\"", verb)
+		}
+		if len(rest) > 1 {
+			return nil, true, fmt.Errorf("approval: %s takes no reason; got %q", verb, raw)
+		}
+		actionID, ns := splitActionTarget(rest[0])
+		if actionID == "" {
+			return nil, true, fmt.Errorf("approval: missing <action-id>; want \"/%s <action-id>\"", verb)
+		}
+		return &ApprovalCommand{Verb: verb, ActionID: actionID, Namespace: ns}, true, nil
+
+	case ApprovalVerbReject, ApprovalVerbUndo:
+		if len(rest) == 0 {
+			return nil, true, fmt.Errorf("approval: missing <action-id>; want \"/%s <action-id> [reason]\"", verb)
+		}
+		actionID, ns := splitActionTarget(rest[0])
+		if actionID == "" {
+			return nil, true, fmt.Errorf("approval: missing <action-id>; want \"/%s <action-id> [reason]\"", verb)
+		}
+		return &ApprovalCommand{
+			Verb:      verb,
+			ActionID:  actionID,
+			Namespace: ns,
+			Reason:    strings.Join(rest[1:], " "),
+		}, true, nil
+
+	default:
+		return nil, true, fmt.Errorf("approval: unrecognized verb %q; want \"approve\", \"reject\", \"undo\", or \"uncontest\"", verbStr)
+	}
+}
+
+func isApprovalTrigger(token string) bool {
+	switch token {
+	case "/approve", "/reject", "/undo", "/uncontest", "/kage", "kage":
+		return true
+	default:
+		return false
+	}
+}

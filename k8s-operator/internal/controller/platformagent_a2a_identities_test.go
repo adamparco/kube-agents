@@ -242,7 +242,7 @@ func TestEveryCalloutPrincipalHasAClientThatCanPresentAToken(t *testing.T) {
 	// Deployment, through a2aBusTokenVolumeSource again — asserted directly
 	// rather than only promised, in
 	// TestTheVerifierDeploymentPresentsTheTokenItsGrantsAreKeyedOn.
-	want := []string{"provision", "session", a2aAgentBusUser, "verifier"}
+	want := []string{"provision", "session", a2aAgentBusUser, "verifier", a2aBrokerUser}
 	if !slices.Equal(got, want) {
 		t.Errorf("callout principals = %v, want %v.\nA new callout principal needs a rendered workload that mounts an a2a-bus token for its ServiceAccount (a2aBusTokenVolumeSource / a2aBusTokenVolumeMount). Without one the entry authorizes nobody and misreports who authenticates.", got, want)
 	}

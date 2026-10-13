@@ -105,3 +105,57 @@ func TestRenderMessageNeverIncludesRationale(t *testing.T) {
 		t.Error("rendered message must not include spec.rationale")
 	}
 }
+
+func TestRenderMessageEnforcesAttributionUnverifiedFloor(t *testing.T) {
+	roster := testRoster("r", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Spec.AttributionUnverified = true
+
+	m := approval.RenderMessage(ar, roster)
+	if m.Required != 2 {
+		t.Errorf("required = %d, want 2 when AttributionUnverified=true and allowSelfApproval=false", m.Required)
+	}
+}
+
+func TestRenderMessageTerminalPhasesAndContestedHint(t *testing.T) {
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Phase = agentv1alpha1.PhaseVerified
+	ar.Spec.Undo = &agentv1alpha1.UndoPlan{
+		Strategy: agentv1alpha1.UndoRestore,
+		Steps:    []agentv1alpha1.UndoStep{{Op: "apply"}},
+	}
+	ar.Status.Report = &agentv1alpha1.ActionReport{
+		Noticed:  "high latency",
+		Did:      "scaled web to 4",
+		Verified: "4/4 ready",
+		Undo:     "/undo ar-01arz3ndektsv4rrffq69g5fav",
+	}
+
+	m := approval.RenderMessage(ar, nil)
+	if m.Resolution != "verified" {
+		t.Fatalf("resolution = %q, want verified", m.Resolution)
+	}
+	text := m.Text()
+	for _, want := range []string{
+		"Noticed: high latency",
+		"Did: scaled web to 4",
+		"Verified: 4/4 ready",
+		"Reply: /undo " + m.RecordName + " <reason> to reverse this change",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Text() missing %q in:\n%s", want, text)
+		}
+	}
+
+	ar.Status.Phase = agentv1alpha1.PhaseUndone
+	ar.Status.Contested = true
+	ar.Status.UndoneBy = "01ARZ3NDEKTSV4RRFFQ69G5FB0"
+	mUndone := approval.RenderMessage(ar, nil)
+	if mUndone.Resolution != "undone" {
+		t.Fatalf("resolution = %q, want undone", mUndone.Resolution)
+	}
+	undoneText := mUndone.Text()
+	if !strings.Contains(undoneText, "Resource is CONTESTED (mutations frozen). Reply: /uncontest "+m.RecordName+" to clear") {
+		t.Errorf("undone Text() missing contested hint:\n%s", undoneText)
+	}
+}

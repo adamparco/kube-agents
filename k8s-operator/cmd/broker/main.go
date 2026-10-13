@@ -210,21 +210,52 @@ func run(ctx context.Context, o options) error {
 	// would be a second answer to "which namespace do records live in".
 	records := journal.NewStore(k8s, nil)
 
-	// Steps 3-11. See wiring.go for the assembly and for what is deliberately left nil.
-	pipeCfg, sources, err := pipelineConfig(ctx, brokerDeps{
+	deps := brokerDeps{
 		RESTConfig:          cfg,
 		Client:              k8s,
 		Records:             records,
 		AgentName:           o.agentName,
 		Namespace:           o.namespace,
 		ActorServiceAccount: brokerServiceAccount(),
-	})
+	}
+
+	// Steps 3-11. See wiring.go for the assembly and for what is deliberately left nil.
+	rt, err := buildBrokerRuntime(ctx, deps)
 	if err != nil {
 		return err
 	}
-	pipe, err := pipeline.New(pipeCfg)
+	pipe, err := pipeline.New(rt.Config)
 	if err != nil {
 		return err
+	}
+
+	// Before the listener opens. A broker that is accepting submissions while its brake has never
+	// been read is a broker whose first few actions were decided by a source that had nothing in
+	// it -- and startSources exits non-zero rather than degrading, for the reasons stated there.
+	if err := startSources(ctx, rt.Sources); err != nil {
+		return err
+	}
+	if err := syncContestedIndex(ctx, k8s, o.namespace, rt.Contested); err != nil {
+		return fmt.Errorf("startup contested index sync: %w", err)
+	}
+
+	guard := broker.NewReplayGuard(time.Now)
+	rejectionJournal := &broker.StoreRejectionJournal{
+		Store:               records,
+		Namespace:           o.namespace,
+		AgentName:           o.agentName,
+		ActorServiceAccount: brokerServiceAccount(),
+	}
+
+	natsAdapter, stopNATS, err := startNATSAdapter(ctx, deps, o.readerSA, tier, o.scope, pipe, guard, rejectionJournal)
+	if err != nil {
+		return err
+	}
+	defer stopNATS()
+
+	var eventPub pipeline.EventPublisher
+	if natsAdapter != nil {
+		eventPub = natsAdapter
 	}
 
 	// The resumption loop (chat-approval.md §3-4): a poll, not a controller-runtime manager. That
@@ -233,14 +264,7 @@ func run(ctx context.Context, o options) error {
 	// flag to turn them off. A plain List on the direct client this file already builds needs no
 	// second port and no watch cache, and the resumption loop's own latency budget (it is racing an
 	// approval TTL measured in hours) has no use for a watch's sub-second wakeup anyway.
-	go runResumeLoop(ctx, k8s, pipe, records, o.namespace)
-
-	// Before the listener opens. A broker that is accepting submissions while its brake has never
-	// been read is a broker whose first few actions were decided by a source that had nothing in
-	// it -- and startSources exits non-zero rather than degrading, for the reasons stated there.
-	if err := startSources(ctx, sources); err != nil {
-		return err
-	}
+	go runResumeLoop(ctx, k8s, pipe, records, o.namespace, rt.Contested, eventPub)
 
 	server, err := broker.NewServer(broker.Config{
 		Authenticator: &broker.Authenticator{
@@ -255,18 +279,13 @@ func run(ctx context.Context, o options) error {
 			TrustDomain: o.trustDomain,
 			Security:    security,
 		},
-		Guard: broker.NewReplayGuard(time.Now),
+		Guard: guard,
 		// The real pipeline, not broker.UnavailablePipeline. Until P9-T7c-3d-iv-b this line held the
 		// 503 stub, and every envelope that survived auth, the schema, the key recomputation and the
 		// three anti-replay mechanisms was refused by a broker whose steps 3-11 existed only in their
 		// own tests -- LSN-007 exactly. V-BRK-027 is the assertion that keeps it wired.
 		Pipeline: pipe,
-		Journal: &broker.StoreRejectionJournal{
-			Store:               records,
-			Namespace:           o.namespace,
-			AgentName:           o.agentName,
-			ActorServiceAccount: brokerServiceAccount(),
-		},
+		Journal:  rejectionJournal,
 		// 06 §4.4 row 3's auto-pause. The same recorder type the verify driver uses for row 9
 		// (wiring.go), constructed here rather than threaded out of the pipeline because it is
 		// stateless and a shared instance would only create the appearance of shared state between

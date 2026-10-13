@@ -1,18 +1,23 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -197,6 +202,17 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// taskCanonicalRequesters caches taskID -> canonical <platform>:<id>
+	// principal so delegated child turns inherit the human requester on
+	// their root capability entry.
+	taskCanonicalRequesters map[string]string
+	// approvalHandler optionally dispatches zero-inference ChatOps approval
+	// commands (/approve, /reject, /undo, /uncontest) to chatops-gateway.
+	approvalHandler ApprovalHandler
+	// chatOpsGatewayURL is the optional HTTP endpoint of chatops-gateway
+	// (CHATOPS_GATEWAY_URL, e.g. http://kube-agents-chatops-gateway.kubeagents-system.svc.cluster.local:8443)
+	// that executes ActionRecord/status patches as isChatOpsGateway.
+	chatOpsGatewayURL string
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -219,6 +235,11 @@ type Options struct {
 	// (the live tests) must bind its own durable or the two starve each
 	// other probabilistically. The deployed binary never sets this.
 	RelayDurable string
+	// ApprovalHandler optionally handles zero-inference ChatOps approval commands.
+	ApprovalHandler ApprovalHandler
+	// ChatOpsGatewayURL optionally sets the HTTP endpoint for forwarding
+	// zero-inference approval commands to chatops-gateway (overrides CHATOPS_GATEWAY_URL).
+	ChatOpsGatewayURL string
 }
 
 // New assembles a gateway.
@@ -373,31 +394,41 @@ func New(o Options) (*Gateway, error) {
 	if err := o.Config.validateCapabilityCeiling(); err != nil {
 		return nil, err
 	}
+	chatOpsURL := strings.TrimSpace(o.ChatOpsGatewayURL)
+	if chatOpsURL == "" {
+		chatOpsURL = strings.TrimSpace(os.Getenv("CHATOPS_GATEWAY_URL"))
+	}
+	if chatOpsURL == "" && o.Spawner == nil && o.Config.SpawnSessions && os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		chatOpsURL = "http://kube-agents-chatops-gateway.kubeagents-system.svc.cluster.local:8443"
+	}
 	g := &Gateway{
-		turnBudget:     turnTimeout,
-		cfg:            o.Config,
-		client:         o.Client,
-		reg:            NewRegistry(o.Client),
-		adapter:        o.Adapter,
-		pm:             pm,
-		ps:             ps,
-		log:            log,
-		runCtx:         context.Background(),
-		sessionLocks:   map[string]*sessionLockEntry{},
-		taskSessions:   map[string]string{},
-		relays:         map[string]*relayState{},
-		backend:        backend,
-		injectPM:       injectPM,
-		injectAudience: injectAudience,
-		a2aPM:          a2aPM,
-		a2aAudience:    a2aAudience,
-		gchatAllowed:   gchatAllowed,
-		gchatAllowAll:  o.Config.GchatAllowAllUsers,
-		targetAllowed:  targetAllowed,
-		slackAllowed:   slackAllowed,
-		slackAllowAll:  o.Config.SlackAllowAllUsers,
-		droppedNotices: map[string]bool{},
-		relayDurable:   o.RelayDurable,
+		turnBudget:              turnTimeout,
+		cfg:                     o.Config,
+		client:                  o.Client,
+		reg:                     NewRegistry(o.Client),
+		adapter:                 o.Adapter,
+		pm:                      pm,
+		ps:                      ps,
+		log:                     log,
+		runCtx:                  context.Background(),
+		sessionLocks:            map[string]*sessionLockEntry{},
+		taskSessions:            map[string]string{},
+		taskCanonicalRequesters: map[string]string{},
+		relays:                  map[string]*relayState{},
+		backend:                 backend,
+		injectPM:                injectPM,
+		injectAudience:          injectAudience,
+		a2aPM:                   a2aPM,
+		a2aAudience:             a2aAudience,
+		gchatAllowed:            gchatAllowed,
+		gchatAllowAll:           o.Config.GchatAllowAllUsers,
+		targetAllowed:           targetAllowed,
+		slackAllowed:            slackAllowed,
+		slackAllowAll:           o.Config.SlackAllowAllUsers,
+		droppedNotices:          map[string]bool{},
+		relayDurable:            o.RelayDurable,
+		approvalHandler:         o.ApprovalHandler,
+		chatOpsGatewayURL:       chatOpsURL,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -563,6 +594,22 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 
 	backend, principal, ok := g.verifySender(msg)
 	if !ok {
+		return
+	}
+
+	// Zero-inference ChatOps approval command interception: runs strictly
+	// BEFORE acquiring the per-conversation session lock or creating/updating
+	// any SessionRecord in KV_session-state, so an operator can /approve,
+	// /reject, /undo, or /uncontest while a conversation turn is active or in
+	// a notification thread with no agent session.
+	if cmd, matched, parseErr := ParseApprovalCommand(msg.Text); matched {
+		if parseErr != nil {
+			g.post(msg.Conversation, parseErr.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
+		defer cancel()
+		g.handleApprovalCommand(ctx, msg, backend, principal, cmd)
 		return
 	}
 
@@ -1924,16 +1971,26 @@ type taskStart struct {
 	// stored record holds the child without its parent's link (observedAs
 	// and chainLast read the link). Set for a child only.
 	LinkParent bool
+	// CanonicalRequester is the canonical <platform>:<immutable-sender-id>
+	// string written to $KV.cap.root.<taskId>.Requester so the Broker can
+	// evaluate SelfApprovalMode and requester attribution.
+	CanonicalRequester string
 }
 
 // startTask opens a turn for a human message.
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) {
+	in := msg
+	if in.Backend == "" {
+		in.Backend = backend
+	}
+	canonicalRequester, _ := CanonicalRosterPrincipal(in)
 	g.startTaskWith(ctx, rec, taskStart{
-		Text:      msg.Text,
-		MessageID: msg.MessageID,
-		Principal: principal,
-		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
-		Authority: authority,
+		Text:               msg.Text,
+		MessageID:          msg.MessageID,
+		Principal:          principal,
+		Requester:          TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
+		Authority:          authority,
+		CanonicalRequester: canonicalRequester,
 	})
 }
 
@@ -1962,6 +2019,19 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"conversation", rec.Key,
 		"addressee", rec.Addressee)
 
+	canonicalRequester := ts.CanonicalRequester
+	g.mu.Lock()
+	if canonicalRequester == "" && ts.RootTaskID != "" {
+		canonicalRequester = g.taskCanonicalRequesters[ts.RootTaskID]
+	}
+	if canonicalRequester == "" && ts.ParentTaskID != "" {
+		canonicalRequester = g.taskCanonicalRequesters[ts.ParentTaskID]
+	}
+	if canonicalRequester != "" {
+		g.taskCanonicalRequesters[taskID] = canonicalRequester
+	}
+	g.mu.Unlock()
+
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
 	// the entry can name the principal that will serve the request before
@@ -1971,7 +2041,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A mint that fails refuses the turn. The alternative is a submission
 	// with no capability, which the executor refuses anyway, one round trip
 	// and a pod later, with the reason in a different component's log.
-	capRef, err := g.mintCapability(ctx, taskID, rec.Addressee)
+	capRef, err := g.mintTaskCapability(ctx, taskID, rec.Addressee, canonicalRequester)
 	if err != nil {
 		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
 		if !g.cfg.CapabilityOptional {
@@ -2375,4 +2445,280 @@ func randHex(n int) string {
 		panic(fmt.Sprintf("crypto/rand: %v", err)) // process entropy failure; nothing sane to do
 	}
 	return hex.EncodeToString(b)
+}
+
+// ActionApprovalMessage is the zero-inference ChatOps approval payload minted
+// by the gateway and dispatched on a2a.broker.approve.<namespace>.<actionId>.
+type ActionApprovalMessage struct {
+	CapabilityRef       *capability.Ref `json:"capabilityRef,omitempty"`
+	Capability          *capability.Ref `json:"capability,omitempty"`
+	Command             ApprovalVerb    `json:"command"`
+	ActionID            string          `json:"actionId"`
+	RecordName          string          `json:"recordName,omitempty"`
+	Namespace           string          `json:"namespace,omitempty"`
+	DecisionID          string          `json:"decisionId,omitempty"`
+	Principal           string          `json:"principal,omitempty"`
+	ApproverPrincipal   string          `json:"approverPrincipal"`
+	ApproverDisplayName string          `json:"approverDisplayName,omitempty"`
+	Platform            string          `json:"platform"`
+	EventID             string          `json:"eventId"`
+	Conversation        string          `json:"conversation,omitempty"`
+	Approved            bool            `json:"approved,omitempty"`
+	Reason              string          `json:"reason,omitempty"`
+}
+
+// ActionApprovalReply is the synchronous response returned by an in-process
+// ApprovalHandler or a NATS request/reply handler on a2a.broker.approve.>.
+type ActionApprovalReply struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+// ApprovalHandler handles a parsed, sender-verified ChatOps approval command.
+type ApprovalHandler func(ctx context.Context, msg ActionApprovalMessage) (string, error)
+
+// SetApprovalHandler registers or replaces the gateway's ApprovalHandler.
+func (g *Gateway) SetApprovalHandler(h ApprovalHandler) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.approvalHandler = h
+}
+
+// SetChatOpsGatewayURL configures the HTTP URL of chatops-gateway (/v1alpha1/commands).
+func (g *Gateway) SetChatOpsGatewayURL(url string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.chatOpsGatewayURL = strings.TrimSpace(url)
+}
+
+// BrokerApproveSubject returns the NATS subject for an approval command targeting
+// namespace and actionID ("a2a.broker.approve.<namespace>.<actionId>").
+func BrokerApproveSubject(namespace, actionID string) string {
+	ns := strings.TrimSpace(namespace)
+	if ns == "" {
+		ns = "default"
+	}
+	return fmt.Sprintf("a2a.broker.approve.%s.%s", ns, actionID)
+}
+
+type chatOpsCommandRequest struct {
+	Platform  string `json:"platform,omitempty"`
+	SenderID  string `json:"senderId,omitempty"`
+	Principal string `json:"principal,omitempty"`
+	EventID   string `json:"eventId,omitempty"`
+	ChannelID string `json:"channelId,omitempty"`
+	ThreadID  string `json:"threadId,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Command   string `json:"command,omitempty"`
+	ActionID  string `json:"actionId,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	Namespace     string `json:"namespace,omitempty"`
+	CapabilityRef string `json:"capabilityRef,omitempty"`
+}
+
+type chatOpsCommandResponse struct {
+	OK         bool   `json:"ok"`
+	Reply      string `json:"reply"`
+	DecisionID string `json:"decisionId,omitempty"`
+}
+
+func resolveChatOpsCommandsEndpoint(raw string) string {
+	u := strings.TrimSpace(raw)
+	u = strings.TrimRight(u, "/")
+	if strings.HasSuffix(u, "/v1alpha1/commands") {
+		return u
+	}
+	return u + "/v1alpha1/commands"
+}
+
+func forwardToChatOpsGateway(ctx context.Context, baseURL string, wireMsg ActionApprovalMessage, senderID, canonicalText string) (chatOpsCommandResponse, error) {
+	endpoint := resolveChatOpsCommandsEndpoint(baseURL)
+	var capRefStr string
+	if wireMsg.CapabilityRef != nil && wireMsg.CapabilityRef.Key != "" {
+		capRefStr = fmt.Sprintf("%s@%d", wireMsg.CapabilityRef.Key, wireMsg.CapabilityRef.Revision)
+	}
+	reqPayload := chatOpsCommandRequest{
+		Platform:      wireMsg.Platform,
+		SenderID:      senderID,
+		Principal:     wireMsg.ApproverPrincipal,
+		EventID:       wireMsg.EventID,
+		ChannelID:     wireMsg.Conversation,
+		ThreadID:      wireMsg.Conversation,
+		Text:          canonicalText,
+		Command:       string(wireMsg.Command),
+		ActionID:      wireMsg.ActionID,
+		Reason:        wireMsg.Reason,
+		Namespace:     wireMsg.Namespace,
+		CapabilityRef: capRefStr,
+	}
+	body, err := json.Marshal(reqPayload)
+	if err != nil {
+		return chatOpsCommandResponse{}, fmt.Errorf("marshal chatops command request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return chatOpsCommandResponse{}, fmt.Errorf("build chatops command request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return chatOpsCommandResponse{}, fmt.Errorf("post chatops command to %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return chatOpsCommandResponse{}, fmt.Errorf("read chatops command response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return chatOpsCommandResponse{}, fmt.Errorf("chatops gateway returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+	var parsed chatOpsCommandResponse
+	if err := json.Unmarshal(respBytes, &parsed); err != nil {
+		return chatOpsCommandResponse{}, fmt.Errorf("decode chatops command response: %w", err)
+	}
+	return parsed, nil
+}
+
+// mintTaskCapability writes a task's root capability at $KV.cap.root.<taskId>,
+// including the canonical <platform>:<id> requester principal.
+func (g *Gateway) mintTaskCapability(ctx context.Context, taskID, delegate, requester string) (*capability.Ref, error) {
+	ref, err := capability.NewMinter(g.client.JetStream()).Mint(ctx, taskID, capability.Entry{
+		Tier:      g.cfg.AuthorityTier,
+		Scope:     g.cfg.AuthorityScope,
+		Delegate:  delegate,
+		Requester: requester,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
+// handleApprovalCommand executes a parsed ChatOps approval command (/approve,
+// /reject, /undo, /uncontest) without touching KV_session-state or dispatching
+// any task to an LLM worker.
+func (g *Gateway) handleApprovalCommand(ctx context.Context, msg InboundMessage, backend, principal string, cmd *ApprovalCommand) {
+	in := msg
+	if in.Backend == "" {
+		in.Backend = backend
+	}
+	canonicalPrincipal, err := CanonicalRosterPrincipal(in)
+	if err != nil {
+		g.post(msg.Conversation, fmt.Sprintf("⚠️ approval command refused: %v", err))
+		return
+	}
+
+	ns := cmd.Namespace
+	if ns == "" && g.cfg != nil {
+		ns = strings.TrimSpace(g.cfg.Namespace)
+	}
+	if ns == "" {
+		ns = "default"
+	}
+
+	var appRef *capability.Ref
+	if g.client != nil {
+		requestID := "approve-" + cmd.ActionID + "-" + randHex(taskIDHexWidth)
+		ref, mintErr := capability.NewMinter(g.client.JetStream()).Mint(ctx, requestID, capability.Entry{
+			Tier:      g.cfg.AuthorityTier,
+			Scope:     g.cfg.AuthorityScope,
+			Delegate:  "broker",
+			Requester: canonicalPrincipal,
+		})
+		if mintErr != nil {
+			g.log.Error("approval capability mint failed", "actionId", cmd.ActionID, "err", mintErr)
+			if g.cfg == nil || !g.cfg.CapabilityOptional {
+				g.post(msg.Conversation, "⚠️ approval command failed: could not mint capability")
+				return
+			}
+		} else {
+			appRef = &ref
+		}
+	}
+
+	platform, senderID, _ := strings.Cut(canonicalPrincipal, ":")
+	eventID := in.EventID()
+	if eventID == "" {
+		if msg.MessageID != "" {
+			eventID = platform + ":" + msg.MessageID
+		} else {
+			eventID = platform + ":" + cmd.ActionID
+		}
+	}
+
+	wireMsg := ActionApprovalMessage{
+		CapabilityRef:       appRef,
+		Capability:          appRef,
+		Command:             cmd.Verb,
+		ActionID:            cmd.ActionID,
+		RecordName:          cmd.ActionID,
+		Namespace:           ns,
+		DecisionID:          eventID,
+		Principal:           canonicalPrincipal,
+		ApproverPrincipal:   canonicalPrincipal,
+		ApproverDisplayName: principal,
+		Platform:            platform,
+		EventID:             eventID,
+		Conversation:        msg.Conversation,
+		Approved:            cmd.Verb == ApprovalVerbApprove,
+		Reason:              cmd.Reason,
+	}
+
+	g.mu.Lock()
+	handler := g.approvalHandler
+	chatOpsURL := g.chatOpsGatewayURL
+	g.mu.Unlock()
+
+	if handler != nil {
+		reply, hErr := handler(ctx, wireMsg)
+		if hErr != nil {
+			g.post(msg.Conversation, fmt.Sprintf("⚠️ %s `%s` failed: %v", cmd.Verb, cmd.ActionID, hErr))
+			return
+		}
+		if strings.TrimSpace(reply) != "" {
+			g.post(msg.Conversation, reply)
+		}
+		return
+	}
+
+	var chatOpsReply string
+	if chatOpsURL != "" {
+		resp, fErr := forwardToChatOpsGateway(ctx, chatOpsURL, wireMsg, senderID, cmd.CanonicalText())
+		if fErr != nil {
+			g.post(msg.Conversation, fmt.Sprintf("⚠️ %s `%s` failed: %v", cmd.Verb, cmd.ActionID, fErr))
+			return
+		}
+		if !resp.OK {
+			reply := strings.TrimSpace(resp.Reply)
+			if reply == "" {
+				reply = fmt.Sprintf("⚠️ %s `%s` refused by chatops-gateway", cmd.Verb, cmd.ActionID)
+			}
+			g.post(msg.Conversation, reply)
+			return
+		}
+		chatOpsReply = strings.TrimSpace(resp.Reply)
+		if resp.DecisionID != "" {
+			wireMsg.DecisionID = resp.DecisionID
+		}
+	}
+
+	if g.client != nil {
+		data, mErr := json.Marshal(wireMsg)
+		if mErr != nil {
+			g.post(msg.Conversation, fmt.Sprintf("⚠️ approval command marshal failed: %v", mErr))
+			return
+		}
+		subject := BrokerApproveSubject(ns, cmd.ActionID)
+		if pubErr := g.client.Conn().Publish(subject, data); pubErr != nil {
+			g.post(msg.Conversation, fmt.Sprintf("⚠️ %s `%s` dispatch failed: %v", cmd.Verb, cmd.ActionID, pubErr))
+			return
+		}
+	}
+
+	if chatOpsReply != "" {
+		g.post(msg.Conversation, chatOpsReply)
+	} else if g.client != nil {
+		g.post(msg.Conversation, fmt.Sprintf("⏳ Dispatched `/%s %s` to broker (principal `%s`).", cmd.Verb, cmd.ActionID, canonicalPrincipal))
+	}
 }

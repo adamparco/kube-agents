@@ -99,6 +99,17 @@ type Entry struct {
 
 	// Parent pins the entry this one descends from. Nil for a root.
 	Parent *Ref `json:"parent,omitempty"`
+
+	// Requester is the canonical verified human or system principal
+	// (e.g. "slack:U0123ABC" or "googlechat:users/123") minted by the
+	// gateway at the root of the chain. Optional; if set on parent, a child
+	// may omit it (inheriting parent.Requester at resolution time) or repeat
+	// it verbatim, never alter it.
+	Requester string `json:"requester,omitempty"`
+
+	// EnvelopeSHA256 optionally binds a capability entry to a specific
+	// 64-character lowercase hex SHA-256 ActionEnvelope digest.
+	EnvelopeSHA256 string `json:"envelopeSha256,omitempty"`
 }
 
 // Key prefixes. A bucket key does not live at its bare name: bucket `cap` is
@@ -143,7 +154,7 @@ func checkToken(what, s string) error {
 	switch {
 	case s == "":
 		return refuse("%s is empty", what)
-	case strings.ContainsAny(s, ".*> \t"):
+	case strings.ContainsAny(s, ".*>/ \t\r\n"):
 		return refuse("%s contains a character that is not legal in a key token", what)
 	}
 	return nil
@@ -156,6 +167,20 @@ func RootKey(requestID string) (string, error) {
 		return "", err
 	}
 	return RootPrefix + requestID, nil
+}
+
+// ApprovalRootKey is where the gateway mints a root capability for one human
+// approval decision: `root.approve-<action-id>-<decision-id>`. It uses `-`
+// delimiters so the suffix after `root.` is a single dot-free token, staying
+// inside the gateway's `$KV.cap.root.*` publish grant.
+func ApprovalRootKey(actionID, decisionID string) (string, error) {
+	if err := checkToken("action id", actionID); err != nil {
+		return "", err
+	}
+	if err := checkToken("decision id", decisionID); err != nil {
+		return "", err
+	}
+	return RootKey("approve-" + actionID + "-" + decisionID)
 }
 
 // HopKey is where a broker writes a child. The principal token must be the
@@ -223,7 +248,26 @@ func (e Entry) Validate() error {
 			return refuse("parent reference is not pinned to a revision")
 		}
 	}
+	if e.Requester != "" && strings.ContainsAny(e.Requester, " \t\r\n*>") {
+		return refuse("entry requester contains whitespace")
+	}
+	if e.EnvelopeSHA256 != "" && !isHexSHA256(e.EnvelopeSHA256) {
+		return refuse("entry envelopeSha256 is not a 64-character lowercase hex sha256")
+	}
 	return nil
+}
+
+func isHexSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // Validate is scope well-formedness, exported so a program that takes a scope
@@ -271,7 +315,8 @@ func (s Scope) Contains(other Scope) bool {
 	return true
 }
 
-// Narrows reports whether child is no wider than parent on either axis.
+// Narrows reports whether child is no wider than parent on either axis, and
+// preserves any Requester or EnvelopeSHA256 bound on parent.
 // Equality is narrowing: a hop that forwards what it received is within the
 // rules, and 09 §5 is honest that stopping it is not something a KV scheme can
 // do. What this rule buys is the bound that makes that survivable — a hop
@@ -290,6 +335,12 @@ func Narrows(parent, child Entry) error {
 	}
 	if !parent.Scope.Contains(child.Scope) {
 		return refuse("child widens the scope")
+	}
+	if parent.Requester != "" && child.Requester != "" && child.Requester != parent.Requester {
+		return refuse("child alters the parent's requester")
+	}
+	if parent.EnvelopeSHA256 != "" && child.EnvelopeSHA256 != parent.EnvelopeSHA256 {
+		return refuse("child alters the parent's envelopeSha256")
 	}
 	return nil
 }

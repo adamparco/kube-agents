@@ -132,3 +132,187 @@ func (p *Pseudonymizer) Hash(id string) string {
 	mac.Write([]byte(id))
 	return "hmac:" + hex.EncodeToString(mac.Sum(nil))[:32]
 }
+
+const inboundIdentityCap = 4096
+
+// InboundIdentity holds the immutable platform sender ID and canonical event ID
+// captured by a chat adapter alongside an InboundMessage.
+type InboundIdentity struct {
+	Backend  string
+	SenderID string
+	EventID  string
+}
+
+var (
+	inboundIdentityMu        sync.RWMutex
+	inboundIdentities        = map[string]InboundIdentity{}
+	inboundIdentitiesByMsgID = map[string]InboundIdentity{}
+	inboundIdentityOrder     []string
+	gchatSenderIDByEmail     = map[string]string{}
+)
+
+func inboundIdentityKey(msg InboundMessage) string {
+	return msg.Conversation + "\x00" + msg.MessageID + "\x00" + msg.AuthorID
+}
+
+// WithInboundIdentity records the immutable platform sender ID (e.g. "users/<id>" on
+// Google Chat, "U..." on Slack, snowflake on Discord) and canonical event ID for msg.
+func WithInboundIdentity(msg InboundMessage, senderID, eventID string) InboundMessage {
+	return withInboundIdentity(msg, inferBackend(msg), senderID, eventID)
+}
+
+func withInboundIdentity(msg InboundMessage, backend, senderID, eventID string) InboundMessage {
+	senderID = strings.TrimSpace(senderID)
+	eventID = strings.TrimSpace(eventID)
+	backend = strings.TrimSpace(backend)
+	if backend == "" {
+		backend = inferBackend(msg)
+	}
+	id := InboundIdentity{
+		Backend:  backend,
+		SenderID: senderID,
+		EventID:  eventID,
+	}
+	key := inboundIdentityKey(msg)
+
+	inboundIdentityMu.Lock()
+	defer inboundIdentityMu.Unlock()
+
+	if _, exists := inboundIdentities[key]; !exists {
+		inboundIdentityOrder = append(inboundIdentityOrder, key)
+		if len(inboundIdentityOrder) > inboundIdentityCap {
+			evict := inboundIdentityOrder[0]
+			delete(inboundIdentities, evict)
+			inboundIdentityOrder = inboundIdentityOrder[1:]
+		}
+	}
+	inboundIdentities[key] = id
+	if msg.MessageID != "" {
+		if len(inboundIdentitiesByMsgID) >= inboundIdentityCap {
+			inboundIdentitiesByMsgID = map[string]InboundIdentity{}
+		}
+		inboundIdentitiesByMsgID[msg.MessageID] = id
+	}
+	if (backend == "gchat" || backend == "googlechat") && strings.HasPrefix(senderID, "users/") && msg.AuthorID != "" {
+		if len(gchatSenderIDByEmail) >= inboundIdentityCap {
+			gchatSenderIDByEmail = map[string]string{}
+		}
+		gchatSenderIDByEmail[strings.ToLower(strings.TrimSpace(msg.AuthorID))] = senderID
+	}
+	return msg
+}
+
+func lookupInboundIdentity(msg InboundMessage) (InboundIdentity, bool) {
+	inboundIdentityMu.RLock()
+	defer inboundIdentityMu.RUnlock()
+	if id, ok := inboundIdentities[inboundIdentityKey(msg)]; ok {
+		return id, true
+	}
+	if msg.MessageID != "" {
+		if id, ok := inboundIdentitiesByMsgID[msg.MessageID]; ok {
+			return id, true
+		}
+	}
+	return InboundIdentity{}, false
+}
+
+func inferBackend(msg InboundMessage) string {
+	if b := strings.TrimSpace(msg.Backend); b != "" {
+		return b
+	}
+	if id, ok := lookupInboundIdentity(msg); ok && id.Backend != "" {
+		return id.Backend
+	}
+	switch {
+	case strings.HasPrefix(msg.Conversation, "slack:"):
+		return "slack"
+	case strings.HasPrefix(msg.Conversation, "gchat:"), strings.HasPrefix(msg.Conversation, "googlechat:"):
+		return "gchat"
+	case strings.HasPrefix(msg.Conversation, "discord:"):
+		return "discord"
+	default:
+		return ""
+	}
+}
+
+// SenderID returns the immutable platform sender identifier associated with m
+// ("users/<id>" on Google Chat, "U..." on Slack, snowflake on Discord).
+func (m InboundMessage) SenderID() string {
+	if id, ok := lookupInboundIdentity(m); ok && id.SenderID != "" {
+		return id.SenderID
+	}
+	backend := inferBackend(m)
+	author := strings.TrimSpace(m.AuthorID)
+	if backend == "gchat" || backend == "googlechat" {
+		if strings.HasPrefix(author, "users/") {
+			return author
+		}
+		inboundIdentityMu.RLock()
+		mapped := gchatSenderIDByEmail[strings.ToLower(author)]
+		inboundIdentityMu.RUnlock()
+		if mapped != "" {
+			return mapped
+		}
+	}
+	return author
+}
+
+// EventID returns the canonical platform event identifier associated with m
+// ("googlechat:<message-name>", "slack:<ts>", "discord:<id>").
+func (m InboundMessage) EventID() string {
+	if id, ok := lookupInboundIdentity(m); ok && id.EventID != "" {
+		return id.EventID
+	}
+	msgID := strings.TrimSpace(m.MessageID)
+	if msgID == "" {
+		return ""
+	}
+	switch inferBackend(m) {
+	case "gchat", "googlechat":
+		return "googlechat:" + msgID
+	case "slack":
+		return "slack:" + msgID
+	case "discord":
+		return "discord:" + msgID
+	default:
+		if b := inferBackend(m); b != "" {
+			return b + ":" + msgID
+		}
+		return msgID
+	}
+}
+
+// CanonicalRosterPrincipal returns the immutable 06 §1.2 V-11 principal string
+// ("slack:U...", "googlechat:users/...", "discord:...") used by ApprovalRoster
+// and ActionRecord.Spec.Requester.ID.
+func CanonicalRosterPrincipal(msg InboundMessage) (string, error) {
+	backend := inferBackend(msg)
+	id := strings.TrimSpace(msg.SenderID())
+	if id == "" {
+		return "", fmt.Errorf("missing immutable platform sender ID for backend %q", backend)
+	}
+	switch backend {
+	case "slack":
+		id = strings.TrimPrefix(id, "slack:")
+		if id == "" {
+			return "", fmt.Errorf("missing immutable platform sender ID for backend %q", backend)
+		}
+		return "slack:" + id, nil
+	case "gchat", "googlechat":
+		id = strings.TrimPrefix(id, "googlechat:")
+		id = strings.TrimPrefix(id, "gchat:")
+		if !strings.HasPrefix(id, "users/") || len(strings.TrimPrefix(id, "users/")) == 0 {
+			return "", fmt.Errorf("googlechat sender ID %q must have form users/<id>", id)
+		}
+		return "googlechat:" + id, nil
+	case "discord":
+		id = strings.TrimPrefix(id, "discord:")
+		if id == "" {
+			return "", fmt.Errorf("missing immutable platform sender ID for backend %q", backend)
+		}
+		return "discord:" + id, nil
+	default:
+		return "", fmt.Errorf("unsupported backend %q for roster principal", backend)
+	}
+}
+

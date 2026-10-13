@@ -30,6 +30,11 @@ func GoogleChatPrincipal(userName string) string {
 	return fmt.Sprintf("googlechat:%s", userName)
 }
 
+// DiscordPrincipal renders a Discord user ID in the canonical 06 §1.2 V-11 form.
+func DiscordPrincipal(userID string) string {
+	return fmt.Sprintf("discord:%s", userID)
+}
+
 // SamePrincipal compares two canonical "<platform>:<id>" principals for equality.
 //
 // Exact string equality and nothing else — no case-folding, no whitespace trimming. A roster

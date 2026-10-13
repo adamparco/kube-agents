@@ -23,6 +23,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -641,3 +644,104 @@ func waitForPolicy(ctx context.Context, t *testing.T, human client.Client, probe
 		time.Sleep(250 * time.Millisecond)
 	}
 }
+
+// TestActionRecordStatusVAPParity enforces the L0 invariant cited by vap-agent-scope-journal.yaml
+// (lines 94 and 178) without requiring KUBEBUILDER_ASSETS: every JSON field on ActionRecordStatus
+// must have a corresponding <field>Changed variable in kube-agents-agent-scope-journal's
+// spec.variables, no phantom <field>Changed variable may exist, and every <field>Changed variable
+// must appear as !variables.<field>Changed in nothingChanged.
+func TestActionRecordStatusVAPParity(t *testing.T) {
+	rt := reflect.TypeOf(agentv1alpha1.ActionRecordStatus{})
+	var structFields []string
+	for i := 0; i < rt.NumField(); i++ {
+		tag := rt.Field(i).Tag.Get("json")
+		name := strings.TrimSpace(strings.Split(tag, ",")[0])
+		if name != "" && name != "-" {
+			structFields = append(structFields, name)
+		}
+	}
+	slices.Sort(structFields)
+	if len(structFields) == 0 {
+		t.Fatal("extracted zero JSON fields from ActionRecordStatus")
+	}
+
+	policyPath := filepath.Join("..", "..", "..", "config", "policy", "vap-agent-scope-journal.yaml")
+	raw, err := os.ReadFile(policyPath) // #nosec G304 -- fixed repo-relative policy path
+	if err != nil {
+		t.Fatalf("read %s: %v", policyPath, err)
+	}
+
+	var policyObj *unstructured.Unstructured
+	dec := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 4096)
+	for {
+		var obj unstructured.Unstructured
+		if err := dec.Decode(&obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("decode %s: %v", policyPath, err)
+		}
+		if obj.GetKind() == "ValidatingAdmissionPolicy" && obj.GetName() == "kube-agents-agent-scope-journal" {
+			policyObj = &obj
+			break
+		}
+	}
+	if policyObj == nil {
+		t.Fatalf("ValidatingAdmissionPolicy kube-agents-agent-scope-journal not found in %s", policyPath)
+	}
+
+	varsSlice, found, err := unstructured.NestedSlice(policyObj.Object, "spec", "variables")
+	if err != nil || !found {
+		t.Fatalf("extract spec.variables from kube-agents-agent-scope-journal: found=%v err=%v", found, err)
+	}
+
+	var changedVars []string
+	var nothingChangedExpr string
+	for _, item := range varsSlice {
+		vm, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vm, "name")
+		expr, _, _ := unstructured.NestedString(vm, "expression")
+		if name == "nothingChanged" {
+			nothingChangedExpr = expr
+		} else if strings.HasSuffix(name, "Changed") {
+			changedVars = append(changedVars, strings.TrimSuffix(name, "Changed"))
+		}
+	}
+	slices.Sort(changedVars)
+
+	if nothingChangedExpr == "" {
+		t.Fatal("missing nothingChanged variable in kube-agents-agent-scope-journal")
+	}
+
+	var nothingChangedFields []string
+	for _, clause := range strings.Split(nothingChangedExpr, "&&") {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		if !strings.HasPrefix(clause, "!variables.") || !strings.HasSuffix(clause, "Changed") {
+			t.Fatalf("unexpected clause %q in nothingChanged (want !variables.<field>Changed)", clause)
+		}
+		field := strings.TrimSuffix(strings.TrimPrefix(clause, "!variables."), "Changed")
+		nothingChangedFields = append(nothingChangedFields, field)
+	}
+	slices.Sort(nothingChangedFields)
+
+	if !slices.Equal(structFields, changedVars) {
+		t.Fatalf("ActionRecordStatus JSON fields %v != VAP <field>Changed variables %v", structFields, changedVars)
+	}
+	if !slices.Equal(structFields, nothingChangedFields) {
+		t.Fatalf("ActionRecordStatus JSON fields %v != VAP nothingChanged clauses %v", structFields, nothingChangedFields)
+	}
+
+	// Negative control: adding an unguarded field to the struct set must break parity.
+	mutated := append(slices.Clone(structFields), "unprotectedField")
+	slices.Sort(mutated)
+	if slices.Equal(mutated, changedVars) || slices.Equal(mutated, nothingChangedFields) {
+		t.Fatal("negative control failed: synthetic unprotectedField did not break VAP parity")
+	}
+}
+

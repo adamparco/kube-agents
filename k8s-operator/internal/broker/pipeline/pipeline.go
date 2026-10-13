@@ -659,6 +659,10 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 		}
 		s.plan = plan
 
+		callerMaxObjects := 0
+		if s.env.MaxObjects != nil {
+			callerMaxObjects = *s.env.MaxObjects
+		}
 		in := &classify.Input{
 			Caller:     s.caller,
 			Operations: s.resolved,
@@ -681,7 +685,7 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 			// request. The envelope field keeps its 06 §4.1 meaning here and only here.
 			DryRun:          s.env.DryRun,
 			RequireApproval: s.env.RequireApproval,
-			MaxObjects:      s.env.EffectiveMaxObjects(),
+			MaxObjects:      callerMaxObjects,
 			UndoPlanPresent: plan.Undoable(),
 		}
 		// Resolved per submission, not held from startup. A ChangePolicy applied a second ago is in
@@ -714,7 +718,7 @@ func (p *Pipeline) stepClassify(ctx context.Context, s *state) (*broker.Result, 
 
 		if cls.Abort != nil {
 			return "", &broker.Refusal{
-				Status:        http.StatusForbidden,
+				Status:        http.StatusUnprocessableEntity,
 				Reason:        "blast-radius-cap-exceeded",
 				Detail:        cls.Abort.Error(),
 				Journal:       true,
@@ -745,6 +749,45 @@ func (p *Pipeline) stepBrake(ctx context.Context, s *state) (*broker.Result, err
 	var effect broker.BrakeEffect
 	err := p.step(tr, broker.StepBrake, func() (string, error) {
 		s.brakeView = p.cfg.Brake.Observe(ctx)
+		if p.cfg.Verifier != nil && p.cfg.Verifier.Cooldown != nil && s.env.Trigger.Source != string(agentv1alpha1.ActionTriggerUndo) {
+			for _, t := range s.targets {
+				key := verify.TargetKey(t)
+				active, until, cdErr := p.cfg.Verifier.Cooldown.Active(ctx, key, s.at)
+				if cdErr != nil {
+					return "cooldown-unreadable", &broker.Refusal{
+						Status:  http.StatusServiceUnavailable,
+						Reason:  "cooldown-unreadable",
+						Detail:  cdErr.Error(),
+						Journal: true,
+					}
+				}
+				if active {
+					retryAfter := int(until.Sub(s.at).Seconds())
+					if retryAfter < 1 {
+						retryAfter = 1
+					}
+					if retryAfter > broker.MaxRetryAfterSeconds {
+						retryAfter = broker.MaxRetryAfterSeconds
+					}
+					return "cooldown-active", &broker.Refusal{
+						Status:            http.StatusTooManyRequests,
+						Reason:            "cooldown-active",
+						Detail:            fmt.Sprintf("target %s %s/%s is in post-rollback cooldown until %s", t.Kind, t.Namespace, t.Name, until.UTC().Format(time.RFC3339)),
+						RetryAfterSeconds: retryAfter,
+						Journal:           true,
+					}
+				}
+			}
+		}
+		undoSignal := signal(s.plan.Undoable())
+		if s.record != nil && !s.record.Spec.Classification.Undoable {
+			// Resuming a gated action that was already classified and approved with Undoable=false
+			// (e.g., create batch/v1 Job or delete PersistentVolumeClaim). The human approval
+			// already covers the missing undo plan (row 5), so pass BrakeOK here to evaluate the
+			// remaining rows (6: roster, 7: budget/flap, 8: contested) rather than short-circuiting
+			// back to BrakeRaiseToGated.
+			undoSignal = broker.BrakeOK
+		}
 		d := broker.Decide(broker.BrakeInputs{
 			Stage:      broker.StageGate,
 			Now:        s.at,
@@ -752,7 +795,7 @@ func (p *Pipeline) stepBrake(ctx context.Context, s *state) (*broker.Result, err
 			Scope:      scopeSpecOf(s.brakeView.Agent),
 			Freezes:    s.brakeView.Freezes,
 			Journal:    s.brakeView.Journal,
-			UndoPlan:   signal(s.plan.Undoable()),
+			UndoPlan:   undoSignal,
 			Roster:     s.brakeView.Roster,
 			Accountant: p.cfg.Accountant,
 			Contested:  p.cfg.Contested,
@@ -842,13 +885,10 @@ func (p *Pipeline) stepGate(ctx context.Context, s *state) (*broker.Result, erro
 		if !gated {
 			return "not required (" + s.class.Class.String() + ")", nil
 		}
-		// The record for a parked action deliberately carries NO pre-state. It was captured at
-		// step 3, but by the time a human approves, minutes or hours later, it describes a cluster
-		// that has moved on -- and a stale pre-state on a PendingApproval record is an undo plan
-		// that restores the wrong bytes. The approval path re-snapshots. Step 8 never ran, and the
-		// record says so by omission rather than by carrying something that looks current.
-		s.record.Spec.PreState = nil
-		// The mutating payload DOES need to survive the park, unlike the pre-state: resumption
+		// ActionRecord.spec is immutable after creation (CEL self == oldSelf, 06 §4.3), so the
+		// initial PreState and Undo plan built in step 6 are persisted at creation time; Resume
+		// re-evaluates preconditions and refreshes in-memory PreState/Undo before executing.
+		// The mutating payload DOES need to survive the park: resumption
 		// re-snapshots and re-plans, but nothing re-derives what the operations would WRITE, because
 		// that never lived anywhere but the envelope the HTTP request carried (see EnvelopeJSON's
 		// own doc comment). A marshal failure here is the broker's own bug, not a caller error, and
@@ -980,6 +1020,9 @@ func (p *Pipeline) stepExecute(ctx context.Context, s *state) (*broker.Result, e
 		s.exec = res
 		if res != nil {
 			s.record.Status.Applied = appliedTargets(res)
+			if s.plan != nil && s.plan.Plan != nil {
+				s.plan.Plan = undo.HydratePlanFromRecord(s.record)
+			}
 		}
 
 		// The two ways step 9 can go wrong are not the same thing, and collapsing them is the bug.
@@ -1094,11 +1137,48 @@ func (p *Pipeline) stepJournal(ctx context.Context, s *state) (*broker.Result, e
 			r := s.verify.Recovery
 			s.record.Status.Recovery = &r
 		}
+		if s.record.Status.Report == nil {
+			s.record.Status.Report = buildReport(s, phase)
+		}
 		if err := p.cfg.Records.SetPhase(ctx, s.record, phase, message); err != nil {
 			return "", fmt.Errorf("step 11: recording the outcome of %s: %w", s.actionID, err)
 		}
 		return string(phase), nil
 	})
+}
+
+func buildReport(s *state, phase agentv1alpha1.ActionPhase) *agentv1alpha1.ActionReport {
+	noticed := strings.TrimSpace(s.record.Spec.Rationale)
+	if noticed == "" {
+		noticed = strings.TrimSpace(s.record.Spec.Intent)
+	}
+	did := strings.TrimSpace(s.record.Spec.Intent)
+	verified := string(phase)
+	if s.verify.Verification.Passed {
+		var details []string
+		for _, chk := range s.verify.Verification.Checks {
+			if d := strings.TrimSpace(chk.Detail); d != "" {
+				details = append(details, chk.Name+": "+d)
+			} else {
+				details = append(details, chk.Name+": passed")
+			}
+		}
+		if len(details) > 0 {
+			verified = strings.Join(details, "; ")
+		} else {
+			verified = "Verification checks passed"
+		}
+	}
+	undoCmd := "/undo " + s.actionID
+	if s.record.Spec.Undo != nil && s.record.Spec.Undo.Strategy == agentv1alpha1.UndoNone {
+		undoCmd = "none (this action has no automatic undo plan)"
+	}
+	return &agentv1alpha1.ActionReport{
+		Noticed:  noticed,
+		Did:      did,
+		Verified: verified,
+		Undo:     undoCmd,
+	}
 }
 
 // terminal maps the verification outcome onto the record phase.
@@ -1154,6 +1234,7 @@ func (p *Pipeline) buildRecord(s *state) *agentv1alpha1.ActionRecord {
 			Classification: agentv1alpha1.ActionClassification{
 				Class:         riskClass(s.class.Class),
 				Reasons:       append(recordReasons(s.class), undoReason(s.plan)...),
+				BlastRadius:   recordBlastRadius(s.targets, s.resolved, s.class.EffectiveMaxObjects),
 				Undoable:      s.plan.Undoable(),
 				PolicySources: s.class.PolicySources,
 			},
@@ -1225,6 +1306,7 @@ func ptrTime(t time.Time) *metav1.Time {
 func rawOps(env *broker.Envelope) ([]classify.RawOp, []agentv1alpha1.TargetRef, error) {
 	raws := make([]classify.RawOp, 0, len(env.Operations))
 	targets := make([]agentv1alpha1.TargetRef, 0, len(env.Operations))
+	distinctByNS := make(map[string]map[string]bool)
 	for i, op := range env.Operations {
 		ref, err := targetRef(op)
 		if err != nil {
@@ -1235,6 +1317,10 @@ func rawOps(env *broker.Envelope) ([]classify.RawOp, []agentv1alpha1.TargetRef, 
 			return nil, nil, fmt.Errorf("operation %d: %w", i, err)
 		}
 		targets = append(targets, ref)
+		if distinctByNS[ref.Namespace] == nil {
+			distinctByNS[ref.Namespace] = make(map[string]bool)
+		}
+		distinctByNS[ref.Namespace][ref.Group+"/"+ref.Kind+"/"+ref.Name] = true
 		raws = append(raws, classify.RawOp{
 			Verb:        op.Op,
 			Kind:        classify.KindRef{Group: ref.Group, Kind: ref.Kind},
@@ -1245,7 +1331,42 @@ func rawOps(env *broker.Envelope) ([]classify.RawOp, []agentv1alpha1.TargetRef, 
 			ObjectCount: 1,
 		})
 	}
+	for i := range raws {
+		if n := len(distinctByNS[raws[i].Namespace]); n > 0 {
+			raws[i].ObjectCount = n
+		}
+	}
 	return raws, targets, nil
+}
+
+func recordBlastRadius(targets []agentv1alpha1.TargetRef, resolved []classify.ResolvedOp, cap int) *agentv1alpha1.BlastRadius {
+	distinct := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		distinct[t.Group+"/"+t.Kind+"/"+t.Namespace+"/"+t.Name] = true
+	}
+	objs := len(distinct)
+	var maxFrac *float64
+	for i := range resolved {
+		if resolved[i].BlastRadius.Objects > objs {
+			objs = resolved[i].BlastRadius.Objects
+		}
+		if f := resolved[i].BlastRadius.FractionOfScope; f != nil {
+			if maxFrac == nil || *f > *maxFrac {
+				v := *f
+				maxFrac = &v
+			}
+		}
+	}
+	br := &agentv1alpha1.BlastRadius{
+		Objects: int32(objs), //nolint:gosec
+	}
+	if maxFrac != nil {
+		br.FractionOfScope = fmt.Sprintf("%.2f", *maxFrac)
+	}
+	if cap > 0 {
+		br.Cap = int32(cap) //nolint:gosec
+	}
+	return br
 }
 
 // targetRef normalizes the three target shapes onto one ref.

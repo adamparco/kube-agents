@@ -945,7 +945,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			// A bare mention has nothing to run, in a DM as in a channel.
 			return InboundMessage{}, false
 		}
-		return InboundMessage{
+		return withInboundIdentity(InboundMessage{
 			Conversation: slackConversationID(m.ChannelType, m.Channel, ""),
 			Kind:         "dm",
 			AuthorID:     m.User,
@@ -960,7 +960,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 			// same shift makes normalized text shorter, so an ask that
 			// decodes can newly fall under isStatusQuery's wideMatchLenCap.
 			Text: slackUnescaper.Replace(text),
-		}, true
+		}, slackBackend, m.User, "slack:"+m.TimeStamp), true
 	}
 	isReply := m.ThreadTimeStamp != "" && m.ThreadTimeStamp != m.TimeStamp
 	threadTS := m.ThreadTimeStamp
@@ -992,7 +992,7 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
-	return InboundMessage{
+	return withInboundIdentity(InboundMessage{
 		Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 		Kind:         "group",
 		AuthorID:     m.User,
@@ -1002,5 +1002,5 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// plain text they no longer recognize. Carries the same deliberate
 		// effect on normalize and the affordance matchers as the DM path.
 		Text: slackUnescaper.Replace(text),
-	}, true
+	}, slackBackend, m.User, "slack:"+m.TimeStamp), true
 }

@@ -47,11 +47,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
+	"github.com/nats-io/nats.go"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/brake"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/budget"
@@ -60,6 +65,7 @@ import (
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/execute"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/history"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/livestate"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/natsadapter"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/policy"
 	// Aliased: `probe` is already a function in waitforbroker.go, and the init-container's /healthz
@@ -163,6 +169,26 @@ func newDiscovery(cfg *rest.Config) (discovery.ServerResourcesInterface, error) 
 		return nil, fmt.Errorf("build discovery client: %w", err)
 	}
 	return dc, nil
+}
+
+// brokerRuntime bundles the assembled pipeline.Config, background sources, and shared
+// ContestedIndex so startup and the resume loop can seed and synchronize contested targets.
+type brokerRuntime struct {
+	Config    pipeline.Config
+	Sources   []startable
+	Contested *broker.ContestedIndex
+}
+
+func buildBrokerRuntime(ctx context.Context, d brokerDeps) (brokerRuntime, error) {
+	cfg, sources, err := pipelineConfig(ctx, d)
+	if err != nil {
+		return brokerRuntime{}, err
+	}
+	return brokerRuntime{
+		Config:    cfg,
+		Sources:   sources,
+		Contested: cfg.Contested,
+	}, nil
 }
 
 // pipelineConfig assembles steps 3-11 and returns the sources that must be started.
@@ -384,4 +410,109 @@ func startSources(ctx context.Context, sources []startable) error {
 		go s.run(ctx)
 	}
 	return nil
+}
+
+var defaultNATSTokenFiles = []string{
+	"/var/run/secrets/a2a-bus/token",
+	"/var/run/secrets/a2a/bus-token/token",
+	"/var/run/secrets/kubernetes.io/serviceaccount/token",
+}
+
+// startNATSAdapter connects to NATS when NATS_URL (or A2A_NATS_URL) is configured, builds the
+// CapabilityAssertionVerifier, and starts the natsadapter.Adapter on a2a.broker.{propose,approve}.
+// When no NATS URL is configured, it returns (nil, func() {}, nil) so unit tests and non-NATS
+// deployments operate unchanged.
+func startNATSAdapter(
+	ctx context.Context,
+	d brokerDeps,
+	readerSA string,
+	tier agentv1alpha1.AgentTier,
+	scopeVal string,
+	pipe *pipeline.Pipeline,
+	guard *broker.ReplayGuard,
+	rejectionJournal broker.RejectionJournal,
+) (*natsadapter.Adapter, func(), error) {
+	natsURL := strings.TrimSpace(envOr("NATS_URL", os.Getenv("A2A_NATS_URL")))
+	if natsURL == "" {
+		return nil, func() {}, nil
+	}
+
+	user := strings.TrimSpace(envOr("A2A_BUS_USER", envOr("NATS_USER", broker.DefaultBrokerVerifierCaller)))
+	if user == "" {
+		user = broker.DefaultBrokerVerifierCaller
+	}
+	opts := []nats.Option{
+		nats.Name("kage-broker-" + d.AgentName),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.CustomInboxPrefix("_INBOX." + user),
+	}
+
+	if natsUser, natsPass := strings.TrimSpace(os.Getenv("NATS_USER")), os.Getenv("NATS_PASSWORD"); natsUser != "" && natsPass != "" {
+		opts = append(opts, nats.UserInfo(natsUser, natsPass))
+	} else if token := strings.TrimSpace(envOr("NATS_TOKEN", os.Getenv("A2A_BUS_TOKEN"))); token != "" {
+		opts = append(opts, nats.Token(token))
+	} else if tokenFile := resolveNATSTokenFile(); tokenFile != "" {
+		opts = append(opts, nats.TokenHandler(func() string {
+			b, err := os.ReadFile(tokenFile)
+			if err != nil {
+				return ""
+			}
+			return strings.TrimSpace(string(b))
+		}))
+	}
+
+	nc, err := nats.Connect(natsURL, opts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect NATS (%s): %w", natsURL, err)
+	}
+
+	verifier := broker.NewCapabilityAssertionVerifier(nc, user)
+	adapter, err := natsadapter.New(natsadapter.Config{
+		NC:        nc,
+		Verifier:  verifier,
+		Pipeline:  pipe,
+		Resumer:   pipe,
+		Records:   d.Records,
+		K8sClient: d.Client,
+		Journal:   rejectionJournal,
+		Replay:    guard,
+		ExpectedCaller: broker.ExpectedCaller{
+			Namespace:      d.Namespace,
+			ServiceAccount: readerSA,
+			AgentName:      d.AgentName,
+			Tier:           tier,
+			Scope:          scopeVal,
+		},
+		Namespace: d.Namespace,
+		Log:       ctrllog.Log.WithName("natsadapter"),
+	})
+	if err != nil {
+		nc.Close()
+		return nil, nil, fmt.Errorf("create NATS adapter: %w", err)
+	}
+	if err := adapter.Start(ctx); err != nil {
+		nc.Close()
+		return nil, nil, fmt.Errorf("start NATS adapter: %w", err)
+	}
+
+	stop := func() {
+		adapter.Stop()
+		nc.Close()
+	}
+	return adapter, stop, nil
+}
+
+func resolveNATSTokenFile() string {
+	for _, key := range []string{"NATS_TOKEN_FILE", "A2A_BUS_TOKEN_FILE", "A2A_BUS_TOKEN_PATH"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	for _, p := range defaultNATSTokenFiles {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
 }

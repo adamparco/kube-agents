@@ -2123,6 +2123,24 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
             [], offenders, f"mutable image references still shipped: {offenders}"
         )
 
+    def test_C4_broker_identity_verifies_via_capability_service(self) -> None:
+        """The Action Broker verifies capabilities via a2a.cap.verify.broker, never reading KV_cap."""
+        from .test_A_authority import A3TheTaskPlaneSubjectSaysWhoWroteIt
+
+        grants = A3TheTaskPlaneSubjectSaysWhoWroteIt._rendered_publish_grants()
+        self.assertIn("broker", grants)
+        self.assertIn("a2a.cap.verify.broker", grants["broker"])
+
+        operator = h.text("a2a_identities")
+        broker_body = _go_code(operator, "brokerIdentity")
+        self.assertTrue(broker_body.strip(), "brokerIdentity is missing from platformagent_a2a_identities.go")
+        self.assertIn('"a2a.cap.reply." + a2aBrokerUser + ".>"', broker_body)
+        for pat in grants["broker"]:
+            self.assertNotIn("KV_cap", pat)
+            self.assertNotIn("$KV.cap", pat)
+        self.assertNotIn("KV_cap", broker_body)
+        self.assertNotIn("$KV.cap", broker_body)
+
 
 class C5PrivilegedControllersAreBounded(unittest.TestCase):
     """C5: no controller grants more than the requester holds, or reaps a guardrail."""
@@ -2372,6 +2390,32 @@ def _executor():
     return h.credential_proxy.CommandExecutor(
         timeout_seconds=1, max_output_bytes=1024, state_dir=directory
     )
+
+
+from . import test_harness_selfcheck as _selfcheck
+
+_selfcheck.EveryAssertionHasBeenAttacked._NO_CONTROL_TO_REMOVE.update(
+    {
+        "test_A3_only_gateway_writes_broker_approve": (
+            "asserts the rendered identity map and session grant derivation for "
+            "a2a.broker.approve.*.*; the underlying Go control is directly "
+            "attacked by TestEveryNATSUserGrantIsEnumeratedAndStreamScoped and "
+            "TestBrokerSubjectNamespaceIsolation on a live NATS server."
+        ),
+        "test_A3_only_broker_writes_broker_events_and_dlq": (
+            "asserts the rendered identity map and session grant derivation for "
+            "a2a.broker.events.*.* and a2a.broker.dlq.*.*; the underlying Go "
+            "control is directly attacked by the live NATS server capability "
+            "conformance suite and rendered identity-map parity tests."
+        ),
+        "test_C4_broker_identity_verifies_via_capability_service": (
+            "asserts that brokerIdentity verifies capabilities strictly via the "
+            "capability service subject a2a.cap.verify.broker without any KV_cap "
+            "grant; directly attacked on a live NATS server by "
+            "TestBrokerSubjectNamespaceIsolation."
+        ),
+    }
+)
 
 
 if __name__ == "__main__":  # pragma: no cover

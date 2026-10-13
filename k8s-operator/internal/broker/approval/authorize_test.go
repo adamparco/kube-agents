@@ -146,3 +146,77 @@ func TestAuthorizeRefusesNilRecord(t *testing.T) {
 		t.Fatal("expected refusal for a nil record")
 	}
 }
+
+// C9 / T6: When status.approvals is still nil on the first vote after CreationTimestamp + TTL has
+// elapsed, AuthorizeApprove and AuthorizeReject must refuse rather than skipping the expiry check.
+func TestAuthorizeRefusesFirstVoteAfterUnseededTTLWindowCloses(t *testing.T) {
+	roster := testRoster("r", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Approvals = nil
+	afterTTL := ar.CreationTimestamp.Add(roster.EffectiveTTL())
+
+	if d := approval.AuthorizeApprove(roster, ar, "slack:U02", afterTTL); d.Allowed {
+		t.Fatal("expected AuthorizeApprove to refuse first vote when CreationTimestamp + EffectiveTTL has elapsed")
+	}
+	if d := approval.AuthorizeReject(roster, ar, "slack:U02", afterTTL); d.Allowed {
+		t.Fatal("expected AuthorizeReject to refuse first vote when CreationTimestamp + EffectiveTTL has elapsed")
+	}
+}
+
+func TestAuthorizeUndo(t *testing.T) {
+	roster := testRoster("r", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Phase = agentv1alpha1.PhaseVerified
+	ar.Spec.Undo = &agentv1alpha1.UndoPlan{
+		Strategy:    agentv1alpha1.UndoRestore,
+		GeneratedAt: metav1.NewTime(fixedNow),
+		Validated:   true,
+		Steps: []agentv1alpha1.UndoStep{
+			{Op: "apply", Target: agentv1alpha1.TargetRef{Version: "v1", Kind: "Deployment", Namespace: testNS, Name: "web"}},
+		},
+	}
+
+	if d := approval.AuthorizeUndo(roster, ar, "slack:U02"); !d.Allowed {
+		t.Fatalf("expected AuthorizeUndo to allow roster member on Verified action with undo plan, got: %s", d.Reason)
+	}
+	if d := approval.AuthorizeUndo(roster, ar, "slack:U99"); d.Allowed {
+		t.Fatal("expected AuthorizeUndo to refuse non-roster principal")
+	}
+	if d := approval.AuthorizeUndo(nil, ar, "slack:U02"); d.Allowed {
+		t.Fatal("expected AuthorizeUndo to refuse nil roster")
+	}
+
+	noUndo := ar.DeepCopy()
+	noUndo.Spec.Undo = &agentv1alpha1.UndoPlan{Strategy: agentv1alpha1.UndoNone}
+	if d := approval.AuthorizeUndo(roster, noUndo, "slack:U02"); d.Allowed {
+		t.Fatal("expected AuthorizeUndo to refuse action with UndoNone strategy")
+	}
+
+	wrongPhase := ar.DeepCopy()
+	wrongPhase.Status.Phase = agentv1alpha1.PhasePendingApproval
+	if d := approval.AuthorizeUndo(roster, wrongPhase, "slack:U02"); d.Allowed {
+		t.Fatal("expected AuthorizeUndo to refuse action in PendingApproval phase")
+	}
+}
+
+func TestAuthorizeUncontest(t *testing.T) {
+	roster := testRoster("r", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Contested = true
+
+	if d := approval.AuthorizeUncontest(roster, ar, "slack:U02"); !d.Allowed {
+		t.Fatalf("expected AuthorizeUncontest to allow roster member on contested action, got: %s", d.Reason)
+	}
+	if d := approval.AuthorizeUncontest(roster, ar, "slack:U99"); d.Allowed {
+		t.Fatal("expected AuthorizeUncontest to refuse non-roster principal")
+	}
+	if d := approval.AuthorizeUncontest(nil, ar, "slack:U02"); d.Allowed {
+		t.Fatal("expected AuthorizeUncontest to refuse nil roster")
+	}
+
+	notContested := ar.DeepCopy()
+	notContested.Status.Contested = false
+	if d := approval.AuthorizeUncontest(roster, notContested, "slack:U02"); d.Allowed {
+		t.Fatal("expected AuthorizeUncontest to refuse action that is not contested")
+	}
+}

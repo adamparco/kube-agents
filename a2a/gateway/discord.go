@@ -213,13 +213,13 @@ func (d *DiscordAdapter) inbound(s *discordgo.Session, m *discordgo.MessageCreat
 	if text == "" {
 		return InboundMessage{}, false
 	}
-	return InboundMessage{
+	return withInboundIdentity(InboundMessage{
 		Conversation: conversationID(m.GuildID, channelID),
 		Kind:         kind,
 		AuthorID:     m.Author.ID,
 		MessageID:    m.ID,
 		Text:         text,
-	}, true
+	}, "discord", m.Author.ID, "discord:"+m.ID), true
 }
 
 // threadName derives a thread title from the ask; Discord caps names at 100.

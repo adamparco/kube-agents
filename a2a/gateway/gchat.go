@@ -971,13 +971,13 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		return InboundMessage{}, "duplicate delivery of " + ev.Message.Name
 	}
 
-	return InboundMessage{
+	return withInboundIdentity(InboundMessage{
 		Conversation: gchatConversationID(ev.Space.Name, thread, kind),
 		Kind:         kind,
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
 		Text:         text,
-	}, ""
+	}, gchatBackend, strings.TrimSpace(sender.Name), "googlechat:"+strings.TrimSpace(ev.Message.Name)), ""
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's

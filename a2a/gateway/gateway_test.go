@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2758,3 +2760,382 @@ func TestAskTTLBoundsTheIncarnationSet(t *testing.T) {
 		t.Fatalf("incarnation set past the TTL: %+v unknown=%v", fresh.SessionAuthors, fresh.SessionAuthorsUnknown)
 	}
 }
+
+func TestApprovalCommandInterceptsBeforeSessionAndLLM(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.Namespace = "agent-system" })
+
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	capKV, err := js.KeyValue(context.Background(), capability.Bucket)
+	if err != nil {
+		t.Fatalf("bind cap bucket: %v", err)
+	}
+
+	approveCh := make(chan *nats.Msg, 8)
+	sub, err := nc.ChanSubscribe("a2a.broker.approve.>", approveCh)
+	if err != nil {
+		t.Fatalf("subscribe a2a.broker.approve.>: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	conv := "discord:g1/thread-approval"
+	// Hold the conversation's session lock to prove handleInbound intercepts
+	// approval commands BEFORE lockSession(conv).Lock().
+	lock := r.g.lockSession(conv)
+	lock.Lock()
+	defer lock.Unlock()
+
+	commands := []struct {
+		text    string
+		wantCmd ApprovalVerb
+		wantID  string
+		wantNS  string
+		wantRsn string
+	}{
+		{
+			text:    "/approve ar-01arz3ndektsv4rrffq69g5fav",
+			wantCmd: ApprovalVerbApprove,
+			wantID:  "ar-01arz3ndektsv4rrffq69g5fav",
+			wantNS:  "agent-system",
+		},
+		{
+			text:    "@kage /reject ar-01arz3ndektsv4rrffq69g5fav/ns-prod freeze window active",
+			wantCmd: ApprovalVerbReject,
+			wantID:  "ar-01arz3ndektsv4rrffq69g5fav",
+			wantNS:  "ns-prod",
+			wantRsn: "freeze window active",
+		},
+		{
+			text:    "/undo ar-01arz3ndektsv4rrffq69g5fav bad canary rollout",
+			wantCmd: ApprovalVerbUndo,
+			wantID:  "ar-01arz3ndektsv4rrffq69g5fav",
+			wantNS:  "agent-system",
+			wantRsn: "bad canary rollout",
+		},
+		{
+			text:    "/uncontest ar-01arz3ndektsv4rrffq69g5fav",
+			wantCmd: ApprovalVerbUncontest,
+			wantID:  "ar-01arz3ndektsv4rrffq69g5fav",
+			wantNS:  "agent-system",
+		},
+	}
+
+	for i, tc := range commands {
+		msg := WithInboundIdentity(InboundMessage{
+			Backend:      "discord",
+			Conversation: conv,
+			Kind:         "group",
+			AuthorID:     "1001",
+			MessageID:    fmt.Sprintf("m-app-%d", i+1),
+			Text:         tc.text,
+		}, "1001", fmt.Sprintf("discord:m-app-%d", i+1))
+		r.adapter.inbox <- msg
+
+		var raw *nats.Msg
+		select {
+		case raw = <-approveCh:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for approval message %d (%s)", i, tc.text)
+		}
+
+		wantSubj := BrokerApproveSubject(tc.wantNS, tc.wantID)
+		if raw.Subject != wantSubj {
+			t.Fatalf("subject = %q, want %q", raw.Subject, wantSubj)
+		}
+
+		var got ActionApprovalMessage
+		if err := json.Unmarshal(raw.Data, &got); err != nil {
+			t.Fatalf("unmarshal ActionApprovalMessage: %v", err)
+		}
+		if got.Command != tc.wantCmd || got.ActionID != tc.wantID || got.Namespace != tc.wantNS || got.Reason != tc.wantRsn {
+			t.Fatalf("unexpected ActionApprovalMessage: %+v", got)
+		}
+		if got.ApproverPrincipal != "discord:1001" {
+			t.Fatalf("ApproverPrincipal = %q, want %q", got.ApproverPrincipal, "discord:1001")
+		}
+		if got.EventID != fmt.Sprintf("discord:m-app-%d", i+1) {
+			t.Fatalf("EventID = %q, want %q", got.EventID, fmt.Sprintf("discord:m-app-%d", i+1))
+		}
+		if got.Capability == nil || !strings.HasPrefix(got.Capability.Key, "root.approve-"+tc.wantID+"-") || got.Capability.Revision == 0 {
+			t.Fatalf("unexpected Capability ref: %+v", got.Capability)
+		}
+
+		kvEntry, err := capKV.GetRevision(context.Background(), got.Capability.Key, got.Capability.Revision)
+		if err != nil {
+			t.Fatalf("GetRevision(%s, %d): %v", got.Capability.Key, got.Capability.Revision, err)
+		}
+		var capEntry capability.Entry
+		if err := json.Unmarshal(kvEntry.Value(), &capEntry); err != nil {
+			t.Fatalf("unmarshal capability.Entry: %v", err)
+		}
+		if capEntry.Delegate != "broker" || capEntry.Requester != "discord:1001" || capEntry.Parent != nil {
+			t.Fatalf("unexpected approval root capability entry: %+v", capEntry)
+		}
+	}
+
+	// Verify zero SessionRecord was created in KV_session-state and zero task
+	// was published to a2a.tasks.>.
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil {
+		t.Fatalf("reg.Get: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected nil SessionRecord for approval-only conversation, got %+v", rec)
+	}
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("expected 0 task envelopes published to LLM worker, got %d", len(envs))
+	}
+}
+
+func TestMalformedApprovalCommandNeverLeaksToLLM(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-malformed-approval"
+
+	malformed := []string{
+		"/approve",
+		"/approve ar-01arz3ndektsv4rrffq69g5fav extra-token",
+		"/uncontest ar-01arz3ndektsv4rrffq69g5fav extra-token",
+		"/reject",
+		"/undo",
+	}
+
+	for i, text := range malformed {
+		r.adapter.inbox <- InboundMessage{
+			Backend:      "discord",
+			Conversation: conv,
+			Kind:         "group",
+			AuthorID:     "1001",
+			MessageID:    fmt.Sprintf("m-bad-%d", i+1),
+			Text:         text,
+		}
+	}
+
+	waitFor(t, "5 deterministic syntax error replies", func() bool {
+		return len(r.adapter.postTexts()) == len(malformed)
+	})
+	for i, post := range r.adapter.postTexts() {
+		if !strings.Contains(post, "approval:") && !strings.Contains(post, "usage:") {
+			t.Fatalf("post[%d] = %q, expected deterministic syntax error", i, post)
+		}
+	}
+
+	rec, err := r.g.reg.Get(context.Background(), conv)
+	if err != nil {
+		t.Fatalf("reg.Get: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected nil SessionRecord for malformed approval commands, got %+v", rec)
+	}
+	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
+		t.Fatalf("expected 0 task envelopes published to LLM worker, got %d", len(envs))
+	}
+}
+
+func TestCanonicalRosterPrincipalAndRootCapabilityRequester(t *testing.T) {
+	// 1. Google Chat: Sender.Name ("users/10987654321") wins over mutable email;
+	// bare email without users/<id> is rejected.
+	gchatMsg := WithInboundIdentity(InboundMessage{
+		Backend:      "gchat",
+		Conversation: "gchat:spaces/AAA/threads/BBB",
+		Kind:         "group",
+		AuthorID:     "alice@example.com",
+		MessageID:    "spaces/AAA/messages/CCC",
+		Text:         "hello",
+	}, "users/10987654321", "googlechat:spaces/AAA/messages/CCC")
+	gotGchat, err := CanonicalRosterPrincipal(gchatMsg)
+	if err != nil || gotGchat != "googlechat:users/10987654321" {
+		t.Fatalf("CanonicalRosterPrincipal(gchat) = %q, %v; want googlechat:users/10987654321", gotGchat, err)
+	}
+
+	bareEmailMsg := InboundMessage{
+		Backend:      "gchat",
+		Conversation: "gchat:spaces/AAA/threads/BBB",
+		Kind:         "group",
+		AuthorID:     "unregistered@example.com",
+		MessageID:    "spaces/AAA/messages/DDD",
+	}
+	if got, err := CanonicalRosterPrincipal(bareEmailMsg); err == nil {
+		t.Fatalf("expected error for bare Google Chat email without users/<id>, got %q", got)
+	}
+
+	// 2. Slack: User ID -> slack:<UserID>
+	slackMsg := WithInboundIdentity(InboundMessage{
+		Backend:      "slack",
+		Conversation: "slack:C123/1700000000.000100",
+		Kind:         "group",
+		AuthorID:     "U0123ABC",
+		MessageID:    "1700000000.000100",
+	}, "U0123ABC", "slack:1700000000.000100")
+	gotSlack, err := CanonicalRosterPrincipal(slackMsg)
+	if err != nil || gotSlack != "slack:U0123ABC" {
+		t.Fatalf("CanonicalRosterPrincipal(slack) = %q, %v; want slack:U0123ABC", gotSlack, err)
+	}
+
+	// 3. Discord: Author.ID -> discord:<Author.ID>
+	discordMsg := WithInboundIdentity(InboundMessage{
+		Backend:      "discord",
+		Conversation: "discord:g1/c1",
+		Kind:         "group",
+		AuthorID:     "123456789012345678",
+		MessageID:    "999888777",
+	}, "123456789012345678", "discord:999888777")
+	gotDiscord, err := CanonicalRosterPrincipal(discordMsg)
+	if err != nil || gotDiscord != "discord:123456789012345678" {
+		t.Fatalf("CanonicalRosterPrincipal(discord) = %q, %v; want discord:123456789012345678", gotDiscord, err)
+	}
+
+	// 4. Verify $KV.cap.root.<taskId>.Requester is populated with canonical <platform>:<id>
+	r := startRig(t)
+	conv := "discord:g1/thread-cap-requester"
+	r.adapter.inbox <- WithInboundIdentity(InboundMessage{
+		Backend:      "discord",
+		Conversation: conv,
+		Kind:         "group",
+		AuthorID:     "1001",
+		MessageID:    "m-cap-1",
+		Text:         "check cluster status",
+	}, "1001", "discord:m-cap-1")
+	env := r.awaitTask(t, "platform")
+
+	var rec *SessionRecord
+	waitFor(t, "active task capability", func() bool {
+		rec, _ = r.g.reg.Get(context.Background(), conv)
+		return rec != nil && rec.ActiveTask != nil && rec.ActiveTask.Capability != nil
+	})
+	ref := rec.ActiveTask.Capability
+
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	capKV, err := js.KeyValue(context.Background(), capability.Bucket)
+	if err != nil {
+		t.Fatalf("bind cap bucket: %v", err)
+	}
+	kvEntry, err := capKV.GetRevision(context.Background(), ref.Key, ref.Revision)
+	if err != nil {
+		t.Fatalf("GetRevision(%s, %d): %v", ref.Key, ref.Revision, err)
+	}
+	var capEntry capability.Entry
+	if err := json.Unmarshal(kvEntry.Value(), &capEntry); err != nil {
+		t.Fatalf("unmarshal capability.Entry: %v", err)
+	}
+	if env.TaskID == "" || ref.Key != "root."+env.TaskID {
+		t.Fatalf("ref.Key = %q, want %q", ref.Key, "root."+env.TaskID)
+	}
+	if capEntry.Requester != "discord:1001" {
+		t.Fatalf("capEntry.Requester = %q, want %q", capEntry.Requester, "discord:1001")
+	}
+}
+
+func TestApprovalCommandForwardsToChatOpsGatewayAndPublishesBrokerApprove(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.Namespace = "kage-live-test" })
+
+	var received []chatOpsCommandRequest
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1alpha1/commands" {
+			http.NotFound(w, req)
+			return
+		}
+		var cmdReq chatOpsCommandRequest
+		if err := json.NewDecoder(req.Body).Decode(&cmdReq); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		received = append(received, cmdReq)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if cmdReq.SenderID == "1002" {
+			_ = json.NewEncoder(w).Encode(chatOpsCommandResponse{
+				OK:    false,
+				Reply: cmdReq.ActionID + ": not on the approval roster",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(chatOpsCommandResponse{
+			OK:         true,
+			Reply:      cmdReq.ActionID + ": approved (1/1) — it will resume shortly",
+			DecisionID: cmdReq.EventID,
+		})
+	}))
+	defer srv.Close()
+	r.g.SetChatOpsGatewayURL(srv.URL)
+
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	approveCh := make(chan *nats.Msg, 4)
+	sub, err := nc.ChanSubscribe("a2a.broker.approve.>", approveCh)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	conv := "discord:g1/thread-chatops-bridge"
+	// 1. Authorized approver (1001): chatops-gateway returns OK=true -> NATS message published with CapabilityRef object + Approved=true.
+	r.adapter.inbox <- WithInboundIdentity(InboundMessage{
+		Backend:      "discord",
+		Conversation: conv,
+		Kind:         "group",
+		AuthorID:     "1001",
+		MessageID:    "m-ok-1",
+		Text:         "/approve ar-01arz3ndektsv4rrffq69g5fav",
+	}, "1001", "discord:m-ok-1")
+
+	var raw *nats.Msg
+	select {
+	case raw = <-approveCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a2a.broker.approve message")
+	}
+
+	var wire ActionApprovalMessage
+	if err := json.Unmarshal(raw.Data, &wire); err != nil {
+		t.Fatalf("unmarshal ActionApprovalMessage: %v", err)
+	}
+	if !wire.Approved || wire.CapabilityRef == nil || wire.CapabilityRef.Revision == 0 || wire.DecisionID != "discord:m-ok-1" {
+		t.Fatalf("unexpected wire ActionApprovalMessage: %+v", wire)
+	}
+	waitFor(t, "chatops-gateway approval reply posted", func() bool {
+		posts := r.adapter.postTexts()
+		return len(posts) >= 1 && strings.Contains(posts[0], "approved (1/1)")
+	})
+
+	// 2. Unauthorized approver (1002): chatops-gateway returns OK=false -> refusal reply posted and NO NATS message published.
+	r.adapter.inbox <- WithInboundIdentity(InboundMessage{
+		Backend:      "discord",
+		Conversation: conv,
+		Kind:         "group",
+		AuthorID:     "1002",
+		MessageID:    "m-deny-1",
+		Text:         "/approve ar-01arz3ndektsv4rrffq69g5fav",
+	}, "1002", "discord:m-deny-1")
+
+	waitFor(t, "chatops-gateway refusal reply posted", func() bool {
+		posts := r.adapter.postTexts()
+		return len(posts) >= 2 && strings.Contains(posts[1], "not on the approval roster")
+	})
+	select {
+	case unexpected := <-approveCh:
+		t.Fatalf("unexpected NATS message on refused approval: %s", string(unexpected.Data))
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+

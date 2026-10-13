@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +36,7 @@ import (
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval/gateway"
 )
 
 // TestChatOpsGatewayApprovalPackageObeysThePolicy proves the composition this branch's unit tests
@@ -74,6 +77,7 @@ func TestChatOpsGatewayApprovalPackageObeysThePolicy(t *testing.T) {
 	ctx := context.Background()
 
 	grantTestWriters(ctx, t, admin)
+	grantChatOpsExtraCRs(ctx, t, admin)
 	applyPolicyFile(ctx, t, admin, filepath.Join("..", "..", "..", "config", "policy", "vap-agent-scope-journal.yaml"))
 
 	as := func(user string) client.Client {
@@ -111,9 +115,12 @@ func TestChatOpsGatewayApprovalPackageObeysThePolicy(t *testing.T) {
 	waitForPolicy(ctx, t, as(humanUser), mkPendingRecord(t))
 
 	roster := &agentv1alpha1.ApprovalRoster{
-		ObjectMeta: metav1.ObjectMeta{Name: "roster-x"},
+		ObjectMeta: metav1.ObjectMeta{Name: "roster-x", Namespace: testNS},
 		Spec: agentv1alpha1.ApprovalRosterSpec{
-			Approvers: []agentv1alpha1.Approver{{Platform: "slack", ID: "U02"}},
+			Approvers: []agentv1alpha1.Approver{
+				{Platform: "slack", ID: "U02"},
+				{Platform: "discord", ID: "99887766"},
+			},
 		},
 	}
 
@@ -227,6 +234,210 @@ func TestChatOpsGatewayApprovalPackageObeysThePolicy(t *testing.T) {
 			t.Fatalf("expected Forbidden, got: %v", err)
 		}
 	})
+
+	t.Run("the ChatOps gateway is admitted when clearing status.contested via /uncontest and denied if setting it", func(t *testing.T) {
+		seq++
+		ar := newActionRecord(fmt.Sprintf("ar-chatops-%02d", seq), now)
+		ar.Spec.ActorServiceAccount = brokerSA
+		ar.Spec.ActionID = fmt.Sprintf("%s%02d", testULID[:24], seq%100)
+		if err := admin.Create(ctx, ar); err != nil {
+			t.Fatalf("create record: %v", err)
+		}
+		// Undo controller sets PhaseUndone and Contested=true.
+		if err := statusUpdateAs(ctx, t, as, undoUser, ar, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Phase = agentv1alpha1.PhaseUndone
+			ar.Status.Contested = true
+		}); err != nil {
+			t.Fatalf("setting PhaseUndone + Contested=true as undo controller: %v", err)
+		}
+
+		gatewayClient := as(chatOpsUser)
+		fresh := &agentv1alpha1.ActionRecord{}
+		if err := gatewayClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("gateway reading the record: %v", err)
+		}
+		decision := approval.AuthorizeUncontest(roster, fresh, "slack:U02")
+		if !decision.Allowed {
+			t.Fatalf("AuthorizeUncontest refused a legitimate uncontest: %s", decision.Reason)
+		}
+		if err := approval.Write(ctx, gatewayClient, fresh, approval.ApplyUncontest); err != nil {
+			t.Fatalf("the ChatOps gateway was denied clearing status.contested via /uncontest: %v", err)
+		}
+		if fresh.Status.Contested {
+			t.Fatalf("expected status.contested to be cleared to false, got true")
+		}
+
+		// Attempting to set status.contested: false -> true as ChatOps gateway must be denied by VAP.
+		setErr := approval.Write(ctx, gatewayClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Contested = true
+		})
+		if setErr == nil {
+			t.Fatal("the ChatOps gateway was permitted to set status.contested=true")
+		}
+		if !apierrors.IsForbidden(setErr) {
+			t.Fatalf("expected Forbidden when ChatOps gateway sets status.contested=true, got: %v", setErr)
+		}
+	})
+
+	t.Run("the ChatOps gateway creates an UndoRequest CR on /undo and is denied if it sets status.phase=Undone or mutates status.timestamps", func(t *testing.T) {
+		agentObj := &agentv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "cluster-a-agent", Namespace: testNS},
+			Spec: agentv1alpha1.AgentSpec{
+				Tier:       agentv1alpha1.TierClusterAdmin,
+				Scope:      &agentv1alpha1.ScopeSpec{ProjectID: "proj-x", ClusterName: "cluster-a"},
+				Operations: &agentv1alpha1.OperationsSpec{ApprovalRosterRef: &agentv1alpha1.RosterRef{Name: roster.Name}},
+				Harness:    &agentv1alpha1.HarnessSpec{ClusterName: "cluster-a", Location: "us-central1"},
+			},
+		}
+		if err := admin.Create(ctx, agentObj); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create Agent CR: %v", err)
+		}
+		if err := admin.Create(ctx, roster.DeepCopy()); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create ApprovalRoster CR: %v", err)
+		}
+
+		seq++
+		ar := newActionRecord(fmt.Sprintf("ar-chatops-%02d", seq), now)
+		ar.Spec.ActorServiceAccount = brokerSA
+		ar.Spec.ActionID = fmt.Sprintf("%s%02d", testULID[:24], seq%100)
+		ar.Spec.Undo = &agentv1alpha1.UndoPlan{
+			Strategy:    agentv1alpha1.UndoRestore,
+			GeneratedAt: metav1.NewTime(now),
+			Validated:   true,
+			Steps: []agentv1alpha1.UndoStep{{
+				Op:     "apply",
+				Target: ar.Spec.Targets[0],
+				Object: &runtime.RawExtension{Raw: []byte(`{"replicas":2}`)},
+			}},
+		}
+		if err := admin.Create(ctx, ar); err != nil {
+			t.Fatalf("create record: %v", err)
+		}
+		if err := statusUpdateAs(ctx, t, as, brokerUser, ar, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Phase = agentv1alpha1.PhaseVerified
+		}); err != nil {
+			t.Fatalf("moving record to Verified as owning broker: %v", err)
+		}
+
+		gatewayClient := as(chatOpsUser)
+		d := &gateway.Dispatcher{Client: gatewayClient, Now: func() time.Time { return now }}
+		reply := d.Handle(ctx, "event-undo-envtest-1", "discord:99887766", "/undo "+ar.Name+" rollback bad release")
+		if !strings.Contains(reply, "undo requested") {
+			t.Fatalf("Dispatcher.Handle(/undo) reply = %q, want undo confirmation", reply)
+		}
+
+		urs := &agentv1alpha1.UndoRequestList{}
+		if err := gatewayClient.List(ctx, urs, client.InNamespace(testNS)); err != nil {
+			t.Fatalf("list UndoRequests: %v", err)
+		}
+		var foundUR *agentv1alpha1.UndoRequest
+		for i := range urs.Items {
+			if urs.Items[i].Spec.ActionRef.Name == ar.Name {
+				foundUR = &urs.Items[i]
+				break
+			}
+		}
+		if foundUR == nil {
+			t.Fatalf("expected UndoRequest CR targeting %s, found none", ar.Name)
+		}
+		if foundUR.Spec.RequestedBy != "discord:99887766" || foundUR.Spec.Reason != "rollback bad release" {
+			t.Errorf("UndoRequest spec = %+v", foundUR.Spec)
+		}
+
+		// Attempting to directly set status.phase = Undone as ChatOps gateway must be denied by VAP.
+		fresh := &agentv1alpha1.ActionRecord{}
+		if err := gatewayClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("get record: %v", err)
+		}
+		phaseErr := approval.Write(ctx, gatewayClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Phase = agentv1alpha1.PhaseUndone
+		})
+		if phaseErr == nil {
+			t.Fatal("the ChatOps gateway was permitted to directly set status.phase = Undone")
+		}
+		if !apierrors.IsForbidden(phaseErr) {
+			t.Fatalf("expected Forbidden when ChatOps gateway sets status.phase = Undone, got: %v", phaseErr)
+		}
+
+		// Attempting to mutate status.timestamps as ChatOps gateway must be denied by VAP.
+		if err := gatewayClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("get record: %v", err)
+		}
+		tsErr := approval.Write(ctx, gatewayClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Timestamps = &agentv1alpha1.ActionTimestamps{Submitted: ptrTime(now)}
+		})
+		if tsErr == nil {
+			t.Fatal("the ChatOps gateway was permitted to mutate status.timestamps")
+		}
+		if !apierrors.IsForbidden(tsErr) {
+			t.Fatalf("expected Forbidden when ChatOps gateway mutates status.timestamps, got: %v", tsErr)
+		}
+	})
+
+	t.Run("the owning broker is denied if it attempts to mutate status.approvals or status.contested", func(t *testing.T) {
+		ar := mkPendingRecord(t)
+		brokerClient := as(brokerUser)
+
+		fresh := &agentv1alpha1.ActionRecord{}
+		if err := brokerClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("broker reading the record: %v", err)
+		}
+		appErr := approval.Write(ctx, brokerClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Approvals = &agentv1alpha1.ActionApprovals{
+				Required: 1,
+				Granted:  []agentv1alpha1.ApprovalEntry{{Principal: "slack:U02", At: metav1.NewTime(now)}},
+			}
+		})
+		if appErr == nil {
+			t.Fatal("the owning broker was permitted to mutate status.approvals")
+		}
+		if !apierrors.IsForbidden(appErr) {
+			t.Fatalf("expected Forbidden when owning broker mutates status.approvals, got: %v", appErr)
+		}
+
+		// Have undo controller set Contested=true, then verify owning broker cannot clear or set status.contested.
+		if err := statusUpdateAs(ctx, t, as, undoUser, ar, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Phase = agentv1alpha1.PhaseUndone
+			ar.Status.Contested = true
+		}); err != nil {
+			t.Fatalf("undo controller setting Contested=true: %v", err)
+		}
+		if err := brokerClient.Get(ctx, client.ObjectKeyFromObject(ar), fresh); err != nil {
+			t.Fatalf("broker reading the record: %v", err)
+		}
+		contestedErr := approval.Write(ctx, brokerClient, fresh, func(ar *agentv1alpha1.ActionRecord) {
+			ar.Status.Contested = false
+		})
+		if contestedErr == nil {
+			t.Fatal("the owning broker was permitted to mutate status.contested")
+		}
+		if !apierrors.IsForbidden(contestedErr) {
+			t.Fatalf("expected Forbidden when owning broker mutates status.contested, got: %v", contestedErr)
+		}
+	})
+}
+
+func grantChatOpsExtraCRs(ctx context.Context, t *testing.T, c client.Client) {
+	t.Helper()
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-agents-chatops-extra-test-writer"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"kubeagents.x-k8s.io"},
+			Resources: []string{"agents", "approvalrosters", "undorequests"},
+			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+		}},
+	}
+	if err := c.Create(ctx, role); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create extra test ClusterRole: %v", err)
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-agents-chatops-extra-test-writer"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: testWriterGroup}},
+	}
+	if err := c.Create(ctx, binding); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create extra test ClusterRoleBinding: %v", err)
+	}
 }
 
 // statusUpdateAs applies mutate to ar's status as user and refreshes ar in place with the server's

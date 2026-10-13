@@ -228,7 +228,7 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 	// here; the session's are derived at mint time. An unscoped ack grant is
 	// exactly as dangerous in any of them.
 	want := map[string][]string{
-		"gateway":       {"$JS.ACK.TASKS.>"},
+		"gateway":       {"$JS.ACK.TASKS.>", "$JS.ACK.BROKER.>"},
 		a2aBridgeUser:   {"$JS.ACK.TASKS.>"},
 		a2aAgentBusUser: nil,
 		"provision":     nil,
@@ -244,11 +244,12 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		// ack to hold — and a consumer on KV_cap is precisely the thing its
 		// grants are shaped to forbid, because one would be a live feed of
 		// every capability in flight.
-		"verifier": nil,
-		"seed":     nil,
-		"web":      nil,
-		"console":  nil,
-		"sys":      nil,
+		"verifier":      nil,
+		a2aBrokerUser:   {"$JS.ACK.BROKER.>"},
+		"seed":          nil,
+		"web":           nil,
+		"console":       nil,
+		"sys":           nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -333,6 +334,8 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint",
 		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
 		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
+		// BROKER: a2a.broker.>, 72h, 1GiB, 256 msgs/subject
+		"BROKER", "a2a.broker.>", "--max-msgs-per-subject=256",
 		// max_bytes discipline
 		"1073741824", "--discard=old",
 		// KV buckets, capped like the streams
@@ -653,18 +656,22 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 		"$JS.API.STREAM.INFO.DIRECTORY",
 		"$JS.API.STREAM.INFO.TOPICS-STATE",
 		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.STREAM.INFO.BROKER",
 		"$JS.API.CONSUMER.CREATE.TASKS.>",
 		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
 		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.CREATE.BROKER.>",
 		"$JS.API.CONSUMER.INFO.TASKS.*",
 		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
 		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.INFO.BROKER.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
 		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.BROKER.*",
 		"_INBOX.web.>",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -725,18 +732,22 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.STREAM.INFO.DIRECTORY",
 		"$JS.API.STREAM.INFO.TOPICS-STATE",
 		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.STREAM.INFO.BROKER",
 		"$JS.API.CONSUMER.CREATE.TASKS.>",
 		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
 		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.CREATE.BROKER.>",
 		"$JS.API.CONSUMER.INFO.TASKS.*",
 		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
 		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.INFO.BROKER.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
 		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.BROKER.*",
 		"chat.console.*.in",
 		"_INBOX.console.>",
 	}
@@ -1044,6 +1055,7 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
 		{"app": "test-agent-a2a-verifier"},
+		{"app": "test-agent-a2a-broker"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
@@ -4557,7 +4569,9 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	want := []string{
 		"a2a.tasks." + a2aBridgeAddressee + ".*.events",
+		"a2a.broker.propose.*.*",
 		"$KV.runtime-state.>",
+		"$KV.cap.hop." + a2aBridgeAddressee + ".*",
 	}
 	want = append(want, a2aBridgeJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX."+a2aBridgeUser+".>")
@@ -4598,7 +4612,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no bridge path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "BROKER", "KV_runtime-state", "KV_session-state", "KV_cap"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -4678,12 +4692,14 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// DeepEqual above. Anything outside these shapes has to be argued for in
 	// that function's comment rather than added quietly.
 	allowedShapes := map[string]bool{}
-	for _, s := range []string{"TASKS", "KV_runtime-state"} {
+	for _, s := range []string{"TASKS", "BROKER", "KV_runtime-state"} {
 		allowedShapes["$JS.API.STREAM.INFO."+s] = true
 		allowedShapes["$JS.API.CONSUMER.CREATE."+s+".>"] = true
 	}
 	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
+	allowedShapes["$JS.API.DIRECT.GET.BROKER.>"] = true
+	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.BROKER.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
 	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -4745,7 +4761,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 			"$JS.ACK.TASKS.1.2.3",
 		)
 	}
-	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"} {
+	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "BROKER", "KV_runtime-state", "KV_session-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
 			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
@@ -4811,6 +4827,7 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 		"stream add " + a2aTasksStream + " ",
 		"stream add " + a2aTopicsStateStream + " ",
 		"stream add " + a2aTopicsJournalStream + " ",
+		"stream add " + a2aBrokerStream + " ",
 		"kv add " + a2aRuntimeStateBucket + " ",
 	} {
 		if !strings.Contains(script, create) {
@@ -4819,10 +4836,11 @@ func TestBusGrantsNameStreamsTheProvisionScriptCreates(t *testing.T) {
 	}
 	// Every grant names one of those constants, so the check above covers
 	// the whole list rather than the four names this test happens to know.
-	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
+	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aBrokerStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
 	for who, grants := range map[string][]string{
 		a2aBridgeUser:   a2aBridgeJetStreamGrants(),
 		a2aAgentBusUser: a2aAgentJetStreamGrants(),
+		a2aBrokerUser:   a2aBrokerJetStreamGrants(),
 	} {
 		for _, grant := range grants {
 			if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
@@ -4864,6 +4882,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		"a2a.broker.approve.*.*",
+		"a2a.broker.propose.*.*",
 		"$KV.session-state.>",
 		"chat.console.*.out",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -4873,7 +4893,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$KV.cap.root.*",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
-	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.ACK.BROKER.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
@@ -4906,7 +4926,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no gateway path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "BROKER", "KV_runtime-state", "KV_session-state", "KV_cap"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -4978,14 +4998,18 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// comment rather than added quietly.
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	allowedShapes := map[string]bool{
-		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
-		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
-		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*": true,
-		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>":        true,
-		"$JS.API.STREAM.INFO." + kvSessionState:              true,
-		"$JS.API.DIRECT.GET." + kvSessionState + ".>":        true,
-		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>":   true,
-		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*":   true,
+		"$JS.API.STREAM.INFO." + a2aTasksStream:               true,
+		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":    true,
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*":  true,
+		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>":         true,
+		"$JS.API.STREAM.INFO." + a2aBrokerStream:              true,
+		"$JS.API.CONSUMER.CREATE." + a2aBrokerStream + ".>":   true,
+		"$JS.API.CONSUMER.MSG.NEXT." + a2aBrokerStream + ".*": true,
+		"$JS.API.DIRECT.GET." + a2aBrokerStream + ".>":        true,
+		"$JS.API.STREAM.INFO." + kvSessionState:               true,
+		"$JS.API.DIRECT.GET." + kvSessionState + ".>":         true,
+		"$JS.API.CONSUMER.CREATE." + kvSessionState + ".>":    true,
+		"$JS.API.CONSUMER.DELETE." + kvSessionState + ".*":    true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5087,10 +5111,10 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	if script := a2aProvisionScript(a2aTestAgent()); !strings.Contains(script, "kv add "+a2aSessionStateBucket+" ") {
 		t.Errorf("the provision script has no %q; the gateway's grant names a bucket nothing creates", "kv add "+a2aSessionStateBucket)
 	}
-	// Every JetStream grant names TASKS or that bucket's stream, so the two
-	// checks above cover the whole list rather than the entries this test
+	// Every JetStream grant names TASKS, BROKER or that bucket's stream, so
+	// the checks above cover the whole list rather than the entries this test
 	// happens to spell.
-	known := []string{a2aTasksStream, kvSessionState}
+	known := []string{a2aTasksStream, a2aBrokerStream, kvSessionState}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
 			t.Errorf("gateway grant %q names a stream outside %v, which is what this pair is held to", grant, known)
@@ -5542,16 +5566,17 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	kvSessionState := a2aKVStreamPrefix + "session-state"
 	kvRuntimeState := a2aKVStreamPrefix + a2aRuntimeStateBucket
 	kvCap := a2aKVStreamPrefix + a2aCapBucket
-	// console holds web's four streams and verbs and nothing on any KV_*
+	// console holds web's five streams and verbs and nothing on any KV_*
 	// stream: STREAM.INFO's subjects_filter body would list every key.
 	consoleStreams := a2aSameVerbsOn(
-		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
+		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream, a2aBrokerStream},
 		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
-				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				a2aTasksStream:  {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				a2aBrokerStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				kvSessionState:  {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop
@@ -5565,8 +5590,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
-				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				a2aTasksStream:  {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				a2aBrokerStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				kvRuntimeState:  {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				kvCap:           {"KV"},
 			},
 		},
 		// The other half of what `worker` held. Two streams, two read verbs,
@@ -5588,7 +5615,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		"web": {
 			streams: a2aSameVerbsOn(
-				[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
+				[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream, a2aBrokerStream},
 				"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT"),
 			accountLevel: []string{"$JS.API.INFO"},
 		},
@@ -5619,6 +5646,12 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			// not one per caller.
 			callout: true,
 			streams: map[string][]string{kvCap: {"STREAM.INFO", "DIRECT.GET", "STREAM.MSG.GET"}},
+		},
+		a2aBrokerUser: {
+			callout: true,
+			streams: map[string][]string{
+				a2aBrokerStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+			},
 		},
 	}
 	var staticRows, calloutRows []string

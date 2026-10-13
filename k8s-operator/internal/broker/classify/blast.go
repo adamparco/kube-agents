@@ -158,11 +158,17 @@ func EffectiveMaxObjects(caps ...int) int {
 // denominator a function of how recently the cluster was noisy.
 var ExcludedFromDenominator = []KindRef{
 	{Group: "", Kind: "Pod"},
+	{Group: "", Kind: "Endpoints"},
 	{Group: "apps", Kind: "ReplicaSet"},
 	{Group: "apps", Kind: "ControllerRevision"},
 	{Group: "discovery.k8s.io", Kind: "EndpointSlice"},
 	{Group: "", Kind: "Event"},
 	{Group: "events.k8s.io", Kind: "Event"},
+	{Group: "coordination.k8s.io", Kind: "Lease"},
+	{Group: "metrics.k8s.io", Kind: "PodMetrics"},
+	{Group: "cilium.io", Kind: "CiliumEndpoint"},
+	{Group: "kubeagents.x-k8s.io", Kind: "ActionRecord"},
+	{Group: "kubeagents.x-k8s.io", Kind: "UndoRequest"},
 }
 
 // IsExcludedFromDenominator reports whether a kind is excluded. Objects with an ownerReference are

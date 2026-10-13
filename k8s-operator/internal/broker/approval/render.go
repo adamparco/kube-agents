@@ -60,9 +60,29 @@ type Message struct {
 	ExpiresAt time.Time
 
 	// Resolution is empty while the record is still PendingApproval, and one of "approved",
-	// "rejected", or "expired" once it leaves that phase — the notifier uses it to decide whether
-	// to post a new message or edit an existing one to a terminal state (chat-approval.md §2).
+	// "rejected", "expired", "verified", "rolled back", "failed", or "undone" once it leaves that
+	// phase — the notifier uses it to decide whether to post a new message or edit an existing one
+	// to a terminal state (chat-approval.md §2).
 	Resolution string
+
+	// Report carries the structured 4-beat ActionReport (Noticed, Did, Verified, Undo) on terminal
+	// execution phases.
+	Report *agentv1alpha1.ActionReport
+
+	// Escalation carries rung-5 escalation details (PageRequested, PauseRequested, Reason) when set.
+	Escalation *agentv1alpha1.ActionEscalation
+
+	// Undoable reports whether the record carries a non-none UndoPlan.
+	Undoable bool
+
+	// Contested reports whether status.contested is currently true.
+	Contested bool
+
+	// UndoneBy records the reverse action ID when status.phase is Undone.
+	UndoneBy string
+
+	// StatusMessage is the one-line status.message when present.
+	StatusMessage string
 }
 
 // RenderMessage builds a Message from an ActionRecord and the roster it resolved against. The
@@ -72,10 +92,16 @@ type Message struct {
 // the FIRST notification a human sees already states the true required count and deadline.
 func RenderMessage(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.ApprovalRoster) Message {
 	m := Message{
-		RecordName:  journal.RecordName(ar.Spec.ActionID),
-		Intent:      ar.Spec.Intent,
-		Class:       ar.Spec.Classification.Class,
-		RequesterID: ar.Spec.Requester.ID,
+		RecordName:    journal.RecordName(ar.Spec.ActionID),
+		Intent:        ar.Spec.Intent,
+		Class:         ar.Spec.Classification.Class,
+		RequesterID:   ar.Spec.Requester.ID,
+		Report:        ar.Status.Report,
+		Escalation:    ar.Status.Escalation,
+		Undoable:      ar.Spec.Undo != nil && ar.Spec.Undo.Strategy != agentv1alpha1.UndoNone,
+		Contested:     ar.Status.Contested,
+		UndoneBy:      ar.Status.UndoneBy,
+		StatusMessage: ar.Status.Message,
 	}
 
 	for _, r := range ar.Spec.Classification.Reasons {
@@ -94,7 +120,11 @@ func RenderMessage(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.Approva
 			m.Granted = append(m.Granted, e.Principal)
 		}
 	} else if roster != nil {
-		m.Required = roster.EffectiveMinApprovals()
+		required := roster.EffectiveMinApprovals()
+		if ar.Spec.AttributionUnverified && !roster.SelfApprovalAllowed() && required < 2 {
+			required = 2
+		}
+		m.Required = required
 		m.ExpiresAt = ar.CreationTimestamp.Add(roster.EffectiveTTL())
 	}
 
@@ -105,6 +135,14 @@ func RenderMessage(ar *agentv1alpha1.ActionRecord, roster *agentv1alpha1.Approva
 		m.Resolution = "rejected"
 	case agentv1alpha1.PhaseExpired:
 		m.Resolution = "expired"
+	case agentv1alpha1.PhaseVerified:
+		m.Resolution = "verified"
+	case agentv1alpha1.PhaseRolledBack:
+		m.Resolution = "rolled back"
+	case agentv1alpha1.PhaseFailed:
+		m.Resolution = "failed"
+	case agentv1alpha1.PhaseUndone:
+		m.Resolution = "undone"
 	}
 
 	return m
@@ -139,6 +177,41 @@ func (m Message) Text() string {
 		return b.String()
 	case "expired":
 		fmt.Fprintf(&b, "%s: expired unreviewed — %s\n", m.RecordName, m.Intent)
+		return b.String()
+	case "verified", "rolled back", "failed", "undone":
+		fmt.Fprintf(&b, "%s: %s — %s\n", m.RecordName, m.Resolution, m.Intent)
+		if m.Report != nil {
+			if m.Report.Noticed != "" {
+				fmt.Fprintf(&b, "Noticed: %s\n", m.Report.Noticed)
+			}
+			if m.Report.Did != "" {
+				fmt.Fprintf(&b, "Did: %s\n", m.Report.Did)
+			}
+			if m.Report.Verified != "" {
+				fmt.Fprintf(&b, "Verified: %s\n", m.Report.Verified)
+			}
+			if m.Report.Undo != "" {
+				fmt.Fprintf(&b, "Undo: %s\n", m.Report.Undo)
+			}
+		} else if m.StatusMessage != "" {
+			fmt.Fprintf(&b, "Detail: %s\n", m.StatusMessage)
+		}
+		if m.Escalation != nil {
+			fmt.Fprintf(&b, "Escalation: pageRequested=%t pauseRequested=%t", m.Escalation.PageRequested, m.Escalation.PauseRequested)
+			if m.Escalation.Reason != "" {
+				fmt.Fprintf(&b, " (%s)", m.Escalation.Reason)
+			}
+			b.WriteString("\n")
+		}
+		if m.UndoneBy != "" {
+			fmt.Fprintf(&b, "Undone by: %s\n", m.UndoneBy)
+		}
+		if m.Resolution == "verified" && m.Undoable {
+			fmt.Fprintf(&b, "Reply: /undo %s <reason> to reverse this change\n", m.RecordName)
+		}
+		if m.Contested {
+			fmt.Fprintf(&b, "Resource is CONTESTED (mutations frozen). Reply: /uncontest %s to clear\n", m.RecordName)
+		}
 		return b.String()
 	}
 

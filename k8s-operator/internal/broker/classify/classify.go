@@ -262,13 +262,15 @@ func (c *Classifier) classifyOne(in *Input, op *ResolvedOp) (opResult, error) {
 		}
 	}
 
-	// The blast-radius gate. A count rule, not a table rule.
-	if op.BlastRadius.Objects > GateObjectThreshold {
+	// The blast-radius gate. A count rule, combined across the code floor (GateObjectThreshold),
+	// the caller's declared maxObjects, and any matching ChangePolicy rule maxObjects via min().
+	effCap := EffectiveMaxObjects(append([]int{GateObjectThreshold, in.MaxObjects}, caps...)...)
+	if op.BlastRadius.Objects > effCap {
 		class = Max(class, ClassGated)
 		reasons = append(reasons, Reason{
 			Rule:   RuleBlastRadiusCap,
 			Class:  ClassGated.String(),
-			Detail: fmt.Sprintf("affects %d objects, over the %d that run without approval", op.BlastRadius.Objects, GateObjectThreshold),
+			Detail: fmt.Sprintf("affects %d objects, over the %d that run without approval", op.BlastRadius.Objects, effCap),
 		})
 	}
 

@@ -294,6 +294,7 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		agentIdentity(agent, ns),
 		bridgeIdentity(),
 		verifierIdentity(agent, ns),
+		brokerIdentity(agent, ns),
 		seedIdentity(),
 		webIdentity(),
 		consoleIdentity(),
@@ -326,6 +327,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	publish := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		"a2a.broker.approve.*.*",
+		"a2a.broker.propose.*.*",
 		// The session registry's data plane. The bucket is spelled here and
 		// named by constant inside the grant function; the two are held
 		// together by TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo,
@@ -354,6 +357,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
 		"$JS.ACK.TASKS.>",
+		"$JS.ACK."+a2aBrokerStream+".>",
 		"$JS.FC.>",
 		"_INBOX.gateway.>",
 	)
@@ -488,6 +492,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.DIRECTORY",
 			"$JS.API.STREAM.CREATE.TOPICS-STATE",
 			"$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+			"$JS.API.STREAM.CREATE.BROKER",
 			"$JS.API.STREAM.CREATE.KV_runtime-state",
 			"$JS.API.STREAM.CREATE.KV_session-state",
 			"$JS.API.STREAM.CREATE.KV_cap",
@@ -495,6 +500,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
 			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.INFO.BROKER",
 			"$JS.API.STREAM.INFO.KV_runtime-state",
 			"$JS.API.STREAM.INFO.KV_session-state",
 			"$JS.API.STREAM.INFO.KV_cap",
@@ -600,6 +606,36 @@ func verifierIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity
 // prefix. cmd/verifier spells the same constant; they must agree or every
 // store read times out on a reply the grant does not cover.
 const a2aVerifierUser = "verifier"
+
+// a2aBrokerUser is the Action Broker's NATS user name and inbox prefix.
+const a2aBrokerUser = "broker"
+
+// broker: the Action Broker, sole writer of `a2a.broker.events.*.*` and
+// `a2a.broker.dlq.*.*`.
+func brokerIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.broker.events.*.*",
+		"a2a.broker.dlq.*.*",
+		"a2a.cap.verify." + a2aBrokerUser,
+		"$JS.ACK." + a2aBrokerStream + ".>",
+		"_INBOX." + a2aBrokerUser + ".>",
+	}
+	publish = append(publish, a2aBrokerJetStreamGrants()...)
+	return a2aIdentity{
+		user:           a2aBrokerUser,
+		account:        a2aAccountApp,
+		comment:        "the Action Broker: consumes proposals and approvals on BROKER, verifies capabilities via a2a.cap.verify.broker, and publishes lifecycle events.",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aBrokerServiceAccountName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.broker.propose.*.*",
+			"a2a.broker.approve.*.*",
+			"a2a.cap.reply." + a2aBrokerUser + ".>",
+			"_INBOX." + a2aBrokerUser + ".>",
+		},
+	}
+}
 
 // agent: the platform agent container, on the blackboard and nowhere else.
 //
@@ -714,7 +750,9 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 func bridgeIdentity() a2aIdentity {
 	publish := []string{
 		"a2a.tasks." + a2aBridgeAddressee + ".*.events",
+		"a2a.broker.propose.*.*",
 		"$KV.runtime-state.>",
+		"$KV.cap.hop." + a2aBridgeAddressee + ".*",
 	}
 	publish = append(publish, a2aBridgeJetStreamGrants()...)
 	publish = append(publish,
@@ -741,9 +779,9 @@ func bridgeIdentity() a2aIdentity {
 	// verifier's identity check into a self-assertion — see the same
 	// argument at length in a2a/authcallout/session.go.
 	//
-	// Deliberately NOT granted, for the same reason session pods are not
-	// granted it: `$KV.cap.hop.<...>.*`. This executor never attenuates,
-	// because it never delegates onward.
+	// `$KV.cap.hop.platform.*` above lets this executor mint attenuated
+	// capability hops in its own addressee namespace when proposing an
+	// action to the Action Broker.
 	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
 
 	return a2aIdentity{
@@ -881,18 +919,22 @@ func webIdentity() a2aIdentity {
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
 			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.INFO.BROKER",
 			"$JS.API.CONSUMER.CREATE.TASKS.>",
 			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
 			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.CREATE.BROKER.>",
 			"$JS.API.CONSUMER.INFO.TASKS.*",
 			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
 			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
 			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.INFO.BROKER.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
 			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.BROKER.*",
 			"_INBOX.web.>",
 		},
 		subscribe: []string{
@@ -953,18 +995,22 @@ func consoleIdentity() a2aIdentity {
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
 			"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+			"$JS.API.STREAM.INFO.BROKER",
 			"$JS.API.CONSUMER.CREATE.TASKS.>",
 			"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
 			"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
 			"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+			"$JS.API.CONSUMER.CREATE.BROKER.>",
 			"$JS.API.CONSUMER.INFO.TASKS.*",
 			"$JS.API.CONSUMER.INFO.DIRECTORY.*",
 			"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
 			"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.INFO.BROKER.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
 			"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 			"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+			"$JS.API.CONSUMER.MSG.NEXT.BROKER.*",
 			"chat.console.*.in",
 			"_INBOX.console.>",
 		},

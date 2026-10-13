@@ -27,6 +27,7 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/pipeline"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
@@ -35,15 +36,22 @@ import (
 // Short enough that "approve" in chat feels like it did something; long enough that a fleet of
 // agents polling their own namespace is not itself a load concern -- ActionRecords needing this
 // loop's attention (PendingApproval or freshly-Pending) are, by construction, rare and short-lived.
-const resumePollInterval = 5 * time.Second
+const resumePollInterval = 1 * time.Second
 
 // runResumeLoop drives pipeline.ResumeController without a controller-runtime manager or watch —
 // see the call site in run() for why. It exits when ctx is done; the caller does not wait on it,
 // because the resumption loop racing an hours-long TTL has nothing useful to say about broker
 // shutdown that the HTTP server's own graceful-shutdown handling does not already say better.
-func runResumeLoop(ctx context.Context, c client.Client, pipe *pipeline.Pipeline, records pipeline.RecordStore, namespace string) {
+func runResumeLoop(ctx context.Context, c client.Client, pipe *pipeline.Pipeline, records pipeline.RecordStore, namespace string, contested *broker.ContestedIndex, events ...pipeline.EventPublisher) {
 	log := ctrllog.Log.WithName("resume")
-	rc := &pipeline.ResumeController{Client: c, Pipeline: pipe, Records: records}
+	var ev pipeline.EventPublisher
+	for _, e := range events {
+		if e != nil {
+			ev = e
+			break
+		}
+	}
+	rc := &pipeline.ResumeController{Client: c, Pipeline: pipe, Records: records, Events: ev}
 
 	ticker := time.NewTicker(resumePollInterval)
 	defer ticker.Stop()
@@ -52,9 +60,75 @@ func runResumeLoop(ctx context.Context, c client.Client, pipe *pipeline.Pipeline
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if contested != nil {
+				if err := syncContestedIndex(ctx, c, namespace, contested); err != nil {
+					log.Error(err, "resume: syncing contested index")
+				}
+			}
 			resumeSweep(ctx, c, rc, namespace, log)
 		}
 	}
+}
+
+// syncContestedIndex reconciles the in-memory ContestedIndex from ActionRecords in namespace.
+// Targets of ActionRecords with status.contested == true are marked in the index, and targets
+// whose ActionRecords have status.contested == false are cleared unless another ActionRecord
+// still contests the same target.
+func syncContestedIndex(ctx context.Context, c client.Client, namespace string, contested *broker.ContestedIndex) error {
+	if contested == nil {
+		return nil
+	}
+	var list agentv1alpha1.ActionRecordList
+	if err := c.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+
+	stillContested := make(map[string]bool)
+	for i := range list.Items {
+		ar := &list.Items[i]
+		if !ar.Status.Contested {
+			continue
+		}
+		for _, target := range ar.Spec.Targets {
+			stillContested[broker.ContestedKey(target)] = true
+		}
+	}
+
+	for i := range list.Items {
+		ar := &list.Items[i]
+		if ar.Status.Contested {
+			continue
+		}
+		for _, target := range ar.Spec.Targets {
+			if !stillContested[broker.ContestedKey(target)] {
+				contested.Clear(target)
+			} else if e, ok := contested.Lookup(target); ok && (e.ActionID == ar.Name || (ar.Spec.ActionID != "" && e.ActionID == ar.Spec.ActionID)) {
+				contested.Clear(target)
+			}
+		}
+	}
+
+	for i := range list.Items {
+		ar := &list.Items[i]
+		if !ar.Status.Contested {
+			continue
+		}
+		since := ar.CreationTimestamp.Time
+		if since.IsZero() && ar.Status.Timestamps != nil && ar.Status.Timestamps.Submitted != nil {
+			since = ar.Status.Timestamps.Submitted.Time
+		}
+		if since.IsZero() {
+			since = time.Now().UTC()
+		}
+		reason := ar.Status.Message
+		if reason == "" {
+			reason = "contested via ActionRecord"
+		}
+		for _, target := range ar.Spec.Targets {
+			contested.Mark(target, ar.Name, since, reason)
+		}
+	}
+	return nil
 }
 
 // reconciler is the one method resumeSweep needs from pipeline.ResumeController, named locally so

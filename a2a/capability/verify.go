@@ -121,6 +121,15 @@ func (r *Resolver) Resolve(ctx context.Context, caller string, ref Ref) (Entry, 
 				// than trusted.
 				return Entry{}, refuse("a root carries a parent")
 			}
+			// Propagate the gateway-attested root Requester and any root
+			// EnvelopeSHA256 onto the resolved leaf so a hop that omitted
+			// Requester inherits the canonical root initiator.
+			if cur.Requester != "" {
+				leaf.Requester = cur.Requester
+			}
+			if cur.EnvelopeSHA256 != "" && leaf.EnvelopeSHA256 == "" {
+				leaf.EnvelopeSHA256 = cur.EnvelopeSHA256
+			}
 			return leaf, nil
 		}
 		if cur.Parent == nil {

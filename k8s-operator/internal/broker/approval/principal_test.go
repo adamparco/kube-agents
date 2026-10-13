@@ -34,6 +34,12 @@ func TestGoogleChatPrincipal(t *testing.T) {
 	}
 }
 
+func TestDiscordPrincipal(t *testing.T) {
+	if got := approval.DiscordPrincipal("987654321098765432"); got != "discord:987654321098765432" {
+		t.Errorf("got %q", got)
+	}
+}
+
 func TestSamePrincipal(t *testing.T) {
 	cases := []struct {
 		a, b string
@@ -42,6 +48,8 @@ func TestSamePrincipal(t *testing.T) {
 		{"slack:U01", "slack:U01", true},
 		{"slack:U01", "slack:U02", false},
 		{"slack:U01", "googlechat:U01", false},
+		{"discord:123", "discord:123", true},
+		{"discord:123", "slack:123", false},
 		{"", "", false}, // empty never matches, even itself
 		{"slack:U01", "", false},
 	}

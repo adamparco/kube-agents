@@ -67,19 +67,13 @@ the parent allocates it, and §5's "read the last five words of the claim as the
 discharged. That is a happier answer than §5 expected: it asked for a new credential-issuing
 mechanism and the runtime already had one.
 
-**Not built: the second hop.** §3 draws gateway → broker A → broker B, and the product has
-gateway → session pod. There is no stage-3 dispatcher; the gateway's delegate flow spawns a
-_successor_ session whose root the gateway mints itself, so it is hop 1 twice rather than hop 2.
-Attenuation therefore ships as library, permission and verifier support with **no production
-caller**, exercised by conformance tests and by a live probe holding two real session credentials.
-A reader must not take the narrowing demonstration as evidence that a shipped component narrows.
-Session pods deliberately hold no `$KV.cap.hop.<pod>.*` grant for the same reason: granting a
-capability nothing uses is how a hole gets in ahead of the code that would have justified it.
+**Built and enforcing (10/9): the second hop to the Action Broker, approval roots, and requester/digest binding.** While agent-to-agent delegation still spawns a _successor_ session whose root the gateway mints itself, the **Action Broker (`broker`)** is now a production second-hop capability consumer (`gateway → session/bridge → broker` for action proposals, and `gateway → broker` for human approvals):
 
-**Not built, and still open: everything §5 lists.** Nothing expires. Revocation still names no
-actor. The envelope still has no requester field. And the auth callout's signing seed is still the
-largest concentration in the deployment - see the custody note at the end of §5, which is now
-measured against a live install rather than asserted.
+- **Write-only hop minting (`Minter.MintHop`).** Session pods (`$KV.cap.hop.<pod>.*`) and the Hermes bridge (`$KV.cap.hop.platform.*`) hold write on their own hop prefix and no read on `KV_cap`. When proposing a gated action, they call `Minter.MintHop(ctx, self, n, parentRef, child)` to write `$KV.cap.hop.<self>.<n>` directly — setting `Delegate: "broker"`, `Tier: TierDeveloperTeam`, and `EnvelopeSHA256` (the 64-character lowercase hex SHA-256 of the RFC 8785 JCS-canonicalized `ActionEnvelope`) — without reading the parent entry from `KV_cap`.
+- **Non-delegable approval roots (`ApprovalRootKey` and `VerbBrokerApprove`).** When an authorized human clicks Approve in chat, the gateway mints a fresh root capability under `$KV.cap.root.*` using `ApprovalRootKey(actionID, decisionID)` (`"root.approve-" + actionID + "-" + decisionID`, validated as a single NATS token with no `.`, `*`, `>`, `/`, or whitespace), naming `Delegate: "broker"`, `Requester: <clicker-principal>`, and `EnvelopeSHA256: <approved-jcs-sha256>`. `Permits` refuses `VerbBrokerApprove` (`"broker.approve"`, alias `VerbActionApprove`) whenever `e.Parent != nil`, enforcing that approval authority can only originate at a gateway-minted root and can never be delegated by a hop.
+- **Requester and payload digest propagation (`Entry.Requester`, `Entry.EnvelopeSHA256`).** Root entries carry `Requester` (`json:"requester,omitempty"`) and optional `EnvelopeSHA256` (`json:"envelopeSha256,omitempty"`). `Narrows(parent, child)` refuses any child that alters a non-empty `parent.Requester` or `parent.EnvelopeSHA256`, `Resolver.Resolve` propagates the root's `Requester` (and `EnvelopeSHA256` when unset on the leaf) onto the resolved leaf, and the verifier returns both in `capability.Response` (only when `Allowed: true`, never on refusal) over `a2a.cap.verify.broker` → `a2a.cap.reply.broker.>`.
+
+**Not built, and still open: expiry, revocation actor, and seed custody in §5.** Nothing in `$KV.cap` expires by itself (though the Action Broker enforces envelope TTLs and single-use `decisionId` replay protection in its own state machine). Revocation still names no actor. And the auth callout's signing seed is still the largest concentration in the deployment - see the custody note at the end of §5, which is now measured against a live install rather than asserted.
 
 ## 1. What this decides, and what it supersedes
 
@@ -126,15 +120,11 @@ four is necessary rather than sufficient. Against that:
   readable after the fact by anyone auditing. The store does not give append-only on its own -- see
   "every reference pins a revision" below -- so the audit value rests on that pinning, not on the
   bucket.
-- **Attributable.** This is the property the document exists to carry, and as specified it does not
-  fully carry it -- so read this bullet as the target rather than as a claim of conformance. The
-  root is minted from the requester's verified identity and every hop descends from it, so the
-  chain ties the work to one origin without a correlation exercise across logs. Two gaps, both in
-  §5. The chain terminates at a request id and no entry holds a requester, so turning that origin
-  into "which human" is still a lookup elsewhere, and `02` §2.3 asks for the human by name. And it
-  is conditional on a request-scoped caller identity: where one identity serves several requests at
-  once a resolution can attach to the wrong chain, and the walk then names the wrong origin
-  confidently, which is worse than naming none.
+- **Attributable.** This is the property the document exists to carry. The
+  root is minted from the requester's verified identity (`Entry.Requester`, added 10/9) and every hop descends from it, so the
+  chain ties the work to one origin and one canonical human principal (`slack:U...`, `googlechat:users/...`, `discord:...`) without a correlation exercise across logs. One condition remains in
+  §5: attribution is conditional on a request-scoped caller identity (or a payload-bound `EnvelopeSHA256` digest when delegating to a shared service like `broker`), because where one identity serves several requests at
+  once without binding the capability to the payload digest, a resolution could attach to the wrong chain.
 - **Non-escalating.** Also this document, and the stronger claim: a message confers no authority
   because authority does not travel in the message at all. It travels in an entry the receiver
   cannot read, cannot widen, and cannot resolve unless it was named. Same condition -- "named"
@@ -160,14 +150,12 @@ is the sort of thing you find only by going to add one. **Amended 10/2: five, no
 component that mints every entry in this document -- the a2a chat gateway, `a2a/gateway` -- was
 missing too, and was the hardest of the set to see, because 05 already had a C15 called "ChatOps
 gateway" and the word covered for it. They are two deployments: C15 is the Hermes runtime's chat
-ingress and mints nothing; the minter is now C20. 05's "broker" (C6) is still the GitHub token
+ingress and mints nothing; the minter is now C20. **Amended 10/9: six.** The Action Broker (`a2a/broker` and `k8s-operator` companion Deployment `<agent>-a2a-broker`) is the dedicated mutation executor and second-hop capability consumer (`broker` bus principal). 05's "broker" (C6) is still the GitHub token
 minter, a third thing wearing a shared word, so read every "the broker" below as this document's
 sense of the word and not C6.
 
-**What is settled and what is not.** The mechanism is agreed, and as of 9/9 the first hop is built
-and enforcing -- section 0 says exactly what shipped and what did not. The multi-hop topology the
-rest of this document presumes still does not exist, so everything below section 0 that describes a
-second hop is a design rather than a description.
+**What is settled and what is not.** The mechanism is agreed: as of 9/9 the first hop is built
+and enforcing, and as of 10/9 the second hop (`gateway → session/bridge → broker`) and human approval root (`gateway → broker`) are built and enforcing too -- section 0 says exactly what shipped and what did not.
 
 ## 2. The recommendation, first
 
@@ -282,6 +270,8 @@ is segment-prefix on that path, and a sibling scope is refused.
 A hop delegating to several agents writes one child per recipient, each naming a single delegate.
 A list would also work; one child per recipient keeps the audit trail exact about who was handed
 what.
+
+**Action Broker proposal hop and approval root (10/9).** When a session pod (`recon-7fb2`) or the Hermes bridge (`platform`) proposes a gated action to the Action Broker (`broker`), it calls `Minter.MintHop(ctx, self, n, parentRef, child)` to write `$KV.cap.hop.<self>.<n>` directly without reading `KV_cap`. The child entry names `delegate: "broker"`, narrows `tier` to at least `developer-team`, and sets `envelopeSha256` to the 64-character lowercase hex SHA-256 of the RFC 8785 JCS-canonicalized `ActionEnvelope`. The Action Broker verifies the proposal capability over `a2a.cap.verify.broker` for `VerbBrokerPropose` (`"broker.propose"`, alias `VerbClusterPropose`), receiving the root-attested `Requester` and `EnvelopeSHA256` in `capability.Response` (populated only when `Allowed: true`) and confirming that the capability's `EnvelopeSHA256` matches the recomputed JCS SHA-256 of the proposed envelope. When a human subsequently clicks Approve in chat, the gateway mints a separate root capability under `$KV.cap.root.*` keyed by `ApprovalRootKey(actionID, decisionID)` (`"root.approve-" + actionID + "-" + decisionID`), with `delegate: "broker"`, `requester: <clicker-principal>`, and `envelopeSha256: <approved-jcs-sha256>`. The Action Broker verifies that approval root for `VerbBrokerApprove` (`"broker.approve"`, alias `VerbActionApprove`); `Permits` refuses `VerbBrokerApprove` on any entry with `Parent != nil`, so approval capabilities can never be minted or delegated by a hop.
 
 ## 4. Why this needs no crypto
 
@@ -675,13 +665,7 @@ the party being revoked from. **Shipped in that state**: no component deletes a 
 revocation -- the property this design prefers over TTLs, and the reason it can tolerate "nothing
 expires" -- is the one advertised feature with no implementation behind it.
 
-**The envelope has no requester field.** It carries a tier and a scope. [03](03-security-model.md)
-§4a stays canonical for the requirement and that requirement is authorization against the
-requester's own identity, which a hop cannot perform from a resolved capability because it does not
-know who the human is. The goal below is written as "agent ceiling ∩ requester" while the mechanism
-delivers agent ceiling ∩ tier, and the chain walk terminates at a request id rather than at a
-person -- so "who asked" is still a lookup somewhere else. Which way to reconcile that is a
-downscoping question, not one this document should settle alone.
+**Amended 10/9: `Entry.Requester` and `Entry.EnvelopeSHA256` now travel in `$KV.cap` and `capability.Response`.** An earlier version of this paragraph noted that the entry carried only a tier and a scope, leaving "who asked" as an external lookup. As of 10/9, `Entry` carries `Requester` (`json:"requester,omitempty"`) and `EnvelopeSHA256` (`json:"envelopeSha256,omitempty"`). Because `$KV.cap` is unreadable on the bus except by `verifier`, storing the canonical requester identity (`slack:U...`, `googlechat:users/...`, `discord:...`) in the KV entry rather than in bus message headers keeps PII off the general bus while making it available to authorized capability verifiers. `Narrows` refuses any child entry that alters a non-empty `parent.Requester` or `parent.EnvelopeSHA256`, `Resolver.Resolve` propagates the root's `Requester` (and `EnvelopeSHA256` when unset on the leaf) onto the resolved leaf, and `capability.Response` returns both fields when `Allowed: true` (and omits them on any refusal). The Action Broker uses the verifier-returned `Requester` and `EnvelopeSHA256` to bind proposals and approvals to their exact JCS payload digest and to enforce separation of duties (e.g., proposer ≠ approver when configured) without trusting unverified message fields. Per-user Kubernetes RBAC/IAM downscoping beyond the tier/Action Broker RBAC ceiling remains governed by [03](03-security-model.md) §4a.
 
 ---
 

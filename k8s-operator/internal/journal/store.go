@@ -298,31 +298,16 @@ func (s *Store) SetPhase(ctx context.Context, ar *agentv1alpha1.ActionRecord, ph
 	}
 	live.Labels[StatusLabel] = labelValue(string(phase))
 	if err := s.client.Update(ctx, &live); err != nil {
-		if apierrors.IsForbidden(err) {
-			// The one caller that cannot make this write is the BROKER, and it cannot make it by
-			// design: 06 §2.2.1 grants `actionrecords` only `get list watch create` plus
-			// `actionrecords/status get update patch`. `update` on the main resource is withheld on
-			// purpose -- the broker appends and advances status, and may never rewrite or remove a
-			// record -- and a label lives in metadata, so the index write is an `update` and always
-			// will be. Treating that as fatal made every terminal transition the broker took return
-			// a 500 for an action that had already executed AND already been journaled: the
-			// authoritative `status.phase` landed on the line above, through the subresource the
-			// grant does allow. Reporting that as a failure is not caution, it is a false negative
-			// in the audit trail, and it is the direction that loses truth.
-			//
-			// So: log and continue, exactly as the comment above promises. The reconciler's
-			// repairStatusLabel runs in the operator, which does hold `update`, and brings the index
-			// back into step on the next reconcile of this record.
-			//
-			// Narrow to Forbidden on purpose. A Conflict or a 500 here is a transient the caller may
-			// want to see; a Forbidden is the RBAC model working as specified, and the only way to
-			// "fix" it at the call site would be to widen a grant the spec closed deliberately.
+		if apierrors.IsForbidden(err) || apierrors.IsConflict(err) {
+			// The authoritative `status.phase` already landed on the line above. If the metadata
+			// label update is Forbidden (broker SA without `update` on main resource) or hits a
+			// 409 Conflict (because JournalReconciler in the operator raced to repair the label
+			// at the same instant), failing SetPhase here would abort a pipeline whose status
+			// transition is already durable in etcd. JournalReconciler.repairStatusLabel brings
+			// the label index back into step on its next reconcile.
 			logf.FromContext(ctx).V(1).Info(
 				"the status label could not be synced and will be repaired by the reconciler; status.phase is authoritative and already written (06 §4.3)",
 				"actionRecord", ar.Namespace+"/"+ar.Name, "phase", string(phase), "label", StatusLabel, "reason", err.Error())
-			// Deliberately NOT adopting live.Labels: the label write did not land, and handing the
-			// caller a copy that says it did would make an in-memory read of the index disagree with
-			// the server. Only status is adopted, because only status was written.
 			ar.Status = live.Status
 			return nil
 		}

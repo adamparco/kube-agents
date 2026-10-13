@@ -171,6 +171,10 @@ type Outcome struct {
 	// Diff is the executed diff: (pre-state, what the server says it would become).
 	Diff DiffResult
 
+	// UIDAfter is the live object's UID after a real mutation. Used by the pipeline and undo
+	// replayer to bind the UID precondition on UndoDelete steps for newly created objects.
+	UIDAfter string
+
 	// Applied is the record entry, set only after a real mutation.
 	Applied *agentv1alpha1.AppliedTarget
 }
@@ -263,12 +267,13 @@ func (e *Executor) Execute(ctx context.Context, req Request) (*Result, error) {
 	res.Mutated = true
 	for i, op := range req.Ops {
 		snap := snaps[op.Index]
-		applied, err := e.mutate(ctx, op, snap, fm)
+		applied, uidAfter, err := e.mutate(ctx, op, snap, fm)
 		if err != nil {
 			return res, fmt.Errorf("execute: op %d (%s %s %s/%s) failed after %d applied: %w",
 				op.Index, op.Verb, op.Ref.Kind, op.Ref.Namespace, op.Ref.Name, i, err)
 		}
 		res.Outcomes[i].Applied = applied
+		res.Outcomes[i].UIDAfter = uidAfter
 	}
 	return res, nil
 }
@@ -355,7 +360,7 @@ func (e *Executor) intended(op Op, snap Snapshot) (*unstructured.Unstructured, e
 }
 
 // mutate performs the real change and builds the record entry.
-func (e *Executor) mutate(ctx context.Context, op Op, snap Snapshot, fm string) (*agentv1alpha1.AppliedTarget, error) {
+func (e *Executor) mutate(ctx context.Context, op Op, snap Snapshot, fm string) (*agentv1alpha1.AppliedTarget, string, error) {
 	entry := &agentv1alpha1.AppliedTarget{
 		TargetIndex: int32(op.Index), //nolint:gosec // bounded by the envelope's operation cap
 	}
@@ -368,29 +373,38 @@ func (e *Executor) mutate(ctx context.Context, op Op, snap Snapshot, fm string) 
 			opts.UID = snap.Ref.UID
 		}
 		if err := e.Applier.Delete(ctx, op.Ref, opts, false); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		diff, err := Diff(snap.Live, nil)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		entry.Diff = diff.Ops
-		return entry, nil
+		return entry, "", nil
 	}
 
 	after, err := e.callVerb(ctx, op, fm, false)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	diff, err := Diff(snap.Live, after)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	entry.Diff = diff.Ops
+	var uidAfter string
 	if after != nil {
 		entry.ResourceVersionAfter = after.GetResourceVersion()
+		uidAfter = string(after.GetUID())
+		if !snap.Existed && uidAfter != "" && len(entry.Diff) < MaxDiffOps {
+			entry.Diff = append(entry.Diff, agentv1alpha1.AppliedDiffOp{
+				Op:    "add",
+				Path:  "/metadata/uid",
+				Value: uidAfter,
+			})
+		}
 	}
-	return entry, nil
+	return entry, uidAfter, nil
 }
 
 // callVerb dispatches one mutating verb, in either dry-run or real mode. One dispatch, used by both

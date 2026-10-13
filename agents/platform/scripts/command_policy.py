@@ -1313,3 +1313,266 @@ def evaluate(argv: list[str]) -> Decision:
         return _ALLOWED
 
     return _ALLOWED
+
+
+_BROKER_MUTATION_MAP: dict[tuple[str, ...], str] = {
+    ("create",): "create",
+    ("apply",): "apply",
+    ("patch",): "patch",
+    ("delete",): "delete",
+    ("scale",): "scale",
+    ("rollout", "restart"): "patch",
+    ("set", "image"): "patch",
+    ("label",): "patch",
+    ("annotate",): "patch",
+}
+
+_FORBIDDEN_INTERACTIVE_VERBS: frozenset[str] = frozenset(
+    {"exec", "attach", "cp", "port-forward", "proxy", "debug"}
+)
+
+_KIND_MAP: dict[str, tuple[str, str]] = {
+    "deployment": ("apps/v1", "Deployment"),
+    "deployments": ("apps/v1", "Deployment"),
+    "deploy": ("apps/v1", "Deployment"),
+    "deployment.apps": ("apps/v1", "Deployment"),
+    "deployments.apps": ("apps/v1", "Deployment"),
+    "statefulset": ("apps/v1", "StatefulSet"),
+    "statefulsets": ("apps/v1", "StatefulSet"),
+    "sts": ("apps/v1", "StatefulSet"),
+    "daemonset": ("apps/v1", "DaemonSet"),
+    "daemonsets": ("apps/v1", "DaemonSet"),
+    "ds": ("apps/v1", "DaemonSet"),
+    "replicaset": ("apps/v1", "ReplicaSet"),
+    "replicasets": ("apps/v1", "ReplicaSet"),
+    "rs": ("apps/v1", "ReplicaSet"),
+    "configmap": ("v1", "ConfigMap"),
+    "configmaps": ("v1", "ConfigMap"),
+    "cm": ("v1", "ConfigMap"),
+    "secret": ("v1", "Secret"),
+    "secrets": ("v1", "Secret"),
+    "service": ("v1", "Service"),
+    "services": ("v1", "Service"),
+    "svc": ("v1", "Service"),
+    "pod": ("v1", "Pod"),
+    "pods": ("v1", "Pod"),
+    "po": ("v1", "Pod"),
+    "namespace": ("v1", "Namespace"),
+    "namespaces": ("v1", "Namespace"),
+    "ns": ("v1", "Namespace"),
+    "serviceaccount": ("v1", "ServiceAccount"),
+    "serviceaccounts": ("v1", "ServiceAccount"),
+    "sa": ("v1", "ServiceAccount"),
+    "job": ("batch/v1", "Job"),
+    "jobs": ("batch/v1", "Job"),
+    "cronjob": ("batch/v1", "CronJob"),
+    "cronjobs": ("batch/v1", "CronJob"),
+    "cj": ("batch/v1", "CronJob"),
+    "ingress": ("networking.k8s.io/v1", "Ingress"),
+    "ingresses": ("networking.k8s.io/v1", "Ingress"),
+    "ing": ("networking.k8s.io/v1", "Ingress"),
+    "networkpolicy": ("networking.k8s.io/v1", "NetworkPolicy"),
+    "networkpolicies": ("networking.k8s.io/v1", "NetworkPolicy"),
+    "netpol": ("networking.k8s.io/v1", "NetworkPolicy"),
+    "horizontalpodautoscaler": ("autoscaling/v2", "HorizontalPodAutoscaler"),
+    "horizontalpodautoscalers": ("autoscaling/v2", "HorizontalPodAutoscaler"),
+    "hpa": ("autoscaling/v2", "HorizontalPodAutoscaler"),
+    "poddisruptionbudget": ("policy/v1", "PodDisruptionBudget"),
+    "poddisruptionbudgets": ("policy/v1", "PodDisruptionBudget"),
+    "pdb": ("policy/v1", "PodDisruptionBudget"),
+}
+
+
+def build_broker_escalation_hint(
+    subcommand: str | list[str] | tuple[str, ...],
+    args: list[str] | tuple[str, ...] | Decision = (),
+    namespace: str | Decision | None = None,
+    *,
+    tool: str | None = None,
+    argv: list[str] | tuple[str, ...] | None = None,
+    decision: Decision | None = None,
+) -> dict[str, object]:
+    """Build a structured Action Broker escalation hint for a refused command.
+
+    Supports both calling conventions:
+      - build_broker_escalation_hint(subcommand, args, namespace)
+      - build_broker_escalation_hint(tool, argv, decision)
+    """
+    default_ns: str | None = None
+    resolved_decision: Decision | None = decision
+    if isinstance(namespace, Decision):
+        resolved_decision = namespace
+    elif isinstance(namespace, str) and namespace:
+        default_ns = namespace
+
+    if isinstance(args, Decision):
+        resolved_decision = args
+        arg_list: list[str] = []
+    else:
+        arg_list = list(args) if args is not None else []
+
+    if argv is not None:
+        full_argv = list(argv)
+        resolved_tool = tool or (full_argv[0] if full_argv else "kubectl")
+    elif isinstance(subcommand, (list, tuple)):
+        full_argv = list(subcommand)
+        resolved_tool = tool or (full_argv[0] if full_argv else "kubectl")
+    elif subcommand in ("kubectl", "gcloud"):
+        resolved_tool = subcommand
+        if arg_list and arg_list[0] == subcommand:
+            full_argv = arg_list
+        else:
+            full_argv = [subcommand, *arg_list]
+    else:
+        resolved_tool = tool or "kubectl"
+        if arg_list and arg_list[0] in ("kubectl", "gcloud"):
+            full_argv = arg_list
+            resolved_tool = arg_list[0]
+        elif subcommand:
+            full_argv = [resolved_tool, str(subcommand), *arg_list]
+        else:
+            full_argv = [resolved_tool, *arg_list]
+
+    if resolved_decision is None:
+        resolved_decision = evaluate(full_argv)
+
+    if resolved_tool == "gcloud" or resolved_decision.rule_id.startswith("gcp."):
+        return {
+            "action": "emit_suggestion",
+            "brokerSupported": False,
+            "suggestedOp": None,
+            "cliHint": (
+                "Direct gcloud mutations are blocked in read-only mode and cloudTarget execution "
+                "is not enabled on the Action Broker. Emit a suggestion via `submit-suggestion` instead."
+            ),
+        }
+
+    tokens = full_argv[1:] if full_argv and full_argv[0] == "kubectl" else list(full_argv)
+    extracted_ns: str | None = None
+    replicas: str | None = None
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            positionals.extend(tokens[idx + 1 :])
+            break
+        if tok in ("-n", "--namespace") and idx + 1 < len(tokens):
+            extracted_ns = tokens[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("--namespace=") or tok.startswith("-n="):
+            extracted_ns = tok.split("=", 1)[1]
+            idx += 1
+            continue
+        if tok == "--replicas" and idx + 1 < len(tokens):
+            replicas = tokens[idx + 1]
+            idx += 2
+            continue
+        if tok.startswith("--replicas="):
+            replicas = tok.split("=", 1)[1]
+            idx += 1
+            continue
+        if tok in _KUBECTL_FLAGS_WITH_VALUE and idx + 1 < len(tokens):
+            idx += 2
+            continue
+        if tok in ("-f", "--filename", "-o", "--output", "-l", "--selector", "--type", "--patch", "--patch-file") and idx + 1 < len(tokens):
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        positionals.append(tok)
+        idx += 1
+
+    verb_tuple: tuple[str, ...] = ()
+    rest: list[str] = []
+    if len(positionals) >= 2 and tuple(positionals[:2]) in _BROKER_MUTATION_MAP:
+        verb_tuple = tuple(positionals[:2])
+        rest = positionals[2:]
+    elif positionals:
+        verb_tuple = (positionals[0],)
+        rest = positionals[1:]
+    elif resolved_decision.verb_tuple:
+        verb_tuple = resolved_decision.verb_tuple
+
+    first_verb = verb_tuple[0] if verb_tuple else ""
+    if first_verb in _FORBIDDEN_INTERACTIVE_VERBS:
+        return {
+            "action": "forbidden_interactive",
+            "brokerSupported": False,
+            "suggestedOp": None,
+            "cliHint": (
+                "Interactive pod access (exec/attach/cp/port-forward/debug) is forbidden "
+                "by both the read-only proxy and the Action Broker."
+            ),
+        }
+
+    mapped_op = _BROKER_MUTATION_MAP.get(verb_tuple) or _BROKER_MUTATION_MAP.get((first_verb,))
+    if not mapped_op:
+        return {
+            "action": "forbidden",
+            "brokerSupported": False,
+            "suggestedOp": None,
+            "cliHint": (
+                "This kubectl command is blocked by the read-only policy and is not "
+                "a supported Action Broker operation."
+            ),
+        }
+
+    raw_kind = ""
+    raw_name = ""
+    if rest:
+        if "/" in rest[0]:
+            raw_kind, raw_name = rest[0].split("/", 1)
+        elif len(rest) >= 2:
+            raw_kind, raw_name = rest[0], rest[1]
+
+    api_version = "v1"
+    kind = ""
+    if raw_kind:
+        mapped_kind = _KIND_MAP.get(raw_kind.lower())
+        if mapped_kind is not None:
+            api_version, kind = mapped_kind
+        else:
+            kind = raw_kind[:1].upper() + raw_kind[1:]
+
+    effective_ns = extracted_ns or default_ns or "default"
+    if mapped_op == "scale" and kind and raw_name and replicas is not None:
+        cli_hint = (
+            f"python3 /opt/scripts/broker_client.py --op scale "
+            f"--api-version {api_version} --kind {kind} "
+            f"--namespace {effective_ns} --name {raw_name} --replicas {replicas}"
+        )
+    elif kind and raw_name:
+        cli_hint = (
+            f"python3 /opt/scripts/broker_client.py --op {mapped_op} "
+            f"--api-version {api_version} --kind {kind} "
+            f"--namespace {effective_ns} --name {raw_name}"
+        )
+    else:
+        cli_hint = (
+            f"python3 /opt/scripts/broker_client.py --op {mapped_op} "
+            f"--namespace {effective_ns}"
+        )
+
+    result: dict[str, object] = {
+        "action": "propose_to_broker",
+        "brokerSupported": True,
+        "suggestedOp": mapped_op,
+        "op": mapped_op,
+        "namespace": effective_ns,
+        "cliHint": cli_hint,
+    }
+    if kind:
+        result["apiVersion"] = api_version
+        result["kind"] = kind
+    if raw_name:
+        result["name"] = raw_name
+    if replicas is not None:
+        try:
+            result["replicas"] = int(replicas)
+        except ValueError:
+            result["replicas"] = replicas
+    return result
+

@@ -105,6 +105,38 @@ Nominating nothing is the normal outcome: omit the field and omit the block. A r
 
 ---
 
+## 2.5 Action Broker Mutations & Live Journal Inspection (`apply-change` / `/opt/scripts/broker_client.py`)
+
+When asked to mutate a live Kubernetes resource in the cluster (`scale`, `patch`, `apply`, `delete`), or when using `/opt/scripts/broker_client.py`, submit the mutation directly through the **Action Broker** (`apply-change` skill) using the `terminal` tool rather than opening a GitOps PR:
+
+- **Scale a Deployment/StatefulSet:**
+  ```bash
+  python3 /opt/scripts/broker_client.py --op scale --api-version apps/v1 --kind Deployment --namespace <namespace> --name <name> --replicas <count> --intent "Scale Deployment/<name> to <count> replicas"
+  ```
+- **Patch a Resource (e.g., ConfigMap or Deployment):**
+  ```bash
+  python3 /opt/scripts/broker_client.py --op patch --api-version v1 --kind ConfigMap --namespace <namespace> --name <name> --patch-type application/merge-patch+json --patch '<json-patch>' --intent "<intent>"
+  ```
+- **Apply a Resource:**
+  Write desired JSON to `/tmp/desired.json`, then run:
+  ```bash
+  python3 /opt/scripts/broker_client.py --op apply --api-version <apiVersion> --kind <Kind> --namespace <namespace> --name <name> --desired-file /tmp/desired.json --intent "<intent>"
+  ```
+- **Delete a Resource:**
+  ```bash
+  python3 /opt/scripts/broker_client.py --op delete --api-version <apiVersion> --kind <Kind> --namespace <namespace> --name <name> --intent "<intent>"
+  ```
+- **Inspect Live Action Status or Recent Actions (Authoritative Journal):**
+  Human ChatOps slash commands (`/approve <actionId>`, `/reject <actionId> <reason>`, `/undo <actionId> [optional reason]`, `/uncontest <actionId>`) are handled out-of-band by the ChatOps gateway against `ActionRecord` and `UndoRequest` CRs and do **not** appear in your chat transcript. Whenever a user asks about an action's status, approval, undo, or why a resource is contested, **never guess from earlier chat messages**—always query the live journal first:
+  ```bash
+  python3 /opt/scripts/broker_client.py --op status --namespace <namespace> --action-id <actionId>
+  python3 /opt/scripts/broker_client.py --op list --namespace <namespace> --limit 10
+  ```
+
+**Always report the returned `actionId` (and `recordName`), `decision`, `phase`, and the 4-beat `report` (`noticed`, `did`, `verified`, `undo`) or `/approve <actionId>` instructions in your reply to the user.**
+
+---
+
 ## 3. Declarative Workflow Playbook
 
 1.  **Do NOT manage infrastructure manually:** You are strictly forbidden from generating ad-hoc manifests or executing raw `kubectl apply`, `kubectl patch`, `kubectl edit`, `kubectl delete`, or `kubectl rollout restart` commands against GKE infrastructure. You must never attempt to patch, reconfigure, or restart control-plane components in the `kubeagents-system` namespace (including `github-token-minter`, `platform-agent-gateway`, and operator CRDs/ConfigMaps). Always propose all cluster, operator, and workload changes exclusively through the active declarative workflow in the user's environment (e.g. submitting a pull request — a merge request on GitLab — via `submit-suggestion`). This is how a change is made, never whether one is submitted; item 3 decides that.

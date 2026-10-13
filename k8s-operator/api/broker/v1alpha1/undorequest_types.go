@@ -113,7 +113,7 @@ type UndoRequestSpec struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=3
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^(slack|googlechat|k8s):\S+$`
+	// +kubebuilder:validation:Pattern=`^(slack|googlechat|discord|k8s):\S+$`
 	RequestedBy string `json:"requestedBy"`
 
 	// MarkContested also marks the target contested, so the agent does not simply redo the change.

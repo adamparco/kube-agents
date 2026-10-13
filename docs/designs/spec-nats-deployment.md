@@ -51,6 +51,7 @@ Streams bind to the payload spec's subjects and topic classes:
 | `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `BROKER`         | `a2a.broker.>`       | Age window W (72h dev default), `max_msgs_per_subject: 256`, `max_consumers: 64`, `--allow-direct`, R3 | Durable consumers held by the Action Broker on `a2a.broker.propose.*.*` and `a2a.broker.approve.*.*`; event stream on `a2a.broker.events.<ns>.<actionId>` read by the gateway, bridge, session pods, web, and console, and queried via `$JS.API.DIRECT.GET.BROKER.>` (`--allow-direct`) by the Action Broker for stateless crash recovery of the latest action state. |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -64,8 +65,8 @@ the tempting place for a cheaper R1 class, but they are also the replay and audi
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
-limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
-and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`,
+`DIRECTORY`, and `BROKER`). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of
@@ -256,10 +257,10 @@ verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
 Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/15,
-`worker` retired; amended 9/9, the verifier added): the render now carries the
+`worker` retired; amended 9/9, the verifier added; amended 10/9, the Action Broker added): the render now carries the
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
-every spawned session pod, the platform agent container, and the capability verifier. **Statically**, from `nats.conf` and listed in `auth_users`:
+every spawned session pod, the platform agent container, the capability verifier, and the Action Broker (`<agent>-a2a-broker`, or its resolved companion `<agent>-broker` actor ServiceAccount via `kubeagents.x-k8s.io/broker-service-account` / `A2A_BROKER_SERVICE_ACCOUNT`). **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -361,11 +362,17 @@ Layout:
   consumer rule that rests on all of this and enumerates what is not yet decision-grade -
   including a redirection route onto `…supervisor` that no assertion pins. Read that
   section before treating any class as closed.
+- **Four broker-subject classes, and the publish grants split along them** (10/9). The `BROKER` stream (`a2a.broker.>`) carries the Action Broker's proposal, approval, status-event, and dead-letter traffic, with writer/reader separation enforced at the NATS subject layer before capability verification runs:
+  - `a2a.broker.propose.<ns>.<agent>` — written by session pods (`a2a.broker.propose.*.<pod>`, alongside `$KV.cap.hop.<pod>.*`), the Hermes bridge (`a2a.broker.propose.*.*`, alongside `$KV.cap.hop.platform.*`), and the gateway (`a2a.broker.propose.*.*`); consumed by `broker`.
+  - `a2a.broker.approve.<ns>.<actionId>` — written **solely** by `gateway` (`a2a.broker.approve.*.*`) when an authorized human clicks Approve/Reject in chat; consumed by `broker`. Neither `session`, `bridge`, `agent`, `web`, nor `console` holds publish on `a2a.broker.approve.>`.
+  - `a2a.broker.events.<ns>.<actionId>` — written **solely** by `broker` (`a2a.broker.events.*.*`); subscribed or replayed by `gateway`, `bridge`, `session`, `web`, and `console` to render approval cards and terminal execution outcomes.
+  - `a2a.broker.dlq.<ns>.<actionId>` — written **solely** by `broker` (`a2a.broker.dlq.*.*`) for poison-pill proposals or approvals after bounded retries.
+  The `broker` principal itself (`a2aBrokerUser = "broker"`) is callout-authenticated and holds publish on `a2a.broker.events.*.*`, `a2a.broker.dlq.*.*`, `a2a.cap.verify.broker`, `$JS.ACK.BROKER.>`, `_INBOX.broker.>`, and `a2aBrokerJetStreamGrants` (`$JS.API.STREAM.INFO.BROKER`, `$JS.API.CONSUMER.CREATE.BROKER.>`, `$JS.API.CONSUMER.MSG.NEXT.BROKER.*`, `$JS.API.DIRECT.GET.BROKER.>`), and subscribe on `a2a.broker.propose.*.*`, `a2a.broker.approve.*.*`, `a2a.cap.reply.broker.>`, and `_INBOX.broker.>`.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
   known (the bridge's list is the operator's `a2aBridgeJetStreamGrants`, the agent
-  CLI's is `a2aAgentJetStreamGrants` and the gateway's is
+  CLI's is `a2aAgentJetStreamGrants`, the Action Broker's is `a2aBrokerJetStreamGrants`, and the gateway's is
   `a2aGatewayJetStreamGrants`; no rendered principal holds `$JS.API.>` any more, and a
   user that gains one back holds playground posture); `$JS.ACK.<its streams>.>` for explicit
   acks - an ack is a publish, and missing this grant means every consumer redelivers
@@ -379,7 +386,7 @@ Layout:
   and a consumer, never the caller, so an unscoped `$JS.ACK.>` lets any holder `+TERM`
   another principal's in-flight delivery. That narrowing has landed: every rendered
   principal's ack grant is scoped to the streams it consumes with explicit ack -
-  `$JS.ACK.TASKS.>` for the gateway and the bridge - and the principals whose reads
+  `$JS.ACK.TASKS.>` for the gateway and the bridge, `$JS.ACK.BROKER.>` for the Action Broker - and the principals whose reads
   are ordered or ack-none hold no ack grant at all. What scoping still cannot express is
   per-consumer scope inside a granted stream, since NATS wildcards match whole tokens.
   Enumerating leaves one refusal that is expected rather than a fault: the gateway's
@@ -404,7 +411,7 @@ Layout:
   browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
   inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
-  the four message streams - plus its own inbox. It rides a websocket listener on 9222
+  the five message streams (`TASKS`, `DIRECTORY`, `TOPICS-STATE`, `TOPICS-JOURNAL`, `BROKER`) - plus its own inbox. It rides a websocket listener on 9222
   rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
@@ -518,7 +525,7 @@ Layout:
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, the capability verifier, session pods by the spawner's
+  its labels - the A2A gateway, the capability verifier, the Action Broker `<agent>-a2a-broker`, session pods by the spawner's
   labels, the provision Job,
   and the hand-applied seed Job), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
@@ -587,7 +594,7 @@ Layout:
   gateway gets `session-state`, the artifact bucket goes to whoever writes artifacts,
   nobody gets a bucket their role doesn't name. **Amended 9/8:** that last clause now
   binds the session worker too, and it names none - the derived per-session grant set
-  below has no `$KV` or `$O` subject in it at all. Nothing breaks today, because the
+  below has no `$KV` or `$O` subject in it at all (save the 10/9 write-only hop capability grant `$KV.cap.hop.<pod>.*` for `Minter.MintHop`, with zero read on `KV_cap`). Nothing breaks today, because the
   worker adapter never offloads: it chunks artifact updates onto its own events
   subject under the bus message limit (`resultChunkSize`) rather than writing a
   bucket. What it means is that the bucket path is not available to a session, and
@@ -597,7 +604,7 @@ Layout:
   Authorization Violation. Within the artifact bucket, visibility is bucket-wide;
   per-task artifact scoping is still parked. Per-session credentials landed (9/8) and did
   not close it: a session's grants are derived from its pod name, which the gateway mints
-  one of per task, so the scope is per incarnation and the KV buckets are not in a
+  one of per task, so the scope is per incarnation and the state/artifact KV buckets are not in a
   session's grant set at all. Scoping the bucket itself is a separate change.
 
 The callout reads an identity-to-permissions map rendered by the operator (**amended
@@ -609,7 +616,7 @@ entries - the provisioning Job and the session principal. **Amended 9/15:** thre
 platform agent container having joined them when `worker` was retired. **Amended 9/9:**
 four, the capability verifier having joined them; it is callout-authenticated for the
 same reason the others are, and keying the only read grant on the capability store to a
-ServiceAccount rather than to a password is the point. The agent container's entry is
+ServiceAccount rather than to a password is the point. **Amended 10/9:** five, the Action Broker (`broker`) having joined them, keyed on `<agent>-a2a-broker` (or on the companion `<agent>-broker` ServiceAccount when configured via `kubeagents.x-k8s.io/broker-service-account` / `A2A_BROKER_SERVICE_ACCOUNT`). The agent container's entry is
 keyed on the agent's own ServiceAccount and carries the blackboard grants and nothing
 else. The bridge sidecar is **not** among them and cannot be, for the ServiceAccount
 reason in the status section above: it would key to the agent's entry. Nor is the
@@ -644,7 +651,7 @@ set would quietly admit a pod named after the dropped user. The list is fixed fo
 of the process, and that is enough: it changes only when the operator's render does, and a
 changed value changes the pod template, which rolls the callout. The same check also
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
-`agent`, `verifier`, `session`, and any user the map gains), because the callout mints
+`agent`, `verifier`, `broker`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
 `_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names

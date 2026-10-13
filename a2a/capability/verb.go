@@ -28,6 +28,25 @@ const (
 	// VerbClusterMutate is any write against a cluster's control plane.
 	VerbClusterMutate Verb = "cluster.mutate"
 
+	// VerbBrokerPropose is a read-only session or bridge proposing an
+	// ActionEnvelope to the Action Broker. Permitted at TierDeveloperTeam
+	// and above so a developer-team agent can propose namespace-scoped
+	// mutations while the broker's classification and approval gate govern execution.
+	VerbBrokerPropose Verb = "broker.propose"
+
+	// VerbClusterPropose aliases VerbBrokerPropose for callers using the
+	// draft design's identifier.
+	VerbClusterPropose Verb = VerbBrokerPropose
+
+	// VerbBrokerApprove is the gateway attesting a human approval or
+	// rejection decision for a gated ActionRecord. Must be a root entry
+	// (Parent == nil); cannot be delegated via a hop.
+	VerbBrokerApprove Verb = "broker.approve"
+
+	// VerbActionApprove aliases VerbBrokerApprove for callers using the
+	// draft design's identifier.
+	VerbActionApprove Verb = VerbBrokerApprove
+
 	// VerbFleetRead is a read that spans clusters.
 	VerbFleetRead Verb = "fleet.read"
 )
@@ -39,6 +58,8 @@ const (
 var verbTier = map[Verb]Tier{
 	VerbTaskExecute:        TierDeveloperTeam,
 	VerbTaskDelegate:       TierDeveloperTeam,
+	VerbBrokerPropose:      TierDeveloperTeam,
+	VerbBrokerApprove:      TierDeveloperTeam,
 	VerbTopicPublishShared: TierClusterAdmin,
 	VerbClusterMutate:      TierClusterAdmin,
 	VerbFleetRead:          TierPlatform,
@@ -59,6 +80,9 @@ func Permits(e Entry, v Verb, r Scope) error {
 	}
 	if have < tierRank[need] {
 		return refuse("capability's tier is below the tier the verb requires")
+	}
+	if v == VerbBrokerApprove && e.Parent != nil {
+		return refuse("broker.approve capability must be a root entry and cannot be delegated")
 	}
 	if err := r.validate(); err != nil {
 		return refuse("the resource is not a well-formed scope")

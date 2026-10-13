@@ -277,3 +277,86 @@ func TestNotifierIgnoresIrrelevantPhases(t *testing.T) {
 		t.Errorf("delivered %d messages for an Executing record, want 0", len(del.delivered))
 	}
 }
+
+func TestNotifierUpdatesOnVerifiedTerminalPhase(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "default"},
+		Spec: agentv1alpha1.AgentSpec{
+			Operations: &agentv1alpha1.OperationsSpec{ApprovalRosterRef: &agentv1alpha1.RosterRef{Name: "roster-1"}},
+		},
+	}
+	roster := &agentv1alpha1.ApprovalRoster{
+		ObjectMeta: metav1.ObjectMeta{Name: "roster-1", Namespace: "default"},
+		Spec: agentv1alpha1.ApprovalRosterSpec{
+			Approvers: []agentv1alpha1.Approver{{Platform: "slack", ID: "U02"}},
+			Notify:    &agentv1alpha1.ApprovalNotify{Slack: &agentv1alpha1.SlackNotify{Channel: "C01"}},
+		},
+	}
+	ar := gatedRecord("ar-1")
+	c := fake.NewClientBuilder().
+		WithScheme(notifierScheme(t)).
+		WithObjects(agent, roster, ar).
+		WithStatusSubresource(&agentv1alpha1.ActionRecord{}).
+		Build()
+
+	del := &recordingDeliverer{}
+	store := newMemStore()
+	r := &notify.Reconciler{Client: c, Deliverers: notify.Deliverers{notify.PlatformSlack: del}, Store: store}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ar)}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+
+	live := &agentv1alpha1.ActionRecord{}
+	if err := c.Get(context.Background(), req.NamespacedName, live); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	live.Status.Phase = agentv1alpha1.PhaseVerified
+	live.Status.Report = &agentv1alpha1.ActionReport{
+		Noticed:  "pod crash",
+		Did:      "scaled deployment",
+		Verified: "all pods ready",
+	}
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("terminal reconcile: %v", err)
+	}
+	if len(del.updated) != 1 || del.updated[0].Resolution != "verified" {
+		t.Fatalf("updated = %+v, want 1 verified update", del.updated)
+	}
+}
+
+func TestNotifierIgnoresNonGatedRoutineVerifiedRecord(t *testing.T) {
+	agent := &agentv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "default"},
+		Spec: agentv1alpha1.AgentSpec{
+			Operations: &agentv1alpha1.OperationsSpec{ApprovalRosterRef: &agentv1alpha1.RosterRef{Name: "roster-1"}},
+		},
+	}
+	roster := &agentv1alpha1.ApprovalRoster{
+		ObjectMeta: metav1.ObjectMeta{Name: "roster-1", Namespace: "default"},
+		Spec: agentv1alpha1.ApprovalRosterSpec{
+			Approvers: []agentv1alpha1.Approver{{Platform: "slack", ID: "U02"}},
+			Notify:    &agentv1alpha1.ApprovalNotify{Slack: &agentv1alpha1.SlackNotify{Channel: "C01"}},
+		},
+	}
+	ar := gatedRecord("ar-routine")
+	ar.Spec.Classification.Class = agentv1alpha1.RiskRoutine
+	ar.Status.Phase = agentv1alpha1.PhaseVerified
+	ar.Status.Approvals = nil
+	c := fake.NewClientBuilder().WithScheme(notifierScheme(t)).WithObjects(agent, roster, ar).Build()
+
+	del := &recordingDeliverer{}
+	r := &notify.Reconciler{Client: c, Deliverers: notify.Deliverers{notify.PlatformSlack: del}, Store: newMemStore()}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ar)}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(del.delivered) != 0 || len(del.updated) != 0 {
+		t.Errorf("routine non-gated Verified record should not be delivered to approval channel; delivered=%d updated=%d", len(del.delivered), len(del.updated))
+	}
+}

@@ -52,9 +52,11 @@ func capMap(t *testing.T) string {
 const (
 	verifierSA  = "system:serviceaccount:kubeagents-system:agent-a2a-verifier"
 	provisionSA = "system:serviceaccount:kubeagents-system:agent-a2a-provision"
+	brokerSA    = "system:serviceaccount:kubeagents-system:agent-a2a-broker"
 
 	tokenVerifier  = "token-for-the-verifier-serviceaccount-padded-to-a-realistic-len"
 	tokenProvision = "token-for-the-provision-serviceaccount-padded-to-a-realistic-l"
+	tokenBroker    = "token-for-the-broker-serviceaccount-padded-to-a-realistic-len-"
 )
 
 // capTokens attests the callout-issued ServiceAccounts the rendered map keys
@@ -64,6 +66,7 @@ func capTokens() map[string]Attested {
 	return map[string]Attested{
 		tokenVerifier:  {ServiceAccount: verifierSA},
 		tokenProvision: {ServiceAccount: provisionSA},
+		tokenBroker:    {ServiceAccount: brokerSA},
 		agentToken:     {ServiceAccount: agentSA},
 		tokenPodA:      {ServiceAccount: sessionSA, PodName: podA, PodUID: "uid-a"},
 		tokenPodB:      {ServiceAccount: sessionSA, PodName: podB, PodUID: "uid-b"},
@@ -180,6 +183,19 @@ func TestNoBrokerCanReadTheCapabilityStore(t *testing.T) {
 		})
 	})
 
+	t.Run("broker", func(t *testing.T) {
+		nc, violations := h.connectAs(t, "broker", tokenBroker)
+		checkPublish(t, nc, violations, refuseAll(capReadSubjects()))
+		if !subscribeRefused(t, nc, violations, capability.SubjectPrefix+">") {
+			t.Errorf("broker may subscribe to %s>; it would see every capability as it is minted",
+				capability.SubjectPrefix)
+		}
+		// The control: a subject this principal really does hold.
+		checkPublish(t, nc, violations, map[string]bool{
+			"a2a.broker.events.agent-1.ar-01J": false,
+		})
+	})
+
 	t.Run("session", func(t *testing.T) {
 		nc, violations := h.connectAs(t, podA, tokenPodA)
 		checkPublish(t, nc, violations, refuseAll(capReadSubjects()))
@@ -201,20 +217,21 @@ func TestNoBrokerCanReadTheCapabilityStore(t *testing.T) {
 
 // 09 §9 (1). A broker writes in its own namespace and nowhere else.
 //
-// The gateway's grant is `$KV.cap.root.*` — one token, so one request id, and
-// no reach into the hop namespace at all. A session's is nothing: there is no
-// second hop in the product yet, so the write a hop would need is deliberately
-// ungranted rather than granted early (see sessionGrants).
+// The gateway's grant is `$KV.cap.root.*` — one token, so one request id (or
+// single-token approval root key), and no reach into the hop namespace at all.
+// A session's is `$KV.cap.hop.<pod>.*` — its own hop namespace only.
 func TestACapabilityWriterCannotWriteOutsideItsOwnNamespace(t *testing.T) {
 	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
 
 	gw, gwViolations := connectStatic(t, h, "gateway", renderedGatewayPassword)
 	checkPublish(t, gw, gwViolations, map[string]bool{
 		// Its own namespace, one token deep.
-		capability.Subject("root.task-1"): false,
+		capability.Subject("root.task-1"):           false,
+		capability.Subject("root.approve-ar-01J-1"): false,
 		// Two tokens: `*` is one token, so a request id with a dot in it
 		// is refused rather than silently landing somewhere else.
-		capability.Subject("root.task.1"): true,
+		capability.Subject("root.task.1"):           true,
+		capability.Subject("root.approve.ar-01J.1"): true,
 		// The hop namespace, which belongs to whoever is attenuating.
 		capability.Subject("hop." + podA + ".0"): true,
 		capability.Subject("hop.gateway.0"):      true,
@@ -227,29 +244,35 @@ func TestACapabilityWriterCannotWriteOutsideItsOwnNamespace(t *testing.T) {
 		// A session cannot mint a root, which would be a task
 		// authorizing itself.
 		capability.Subject("root.task-1"): true,
-		// Nor a hop, its own included: the rules for attenuation exist
-		// and are tested, but no shipped component performs one, so the
-		// grant lands with the caller rather than ahead of it.
-		capability.Subject("hop." + podA + ".0"): true,
-		capability.Subject("hop." + podB + ".0"): true,
+		// A session may mint a hop in its own namespace, one token deep,
+		// and nowhere else.
+		capability.Subject("hop." + podA + ".0"):   false,
+		capability.Subject("hop." + podA + ".0.1"): true,
+		capability.Subject("hop." + podB + ".0"):   true,
 	})
 
 	// Both halves of the credential a compromised agent-side sidecar could
 	// hold -- gke-labs#1653 split the old static `worker` into the bridge's
-	// static executor credential and the callout-issued `agent`. Neither
-	// writes in this namespace, and they are asked separately because they
-	// are refused by different mechanisms: the bridge by a deny on an
-	// enumerated static grant, the agent by a rendered map that grants it
-	// nothing here.
+	// static executor credential and the callout-issued `agent`. The bridge
+	// may mint a hop in its own `platform` addressee namespace and nowhere
+	// else; `agent` and `broker` write nothing in KV_cap.
 	bridge, bridgeViolations := connectStatic(t, h, "bridge", "pw-bridge")
 	checkPublish(t, bridge, bridgeViolations, map[string]bool{
-		capability.Subject("root.task-1"):        true,
-		capability.Subject("hop." + podA + ".0"): true,
+		capability.Subject("root.task-1"):                   true,
+		capability.Subject("hop." + bridgeAddressee + ".0"): false,
+		capability.Subject("hop." + podA + ".0"):            true,
 	})
 
 	agent, agentViolations := h.connectAs(t, "agent", agentToken)
 	checkPublish(t, agent, agentViolations, map[string]bool{
 		capability.Subject("root.task-1"):        true,
+		capability.Subject("hop." + podA + ".0"): true,
+	})
+
+	broker, brokerViolations := h.connectAs(t, "broker", tokenBroker)
+	checkPublish(t, broker, brokerViolations, map[string]bool{
+		capability.Subject("root.task-1"):        true,
+		capability.Subject("hop.broker.1"):       true,
 		capability.Subject("hop." + podA + ".0"): true,
 	})
 }
@@ -549,6 +572,86 @@ func TestTheBridgeVerifiesOverItsShippedGrants(t *testing.T) {
 		capability.NamespaceScope("kube-system")); err == nil {
 		t.Error("the bridge executed at a scope its capability does not contain")
 	}
+}
+
+func TestTheBrokerVerifiesHopAndApprovalOverItsShippedGrants(t *testing.T) {
+	h, vl := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	provision, _ := h.connectAs(t, "provision", tokenProvision)
+	pjs, err := jetstream.New(provision)
+	if err != nil {
+		t.Fatalf("jetstream as provision: %v", err)
+	}
+	if _, err := pjs.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: capability.Bucket, History: 1,
+	}); err != nil {
+		t.Fatalf("creating the cap bucket: %v", err)
+	}
+	startCapabilityVerifier(t, ctx, h)
+
+	gw, _ := connectStatic(t, h, "gateway", renderedGatewayPassword)
+	gjs, err := jetstream.New(gw)
+	if err != nil {
+		t.Fatalf("jetstream as gateway: %v", err)
+	}
+	rootRef, err := capability.NewMinter(gjs).Mint(ctx, "task-broker-1", capability.Entry{
+		Tier:      capability.TierDeveloperTeam,
+		Scope:     capability.NamespaceScope("kubeagents-system"),
+		Delegate:  podA,
+		Requester: "gchat:users/112233",
+	})
+	if err != nil {
+		t.Fatalf("minting session root: %v", err)
+	}
+
+	session, _ := h.connectAs(t, podA, tokenPodA)
+	sjs, err := jetstream.New(session)
+	if err != nil {
+		t.Fatalf("jetstream as session: %v", err)
+	}
+	const wantSHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	hopRef, err := capability.NewMinter(sjs).MintHop(ctx, podA, 1, rootRef, capability.Entry{
+		Tier:           capability.TierDeveloperTeam,
+		Scope:          capability.NamespaceScope("kubeagents-system"),
+		Delegate:       "broker",
+		EnvelopeSHA256: wantSHA,
+	})
+	if err != nil {
+		t.Fatalf("session could not MintHop under its derived grant: %v", err)
+	}
+
+	brokerConn, brokerViolations := h.connectAs(t, "broker", tokenBroker)
+	for _, subj := range []string{"a2a.broker.propose.kubeagents-system.*", "a2a.broker.approve.kubeagents-system.*"} {
+		if queueSubscribeRefused(t, brokerConn, brokerViolations, subj, "broker") {
+			t.Errorf("broker was refused QueueSubscribe on %s", subj)
+		}
+	}
+	brokerClient, err := capability.NewClient(brokerConn, "broker")
+	if err != nil {
+		t.Fatalf("NewClient(broker): %v", err)
+	}
+	resp, err := brokerClient.Verify(ctx, hopRef, capability.VerbBrokerPropose,
+		capability.NamespaceScope("kubeagents-system"))
+	if err != nil {
+		t.Fatalf("broker Verify(hopRef) failed: %v", err)
+	}
+	if resp.Requester != "gchat:users/112233" || resp.EnvelopeSHA256 != wantSHA {
+		t.Errorf("broker Verify(hopRef) = %+v, want requester gchat:users/112233 and sha %s", resp, wantSHA)
+	}
+
+	forged, err := capability.NewClient(brokerConn, podA)
+	if err != nil {
+		t.Fatalf("NewClient(broker-as-podA): %v", err)
+	}
+	short, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer shortCancel()
+	if err := forged.Check(short, rootRef, capability.VerbTaskExecute,
+		capability.NamespaceScope("kubeagents-system")); err == nil {
+		t.Fatal("broker asked the verifier in podA's name and was answered")
+	}
+	assertTheBusRefusedTheForgedAsk(t, vl, podA)
 }
 
 // bridgeAddressee is the addressee the bridge executes for, which is also the

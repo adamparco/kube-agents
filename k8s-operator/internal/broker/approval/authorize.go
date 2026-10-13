@@ -65,7 +65,13 @@ func Authorize(roster *agentv1alpha1.ApprovalRoster, ar *agentv1alpha1.ActionRec
 	// the resumption loop's next reconcile is refused here rather than raced through. A late write
 	// that gets past this check anyway still fails at admission, because by then the resumption
 	// loop has moved the phase off PendingApproval and the VAP's oldPhase guard denies it.
-	if ar.Status.Approvals != nil && ar.Status.Approvals.ExpiresAt != nil && !now.Before(ar.Status.Approvals.ExpiresAt.Time) {
+	var expiresAt time.Time
+	if ar.Status.Approvals != nil && ar.Status.Approvals.ExpiresAt != nil {
+		expiresAt = ar.Status.Approvals.ExpiresAt.Time
+	} else if !ar.CreationTimestamp.IsZero() {
+		expiresAt = ar.CreationTimestamp.Add(roster.EffectiveTTL())
+	}
+	if !expiresAt.IsZero() && !now.Before(expiresAt) {
 		return refuse("the approval window for this action has expired")
 	}
 	return allow()
@@ -89,4 +95,43 @@ func AuthorizeApprove(roster *agentv1alpha1.ApprovalRoster, ar *agentv1alpha1.Ac
 // self-dealing risk (chat-approval.md §4 sequence 2).
 func AuthorizeReject(roster *agentv1alpha1.ApprovalRoster, ar *agentv1alpha1.ActionRecord, principal string, now time.Time) Decision {
 	return Authorize(roster, ar, principal, now)
+}
+
+// AuthorizeUndo gates `/undo <action-id> [reason]`: the record must be Verified (or Failed with a
+// recorded undo plan), carry a non-empty UndoPlan, and the caller must be on the ApprovalRoster.
+func AuthorizeUndo(roster *agentv1alpha1.ApprovalRoster, ar *agentv1alpha1.ActionRecord, principal string) Decision {
+	if ar == nil {
+		return refuse("no such action")
+	}
+	if ar.Status.Phase != agentv1alpha1.PhaseVerified && ar.Status.Phase != agentv1alpha1.PhaseFailed {
+		return refuse("this action cannot be undone from phase " + string(ar.Status.Phase) + " (must be Verified or Failed)")
+	}
+	if ar.Spec.Undo == nil || ar.Spec.Undo.Strategy == agentv1alpha1.UndoNone || len(ar.Spec.Undo.Steps) == 0 {
+		return refuse("this action has no recorded undo plan (strategy is none)")
+	}
+	if roster == nil {
+		return refuse("this action has no usable approval roster")
+	}
+	if !roster.HasApprover(principal) {
+		return refuse("you are not on the approval roster for this action")
+	}
+	return allow()
+}
+
+// AuthorizeUncontest gates `/uncontest <action-id>`: the record must currently have
+// status.contested == true and the caller must be on the ApprovalRoster.
+func AuthorizeUncontest(roster *agentv1alpha1.ApprovalRoster, ar *agentv1alpha1.ActionRecord, principal string) Decision {
+	if ar == nil {
+		return refuse("no such action")
+	}
+	if !ar.Status.Contested {
+		return refuse("this action is not marked contested")
+	}
+	if roster == nil {
+		return refuse("this action has no usable approval roster")
+	}
+	if !roster.HasApprover(principal) {
+		return refuse("you are not on the approval roster for this action")
+	}
+	return allow()
 }

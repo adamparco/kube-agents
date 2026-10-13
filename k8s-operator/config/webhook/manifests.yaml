@@ -4,130 +4,130 @@ kind: MutatingWebhookConfiguration
 metadata:
   name: mutating-webhook-configuration
 webhooks:
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /mutate-kubeagents-x-k8s-io-v1alpha1-platformagent
-    failurePolicy: Fail
-    name: mplatformagent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - platformagents
-    sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-kubeagents-x-k8s-io-v1alpha1-platformagent
+  failurePolicy: Fail
+  name: mplatformagent.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - platformagents
+  sideEffects: None
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   name: validating-webhook-configuration
 webhooks:
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-approvalroster
-    failurePolicy: Ignore
-    name: vapprovalroster.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - approvalrosters
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-changepolicy
-    failurePolicy: Fail
-    name: vchangepolicy.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - changepolicies
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-fleetfreeze
-    failurePolicy: Ignore
-    name: vfleetfreeze.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - fleetfreezes
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-platformagent
-    failurePolicy: Fail
-    name: vplatformagent.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-          - DELETE
-        resources:
-          - platformagents
-    sideEffects: None
-  - admissionReviewVersions:
-      - v1
-    clientConfig:
-      service:
-        name: webhook-service
-        namespace: system
-        path: /validate-kubeagents-x-k8s-io-v1alpha1-undorequest
-    failurePolicy: Ignore
-    name: vundorequest.kb.io
-    rules:
-      - apiGroups:
-          - kubeagents.x-k8s.io
-        apiVersions:
-          - v1alpha1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - undorequests
-    sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kubeagents-x-k8s-io-v1alpha1-approvalroster
+  failurePolicy: Ignore
+  name: vapprovalroster.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - approvalrosters
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kubeagents-x-k8s-io-v1alpha1-changepolicy
+  failurePolicy: Fail
+  name: vchangepolicy.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - changepolicies
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kubeagents-x-k8s-io-v1alpha1-fleetfreeze
+  failurePolicy: Ignore
+  name: vfleetfreeze.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - fleetfreezes
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kubeagents-x-k8s-io-v1alpha1-platformagent
+  failurePolicy: Fail
+  name: vplatformagent.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    - DELETE
+    resources:
+    - platformagents
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-kubeagents-x-k8s-io-v1alpha1-undorequest
+  failurePolicy: Ignore
+  name: vundorequest.kb.io
+  rules:
+  - apiGroups:
+    - kubeagents.x-k8s.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - undorequests
+  sideEffects: None

@@ -162,3 +162,19 @@ func (m *Minter) Attenuate(ctx context.Context, self string, n int, parent Entry
 	}
 	return m.Write(ctx, key, child)
 }
+
+// MintHop writes a child capability in self's hop namespace (`hop.<self>.<n>`)
+// pinned to parentRef without requiring the caller to read parent from KV_cap.
+// The verifier checks `Narrows(parent, child)` and `writer == parent.Delegate`
+// against the stored parent when the chain is resolved.
+func (m *Minter) MintHop(ctx context.Context, self string, n int, parentRef Ref, child Entry) (Ref, error) {
+	key, err := HopKey(self, n)
+	if err != nil {
+		return Ref{}, err
+	}
+	if parentRef.Key == "" || parentRef.Revision == 0 {
+		return Ref{}, refuse("parent reference is not pinned to a revision")
+	}
+	child.Parent = &parentRef
+	return m.Write(ctx, key, child)
+}

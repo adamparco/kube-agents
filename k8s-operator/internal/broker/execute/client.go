@@ -18,8 +18,12 @@ package execute
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,10 +74,13 @@ var _ Applier = (*ClientApplier)(nil)
 
 // Apply performs a server-side apply.
 //
-// Ownership is NOT forced. A conflict means another manager owns a field this apply would change,
-// and that is exactly the `contested` signal of 03 §6 -- forcing would resolve it by taking the
-// field, silently, which is the opposite of what a broker whose job is attribution should do. The
-// conflict surfaces as an error and goes to the recovery ladder.
+// Ownership over ANOTHER manager is NOT forced: a conflict with a foreign manager means another
+// actor owns a field this apply would change, which is the `contested` signal of 03 §6. However,
+// Kubernetes SSA treats `(manager: M, operation: Update)` (written by a prior `patch` verb from
+// the same agent) as conflicting with `(manager: M, operation: Apply)` (written by `apply` or
+// `UndoRestore`). When every conflict cause names `fieldManager` itself, retrying with
+// ForceOwnership transitions the agent's own Update-owned fields to Apply without touching any
+// field owned by another manager.
 func (a *ClientApplier) Apply(ctx context.Context, obj *unstructured.Unstructured, fieldManager string, dryRun bool) (*unstructured.Unstructured, error) {
 	out := obj.DeepCopy()
 	opts := []client.PatchOption{client.FieldOwner(fieldManager)}
@@ -81,9 +88,41 @@ func (a *ClientApplier) Apply(ctx context.Context, obj *unstructured.Unstructure
 		opts = append(opts, client.DryRunAll)
 	}
 	if err := a.Client.Patch(ctx, out, client.Apply, opts...); err != nil {
+		if isOnlySelfFieldManagerConflict(err, fieldManager) {
+			retryOut := obj.DeepCopy()
+			retryOpts := append([]client.PatchOption{client.ForceOwnership}, opts...)
+			if retryErr := a.Client.Patch(ctx, retryOut, client.Apply, retryOpts...); retryErr != nil {
+				return nil, retryErr
+			}
+			return retryOut, nil
+		}
 		return nil, err
 	}
 	return out, nil
+}
+
+func isOnlySelfFieldManagerConflict(err error, fieldManager string) bool {
+	if !apierrors.IsConflict(err) || fieldManager == "" {
+		return false
+	}
+	var statusErr *apierrors.StatusError
+	if !errors.As(err, &statusErr) || statusErr.ErrStatus.Details == nil {
+		return false
+	}
+	causes := statusErr.ErrStatus.Details.Causes
+	if len(causes) == 0 {
+		return false
+	}
+	wantPrefix := fmt.Sprintf("conflict with %q", fieldManager)
+	for _, c := range causes {
+		if c.Type != metav1.CauseTypeFieldManagerConflict {
+			return false
+		}
+		if !strings.HasPrefix(c.Message, wantPrefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // Create makes an object that does not exist, and FAILS if the name is taken.

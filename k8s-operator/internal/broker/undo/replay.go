@@ -120,7 +120,7 @@ func Replayable(ar *agentv1alpha1.ActionRecord, now time.Time) (ReplayRefusal, s
 			"action %s is in phase %q; only a %s action changed the world in a way that is still standing and can be put back",
 			ar.Spec.ActionID, ar.Status.Phase, agentv1alpha1.PhaseVerified)
 	}
-	if err := ValidateReplayable(ar.Spec.Undo); err != nil {
+	if err := ValidateReplayable(HydratePlanFromRecord(ar)); err != nil {
 		return RefusePlanUnusable, fmt.Sprintf("action %s cannot be replayed: %v", ar.Spec.ActionID, err)
 	}
 	if !journal.UndoWindowOpen(ar, now) {
@@ -129,4 +129,49 @@ func Replayable(ar *agentv1alpha1.ActionRecord, now time.Time) (ReplayRefusal, s
 			ar.Spec.ActionID, ar.Spec.Retention.UndoWindowExpiresAt.UTC().Format(time.RFC3339))
 	}
 	return ReplayAllowed, ""
+}
+
+// HydratePlanFromRecord returns a copy of ar.Spec.Undo with post-execution UIDs bound onto any
+// delete step whose target was created during execution (recorded in ar.Status.Applied).
+func HydratePlanFromRecord(ar *agentv1alpha1.ActionRecord) *agentv1alpha1.UndoPlan {
+	if ar == nil || ar.Spec.Undo == nil {
+		return nil
+	}
+	plan := ar.Spec.Undo.DeepCopy()
+	for _, applied := range ar.Status.Applied {
+		idx := int(applied.TargetIndex)
+		if idx < 0 || idx >= len(ar.Spec.Targets) {
+			continue
+		}
+		var createdUID string
+		for _, d := range applied.Diff {
+			if d.Path == "/metadata/uid" && d.Value != "" {
+				createdUID = d.Value
+				break
+			}
+		}
+		if createdUID == "" {
+			continue
+		}
+		target := ar.Spec.Targets[idx]
+		for stepIdx := range plan.Steps {
+			step := &plan.Steps[stepIdx]
+			if step.Op != "delete" {
+				continue
+			}
+			if step.Preconditions != nil && step.Preconditions.UID != "" {
+				continue
+			}
+			if sameTargetIdentity(step.Target, target) {
+				_ = BindCreatedUID(plan, stepIdx, createdUID)
+				break
+			}
+		}
+	}
+	return plan
+}
+
+func sameTargetIdentity(a, b agentv1alpha1.TargetRef) bool {
+	return a.Group == b.Group && a.Version == b.Version && a.Kind == b.Kind &&
+		a.Namespace == b.Namespace && a.Name == b.Name
 }

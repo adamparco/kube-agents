@@ -216,3 +216,48 @@ func TestWriteSurvivesTwoConcurrentApprovers(t *testing.T) {
 		t.Errorf("phase = %q, want Pending: both approvals landed, so minApprovals (2) is met", after.Status.Phase)
 	}
 }
+
+// C7 / T5: When AttributionUnverified is true and allowSelfApproval is false, ensureApprovals must
+// raise Required to at least 2 so a compromised pod claiming requester.id = slack:U_OTHER cannot
+// let the true human initiator self-approve with a single vote.
+func TestApplyApproveEnforcesAttributionUnverifiedQuorumFloor(t *testing.T) {
+	roster := testRoster("r", testNS, 1, false,
+		agentv1alpha1.Approver{Platform: "slack", ID: "U02"},
+		agentv1alpha1.Approver{Platform: "slack", ID: "U03"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Spec.AttributionUnverified = true
+
+	approval.ApplyApprove(ar, roster, "slack:U02", "", fixedNow)
+
+	if ar.Status.Approvals.Required != 2 {
+		t.Fatalf("required = %d, want 2 when AttributionUnverified=true and allowSelfApproval=false", ar.Status.Approvals.Required)
+	}
+	if ar.Status.Phase != agentv1alpha1.PhasePendingApproval {
+		t.Fatalf("phase = %q, want PendingApproval after 1/2 approvals", ar.Status.Phase)
+	}
+
+	approval.ApplyApprove(ar, roster, "slack:U03", "", fixedNow)
+	if ar.Status.Phase != agentv1alpha1.PhasePending {
+		t.Fatalf("phase = %q, want Pending after 2/2 approvals", ar.Status.Phase)
+	}
+}
+
+func TestApplyUncontestClearsContestedOnly(t *testing.T) {
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Phase = agentv1alpha1.PhaseUndone
+	ar.Status.Contested = true
+	ar.Status.Message = "keep me"
+	c := fakeClient(t, ar)
+
+	if err := approval.Write(context.Background(), c, ar, func(ar *agentv1alpha1.ActionRecord) {
+		approval.ApplyUncontest(ar)
+	}); err != nil {
+		t.Fatalf("Write(ApplyUncontest): %v", err)
+	}
+	if ar.Status.Contested {
+		t.Fatal("expected status.contested to be cleared to false")
+	}
+	if ar.Status.Phase != agentv1alpha1.PhaseUndone || ar.Status.Message != "keep me" {
+		t.Errorf("unexpected mutation to other status fields: phase=%q message=%q", ar.Status.Phase, ar.Status.Message)
+	}
+}

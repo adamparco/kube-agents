@@ -19,6 +19,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -798,10 +799,10 @@ func TestGatedActionParksAtStepSevenAndNothingBelowRuns(t *testing.T) {
 	if len(r.records.stored) != 1 || r.records.stored[0].Status.Phase != agentv1alpha1.PhasePendingApproval {
 		t.Fatalf("the parked record is %+v, want one PendingApproval", r.records.stored)
 	}
-	// A parked record carries no pre-state: it was captured at step 3, and by the time a human
-	// approves it describes a cluster that has moved on.
-	if len(r.records.stored[0].Spec.PreState) != 0 {
-		t.Errorf("the parked record carries %d pre-states", len(r.records.stored[0].Spec.PreState))
+	// A parked record preserves its initial Undo plan at creation time because
+	// ActionRecord.spec is immutable after creation (06 §4.3).
+	if len(r.records.stored[0].Spec.Undo.Steps) == 0 {
+		t.Errorf("expected the parked record to carry initial undo steps, got 0")
 	}
 }
 
@@ -1919,3 +1920,105 @@ func TestStepElevenHandsTheStoreTheWholeOutcome(t *testing.T) {
 		t.Errorf("status.timestamps is nil")
 	}
 }
+
+func TestStepClassify_BlastRadiusAbortReturns422(t *testing.T) {
+	r := newRig(t)
+	tr := &broker.StepTrace{}
+	for _, st := range []broker.Step{broker.StepAuthenticate, broker.StepValidate, broker.StepResolveScope} {
+		if err := tr.Run(st, func() (string, error) { return "ok", nil }); err != nil {
+			t.Fatalf("seeding trace at %s: %v", st, err)
+		}
+	}
+	env := createEnvelope()
+	s := &state{
+		id:       testIdentity(),
+		env:      env,
+		tr:       tr,
+		at:       testClock,
+		actionID: "01J3Q5V8X9ABCDEFGHJKMNPQRS",
+		caller: classify.Caller{
+			Name:  testAgent,
+			Tier:  string(agentv1alpha1.TierPlatform),
+			Scope: scope.Of(testAgentCR()),
+		},
+		snaps: []execute.Snapshot{{
+			TargetIndex: 0,
+			Ref:         agentv1alpha1.TargetRef{Version: "v1", Kind: "ConfigMap", Namespace: testTenantNS, Name: "app-config"},
+		}},
+		resolved: []classify.ResolvedOp{{
+			Verb:        "delete",
+			Kind:        classify.KindRef{Group: "", Kind: "ConfigMap"},
+			Namespace:   testTenantNS,
+			Name:        "app-config",
+			WholeObject: true,
+			BlastRadius: classify.BlastRadius{Objects: classify.AbortObjectThreshold + 1},
+		}},
+	}
+
+	_, err := r.pipeline.stepClassify(context.Background(), s)
+	if err == nil {
+		t.Fatal("stepClassify succeeded on an operation exceeding AbortObjectThreshold, want 422 refusal")
+	}
+	var ref *broker.Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("err = %v (%T), want *broker.Refusal", err, err)
+	}
+	if ref.Status != http.StatusUnprocessableEntity {
+		t.Errorf("Status = %d, want %d", ref.Status, http.StatusUnprocessableEntity)
+	}
+	if ref.Reason != "blast-radius-cap-exceeded" {
+		t.Errorf("Reason = %q, want %q", ref.Reason, "blast-radius-cap-exceeded")
+	}
+	if !ref.Journal {
+		t.Error("Journal = false, want true")
+	}
+	if !ref.SecurityEvent {
+		t.Error("SecurityEvent = false, want true")
+	}
+	if got := tr.Reached(); got != broker.StepClassify {
+		t.Errorf("reached %s, want %s", got, broker.StepClassify)
+	}
+}
+
+func TestMultiObjectEnvelopeScopeFractionBlastRadiusAbort(t *testing.T) {
+	r := newRig(t)
+	env := createEnvelope()
+	env.Operations = nil
+	for i := 0; i < 11; i++ {
+		name := fmt.Sprintf("cm-%02d", i)
+		env.Operations = append(env.Operations, broker.Operation{
+			Op: "create",
+			Target: &broker.Target{
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Namespace: testTenantNS,
+				Name:      name,
+			},
+			DesiredState: map[string]any{
+				"apiVersion": "v1",
+				"kind":       "ConfigMap",
+				"metadata":   map[string]any{"name": name, "namespace": testTenantNS},
+				"data":       map[string]any{"k": "v"},
+			},
+		})
+	}
+
+	tr, _, err := r.submit(env)
+	if err == nil {
+		t.Fatalf("submit succeeded on 11-object envelope (55%% of 20-floored scope), want 422 refusal; trace: %s", tr)
+	}
+	var ref *broker.Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("err = %v (%T), want *broker.Refusal", err, err)
+	}
+	if ref.Status != http.StatusUnprocessableEntity {
+		t.Errorf("Status = %d, want %d", ref.Status, http.StatusUnprocessableEntity)
+	}
+	if ref.Reason != "blast-radius-cap-exceeded" {
+		t.Errorf("Reason = %q, want %q", ref.Reason, "blast-radius-cap-exceeded")
+	}
+	if !strings.Contains(ref.Detail, "affects 11 objects, 55% of the objects in scope") {
+		t.Errorf("Detail = %q, want 11 objects / 55%% detail", ref.Detail)
+	}
+}
+

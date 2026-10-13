@@ -109,4 +109,11 @@ func TestTheReservedPrincipalsCarryNoCredential(t *testing.T) {
 			t.Errorf("%s is rendered from a reference, not as plain names", a2aCalloutReservedPrincipalsEnvVar)
 		}
 	}
+	var calloutUsers []string
+	for _, id := range calloutIdentities(agent) {
+		calloutUsers = append(calloutUsers, id.user)
+	}
+	if !slices.Contains(calloutUsers, a2aBrokerUser) {
+		t.Errorf("calloutIdentities(%v) lacks %q; the callout reserves map users from this list", calloutUsers, a2aBrokerUser)
+	}
 }

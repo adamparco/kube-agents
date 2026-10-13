@@ -179,3 +179,13 @@ func TestCoveredBy(t *testing.T) {
 		}
 	}
 }
+
+func TestCoveredByPodServiceAccountAlias(t *testing.T) {
+	if !coveredBy("/spec/template/spec/serviceAccount", []string{"/spec/template/spec/serviceAccountName"}) {
+		t.Fatal("expected /spec/template/spec/serviceAccount to be covered by /spec/template/spec/serviceAccountName")
+	}
+	if !coveredBy("/spec/serviceAccount", []string{"/spec/serviceAccountName"}) {
+		t.Fatal("expected /spec/serviceAccount to be covered by /spec/serviceAccountName")
+	}
+}
+

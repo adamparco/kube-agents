@@ -86,6 +86,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Guard against spuriously delivering routine/elevated records that never gated on approval.
+	if !delivered && ar.Status.Phase != agentv1alpha1.PhasePendingApproval && ar.Status.Approvals == nil {
+		return ctrl.Result{}, nil
+	}
+
 	if delivered && state.Key == key {
 		return ctrl.Result{}, nil // already shows exactly this content
 	}
@@ -110,7 +115,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 func relevantPhase(p agentv1alpha1.ActionPhase) bool {
 	switch p {
 	case agentv1alpha1.PhasePendingApproval, agentv1alpha1.PhasePending,
-		agentv1alpha1.PhaseRejected, agentv1alpha1.PhaseExpired:
+		agentv1alpha1.PhaseRejected, agentv1alpha1.PhaseExpired,
+		agentv1alpha1.PhaseVerified, agentv1alpha1.PhaseRolledBack,
+		agentv1alpha1.PhaseFailed, agentv1alpha1.PhaseUndone:
 		return true
 	default:
 		return false
@@ -127,7 +134,7 @@ func deliveryKey(ar *agentv1alpha1.ActionRecord) string {
 		granted = len(ar.Status.Approvals.Granted)
 		rejected = len(ar.Status.Approvals.Rejected)
 	}
-	return fmt.Sprintf("%s:%s:%d:%d", ar.UID, ar.Status.Phase, granted, rejected)
+	return fmt.Sprintf("%s:%s:%d:%d:%t", ar.UID, ar.Status.Phase, granted, rejected, ar.Status.Contested)
 }
 
 // SetupWithManager wires the reconciler to watch ActionRecord.

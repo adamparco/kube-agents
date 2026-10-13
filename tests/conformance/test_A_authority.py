@@ -827,7 +827,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         assertion in this class vacuously.
         """
         grants = self._rendered_publish_grants()
-        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier"):
+        for user in ("gateway", "agent", "bridge", "web", "seed", "provision", "verifier", "broker"):
             self.assertIn(user, grants, f"{user} is no longer a rendered principal")
             self.assertTrue(grants[user], f"{user} renders no publish grants; the tests below go vacuous")
         self.assertEqual([], grants["session"], "the session entry's empty lists are load-bearing")
@@ -984,6 +984,36 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             if any(self._subject_matches(g, self.EVENTS_PROBE) for g in grants)
         )
         self.assertEqual([], writers, f"rendered principals reaching an executor's events subject: {writers}")
+
+
+class A3TheBrokerPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
+    """Each BROKER subject class has a disjoint writer set."""
+
+    def test_A3_only_gateway_writes_broker_approve(self) -> None:
+        grants = A3TheTaskPlaneSubjectSaysWhoWroteIt._rendered_publish_grants()
+        writers = sorted(
+            name
+            for name, allow in grants.items()
+            if any(
+                A3TheTaskPlaneSubjectSaysWhoWroteIt._subject_matches(pat, "a2a.broker.approve.ar-01J.1")
+                for pat in allow
+            )
+        )
+        self.assertEqual(["gateway"], writers)
+        self.assertNotIn("broker.approve", A3TheTaskPlaneSubjectSaysWhoWroteIt._session_publish_derivation())
+
+    def test_A3_only_broker_writes_broker_events_and_dlq(self) -> None:
+        grants = A3TheTaskPlaneSubjectSaysWhoWroteIt._rendered_publish_grants()
+        for subj in ("a2a.broker.events.agent-1.ar-01J", "a2a.broker.dlq.propose.ar-01J"):
+            writers = sorted(
+                name
+                for name, allow in grants.items()
+                if any(A3TheTaskPlaneSubjectSaysWhoWroteIt._subject_matches(pat, subj) for pat in allow)
+            )
+            self.assertEqual(["broker"], writers, f"writers for {subj}: {writers}")
+        session_pub = A3TheTaskPlaneSubjectSaysWhoWroteIt._session_publish_derivation()
+        self.assertNotIn("broker.events", session_pub)
+        self.assertNotIn("broker.dlq", session_pub)
 
 
 class _SlackClickAdapter:

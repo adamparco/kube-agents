@@ -7,6 +7,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // The attacker, written before the verifier. 09 §9 opens by warning that a
@@ -627,4 +632,296 @@ func TestValidateNamespaceRefusesBothSeparatorParities(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVerbBrokerApproveRefusesDelegatedHop(t *testing.T) {
+	const resource = Scope("project/P/cluster/C/ns/N")
+	rootEntry := Entry{
+		Tier:     TierDeveloperTeam,
+		Scope:    resource,
+		Delegate: "broker",
+	}
+	if err := Permits(rootEntry, VerbBrokerApprove, resource); err != nil {
+		t.Fatalf("root entry should permit VerbBrokerApprove: %v", err)
+	}
+	if err := Permits(rootEntry, VerbActionApprove, resource); err != nil {
+		t.Fatalf("root entry should permit VerbActionApprove alias: %v", err)
+	}
+
+	parentRef := Ref{Key: "root.approve-ar1-dec1", Revision: 401}
+	hopEntry := Entry{
+		Tier:     TierDeveloperTeam,
+		Scope:    resource,
+		Delegate: "broker",
+		Parent:   &parentRef,
+	}
+	mustRefuse(t, Permits(hopEntry, VerbBrokerApprove, resource),
+		"broker.approve capability must be a root entry and cannot be delegated")
+
+	// Also verify that VerbBrokerPropose (and alias VerbClusterPropose) IS permitted on a delegated hop.
+	if err := Permits(hopEntry, VerbBrokerPropose, resource); err != nil {
+		t.Fatalf("hop entry should permit VerbBrokerPropose: %v", err)
+	}
+	if err := Permits(hopEntry, VerbClusterPropose, resource); err != nil {
+		t.Fatalf("hop entry should permit VerbClusterPropose alias: %v", err)
+	}
+}
+
+func TestNarrowsRefusesRequesterTampering(t *testing.T) {
+	parent := Entry{
+		Tier:      TierClusterAdmin,
+		Scope:     "project/P/cluster/C",
+		Delegate:  podA,
+		Requester: "slack:U0123ABC",
+	}
+	tampered := Entry{
+		Tier:      TierClusterAdmin,
+		Scope:     "project/P/cluster/C/ns/N",
+		Delegate:  "broker",
+		Requester: "slack:U9999XYZ",
+	}
+	mustRefuse(t, Narrows(parent, tampered), "child alters the parent's requester")
+
+	// Repeating the same requester or omitting it (to inherit from root) is permitted.
+	repeated := tampered
+	repeated.Requester = "slack:U0123ABC"
+	if err := Narrows(parent, repeated); err != nil {
+		t.Fatalf("repeating parent requester should pass Narrows: %v", err)
+	}
+	inherited := tampered
+	inherited.Requester = ""
+	if err := Narrows(parent, inherited); err != nil {
+		t.Fatalf("omitting child requester should pass Narrows: %v", err)
+	}
+
+	// Validate rejects whitespace or wildcards in Requester, while permitting canonical principals.
+	for _, validReq := range []string{"slack:U0123ABC", "googlechat:users/123456", "discord:987654321"} {
+		e := Entry{Tier: TierDeveloperTeam, Scope: "project/P", Delegate: podA, Requester: validReq}
+		if err := e.Validate(); err != nil {
+			t.Fatalf("valid requester %q rejected by Validate: %v", validReq, err)
+		}
+	}
+	for _, badReq := range []string{"slack:U0123 ABC", "slack:U0123\nABC", "slack:*", "googlechat:users/>"} {
+		e := Entry{Tier: TierDeveloperTeam, Scope: "project/P", Delegate: podA, Requester: badReq}
+		mustRefuse(t, e.Validate(), "entry requester contains whitespace")
+	}
+
+	// Verify Resolver.Resolve propagates root.Requester when child.Requester == ""
+	// and never leaks Requester on refusal.
+	s := newStore()
+	rootRef := s.write(t, rootKey(t, gwTask), parent)
+	inherited.Parent = &rootRef
+	hopRef := s.write(t, hopKey(t, podA, 1), inherited)
+
+	leaf, err := resolver(s).Resolve(context.Background(), "broker", hopRef)
+	if err != nil {
+		t.Fatalf("resolve inherited requester chain: %v", err)
+	}
+	if leaf.Requester != "slack:U0123ABC" {
+		t.Fatalf("leaf.Requester = %q, want %q", leaf.Requester, "slack:U0123ABC")
+	}
+
+	// Over the Service.Answer boundary: Allowed: true carries Requester; refusal carries empty Requester.
+	svc := &Service{Resolver: resolver(s)}
+	reqBytes, err := json.Marshal(Request{
+		Ref:      hopRef,
+		Verb:     VerbBrokerPropose,
+		Resource: "project/P/cluster/C/ns/N",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	okSubj, _ := VerifySubject("broker")
+	okResp := svc.Answer(context.Background(), okSubj, reqBytes)
+	if !okResp.Allowed || okResp.Requester != "slack:U0123ABC" {
+		t.Fatalf("expected Allowed with Requester=slack:U0123ABC, got %+v", okResp)
+	}
+
+	evilSubj, _ := VerifySubject(podEvil)
+	refusedResp := svc.Answer(context.Background(), evilSubj, reqBytes)
+	if refusedResp.Allowed || refusedResp.Requester != "" || refusedResp.EnvelopeSHA256 != "" {
+		t.Fatalf("refused response must not populate Requester or EnvelopeSHA256: %+v", refusedResp)
+	}
+}
+
+func TestNarrowsRefusesEnvelopeSHA256Tampering(t *testing.T) {
+	const (
+		shaA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		shaB = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	)
+	parent := Entry{
+		Tier:           TierClusterAdmin,
+		Scope:          "project/P/cluster/C",
+		Delegate:       podA,
+		EnvelopeSHA256: shaA,
+	}
+	altered := Entry{
+		Tier:           TierClusterAdmin,
+		Scope:          "project/P/cluster/C/ns/N",
+		Delegate:       "broker",
+		EnvelopeSHA256: shaB,
+	}
+	mustRefuse(t, Narrows(parent, altered), "child alters the parent's envelopeSha256")
+
+	cleared := altered
+	cleared.EnvelopeSHA256 = ""
+	mustRefuse(t, Narrows(parent, cleared), "child alters the parent's envelopeSha256")
+
+	// When parent has no EnvelopeSHA256, child may bind one.
+	unboundParent := parent
+	unboundParent.EnvelopeSHA256 = ""
+	if err := Narrows(unboundParent, altered); err != nil {
+		t.Fatalf("child binding EnvelopeSHA256 onto unbound parent should pass Narrows: %v", err)
+	}
+
+	// Validate enforces 64 lowercase hex characters.
+	validEntry := Entry{Tier: TierDeveloperTeam, Scope: "project/P", Delegate: podA, EnvelopeSHA256: shaA}
+	if err := validEntry.Validate(); err != nil {
+		t.Fatalf("valid EnvelopeSHA256 rejected: %v", err)
+	}
+	for _, badSHA := range []string{
+		"short",
+		strings.ToUpper(shaA),
+		shaA[:63] + "g",
+		shaA + "0",
+	} {
+		badEntry := Entry{Tier: TierDeveloperTeam, Scope: "project/P", Delegate: podA, EnvelopeSHA256: badSHA}
+		mustRefuse(t, badEntry.Validate(), "entry envelopeSha256 is not a 64-character lowercase hex sha256")
+	}
+}
+
+func TestApprovalRootKeyStaysSingleToken(t *testing.T) {
+	key, err := ApprovalRootKey("01JABCDEF1234567890", "dec-1")
+	if err != nil {
+		t.Fatalf("ApprovalRootKey: %v", err)
+	}
+	if want := "root.approve-01JABCDEF1234567890-dec-1"; key != want {
+		t.Fatalf("ApprovalRootKey = %q, want %q", key, want)
+	}
+	principal, isRoot, err := writerOf(key)
+	if err != nil || !isRoot || principal != "" {
+		t.Fatalf("writerOf(%q) = (%q, %v, %v), want (\"\", true, nil)", key, principal, isRoot, err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		actionID   string
+		decisionID string
+	}{
+		{name: "empty actionID", actionID: "", decisionID: "1"},
+		{name: "empty decisionID", actionID: "ar1", decisionID: ""},
+		{name: "dot in actionID", actionID: "ar.1", decisionID: "1"},
+		{name: "dot in decisionID", actionID: "ar1", decisionID: "dec.1"},
+		{name: "star in actionID", actionID: "ar*", decisionID: "1"},
+		{name: "gt in decisionID", actionID: "ar1", decisionID: "dec>"},
+		{name: "slash in actionID", actionID: "ns/ar1", decisionID: "1"},
+		{name: "space in decisionID", actionID: "ar1", decisionID: "dec 1"},
+		{name: "tab in actionID", actionID: "ar\t1", decisionID: "1"},
+		{name: "newline in decisionID", actionID: "ar1", decisionID: "dec\n1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ApprovalRootKey(tc.actionID, tc.decisionID); err == nil {
+				t.Fatalf("ApprovalRootKey(%q, %q) succeeded; want refusal", tc.actionID, tc.decisionID)
+			}
+		})
+	}
+}
+
+func TestMintHopAndClientVerifyPropagateRequesterAndEnvelopeSHA256(t *testing.T) {
+	opts := &natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		NoLog:     true,
+		NoSigs:    true,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	}
+	srv, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatalf("nats server: %v", err)
+	}
+	go srv.Start()
+	if !srv.ReadyForConnections(5 * time.Second) {
+		t.Fatal("nats server did not come up")
+	}
+	t.Cleanup(srv.Shutdown)
+
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(nc.Close)
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: Bucket, History: 1}); err != nil {
+		t.Fatalf("create kv: %v", err)
+	}
+
+	store, err := NewStore(ctx, js)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	svc := &Service{Resolver: &Resolver{Store: store}}
+	svcCtx, svcCancel := context.WithCancel(ctx)
+	t.Cleanup(svcCancel)
+	sub, err := svc.Subscribe(svcCtx, nc)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	minter := NewMinter(js)
+	rootRef, err := minter.Mint(ctx, gwTask, Entry{
+		Tier:      TierDeveloperTeam,
+		Scope:     "project/P/cluster/C/ns/payments",
+		Delegate:  podA,
+		Requester: "googlechat:users/10987654321",
+	})
+	if err != nil {
+		t.Fatalf("Mint root: %v", err)
+	}
+
+	const digest = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	hopRef, err := minter.MintHop(ctx, podA, 1, rootRef, Entry{
+		Tier:           TierDeveloperTeam,
+		Scope:          "project/P/cluster/C/ns/payments",
+		Delegate:       "broker",
+		EnvelopeSHA256: digest,
+	})
+	if err != nil {
+		t.Fatalf("MintHop: %v", err)
+	}
+
+	brokerClient, err := NewClient(nc, "broker")
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	resp, err := brokerClient.Verify(ctx, hopRef, VerbBrokerPropose, "project/P/cluster/C/ns/payments")
+	if err != nil {
+		t.Fatalf("brokerClient.Verify: %v", err)
+	}
+	if !resp.Allowed {
+		t.Fatalf("expected Allowed=true, got %+v", resp)
+	}
+	if resp.Requester != "googlechat:users/10987654321" {
+		t.Fatalf("resp.Requester = %q, want %q", resp.Requester, "googlechat:users/10987654321")
+	}
+	if resp.EnvelopeSHA256 != digest {
+		t.Fatalf("resp.EnvelopeSHA256 = %q, want %q", resp.EnvelopeSHA256, digest)
+	}
+	if err := brokerClient.Check(ctx, hopRef, VerbBrokerPropose, "project/P/cluster/C/ns/payments"); err != nil {
+		t.Fatalf("brokerClient.Check: %v", err)
+	}
+
+	// Also verify MintHop refuses unpinned parentRef.
+	_, err = minter.MintHop(ctx, podA, 2, Ref{Key: rootRef.Key, Revision: 0}, Entry{
+		Tier:     TierDeveloperTeam,
+		Scope:    "project/P/cluster/C/ns/payments",
+		Delegate: "broker",
+	})
+	mustRefuse(t, err, "parent reference is not pinned to a revision")
 }

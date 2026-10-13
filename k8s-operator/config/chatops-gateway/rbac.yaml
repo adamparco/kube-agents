@@ -35,6 +35,15 @@ rules:
       - actionrecords/status
     verbs:
       - patch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - undorequests
+    verbs:
+      - get
+      - list
+      - watch
+      - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

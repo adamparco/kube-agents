@@ -17,8 +17,12 @@ limitations under the License.
 package gateway_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -201,3 +205,115 @@ func TestDispatchDeduplicatesReplayedEvents(t *testing.T) {
 		t.Errorf("granted count = %d, want 1 (the replay must not have run authorization again)", len(live.Status.Approvals.Granted))
 	}
 }
+
+func TestDispatchUndoCreatesUndoRequest(t *testing.T) {
+	agent := testAgent("my-agent", testNS, &agentv1alpha1.RosterRef{Name: "roster-1"})
+	roster := testRoster("roster-1", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Phase = agentv1alpha1.PhaseVerified
+	ar.Spec.Undo = &agentv1alpha1.UndoPlan{
+		Strategy: agentv1alpha1.UndoRestore,
+		Steps: []agentv1alpha1.UndoStep{
+			{Op: "apply", Target: agentv1alpha1.TargetRef{Version: "v1", Kind: "Deployment", Namespace: testNS, Name: "web"}},
+		},
+	}
+	c := fakeClientWith(t, agent, roster, ar)
+
+	d := &gateway.Dispatcher{Client: c, Now: func() time.Time { return fixedNow }}
+	reply := d.Handle(context.Background(), "event-undo-1", "slack:U02", "/undo "+ar.Name+" bad rollout")
+
+	if !strings.Contains(reply, "undo requested") {
+		t.Fatalf("reply = %q, want undo confirmation", reply)
+	}
+
+	urs := &agentv1alpha1.UndoRequestList{}
+	if err := c.List(context.Background(), urs, client.InNamespace(testNS)); err != nil {
+		t.Fatalf("list UndoRequests: %v", err)
+	}
+	if len(urs.Items) != 1 {
+		t.Fatalf("got %d UndoRequests, want 1", len(urs.Items))
+	}
+	ur := urs.Items[0]
+	if ur.Spec.ActionRef.Name != ar.Name || ur.Spec.RequestedBy != "slack:U02" || ur.Spec.Reason != "bad rollout" {
+		t.Errorf("UndoRequest spec = %+v", ur.Spec)
+	}
+	if ur.Spec.MarkContested == nil || !*ur.Spec.MarkContested {
+		t.Errorf("UndoRequest MarkContested = %v, want true", ur.Spec.MarkContested)
+	}
+}
+
+func TestDispatchUncontestClearsContestedFlag(t *testing.T) {
+	agent := testAgent("my-agent", testNS, &agentv1alpha1.RosterRef{Name: "roster-1"})
+	roster := testRoster("roster-1", testNS, 1, false, agentv1alpha1.Approver{Platform: "slack", ID: "U02"})
+	ar := testRecord("ar-1", testNS, "slack:U01")
+	ar.Status.Phase = agentv1alpha1.PhaseUndone
+	ar.Status.Contested = true
+	c := fakeClientWith(t, agent, roster, ar)
+
+	d := &gateway.Dispatcher{Client: c, Now: func() time.Time { return fixedNow }}
+	reply := d.Handle(context.Background(), "event-uncontest-1", "slack:U02", "/uncontest "+ar.Name)
+
+	if !strings.Contains(reply, "contested marker cleared") {
+		t.Fatalf("reply = %q, want uncontest confirmation", reply)
+	}
+
+	live := &agentv1alpha1.ActionRecord{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ar), live); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if live.Status.Contested {
+		t.Fatal("expected live ActionRecord status.contested to be false")
+	}
+}
+
+func TestCommandHandlerHTTPEndToEnd(t *testing.T) {
+	agent := testAgent("my-agent", testNS, &agentv1alpha1.RosterRef{Name: "roster-1"})
+	roster := testRoster("roster-1", testNS, 1, false,
+		agentv1alpha1.Approver{Platform: "googlechat", ID: "users/10987654321"},
+		agentv1alpha1.Approver{Platform: "discord", ID: "1001"},
+	)
+	ar := testRecord("ar-cmd-1", testNS, "slack:U01")
+	c := fakeClientWith(t, agent, roster, ar)
+
+	d := &gateway.Dispatcher{Client: c, Now: func() time.Time { return fixedNow }}
+	srv := httptest.NewServer(d.CommandHandler())
+	defer srv.Close()
+
+	body, _ := json.Marshal(gateway.CommandRequest{
+		Platform:  "googlechat",
+		SenderID:  "users/10987654321",
+		EventID:   "googlechat:spaces/S1/messages/M1",
+		ChannelID: "gchat:spaces/S1/threads/T1",
+		ThreadID:  "gchat:spaces/S1/threads/T1",
+		Text:      "/approve " + ar.Name,
+		Namespace: testNS,
+	})
+	resp, err := http.Post(srv.URL+"/v1alpha1/commands", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /v1alpha1/commands: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	var got gateway.CommandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode CommandResponse: %v", err)
+	}
+	if !got.OK || !strings.Contains(got.Reply, "approved") || got.DecisionID != "googlechat:spaces/S1/messages/M1" {
+		t.Fatalf("unexpected CommandResponse: %+v", got)
+	}
+
+	live := &agentv1alpha1.ActionRecord{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ar), live); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if live.Status.Phase != agentv1alpha1.PhasePending {
+		t.Fatalf("phase = %q, want Pending", live.Status.Phase)
+	}
+	if live.Status.Approvals == nil || len(live.Status.Approvals.Granted) != 1 || live.Status.Approvals.Granted[0].Principal != "googlechat:users/10987654321" {
+		t.Fatalf("approvals = %+v, want 1 granted by googlechat:users/10987654321", live.Status.Approvals)
+	}
+}
+

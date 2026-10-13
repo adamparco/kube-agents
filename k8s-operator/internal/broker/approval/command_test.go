@@ -64,11 +64,39 @@ func TestParseCommandRejectWithNoReason(t *testing.T) {
 	}
 }
 
-func TestParseCommandRejectsV2Verbs(t *testing.T) {
-	for _, text := range []string{"resume my-agent", "uncontest ar-x"} {
-		if _, err := approval.ParseCommand(text); err == nil {
-			t.Errorf("ParseCommand(%q): expected an error; v1 does not support v2 verbs", text)
-		}
+func TestParseCommandUndoAndUncontest(t *testing.T) {
+	undoCmd, err := approval.ParseCommand("/undo ar-x bad rollout")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if undoCmd.Verb != approval.VerbUndo || undoCmd.ActionID != "ar-x" || undoCmd.Reason != "bad rollout" {
+		t.Errorf("got %+v", undoCmd)
+	}
+
+	undoNoReason, err := approval.ParseCommand("/kage undo ar-x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if undoNoReason.Verb != approval.VerbUndo || undoNoReason.ActionID != "ar-x" || undoNoReason.Reason != "" {
+		t.Errorf("got %+v", undoNoReason)
+	}
+
+	uncontestCmd, err := approval.ParseCommand("/uncontest ar-x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if uncontestCmd.Verb != approval.VerbUncontest || uncontestCmd.ActionID != "ar-x" {
+		t.Errorf("got %+v", uncontestCmd)
+	}
+
+	if _, err := approval.ParseCommand("/uncontest ar-x extra"); err == nil {
+		t.Error("expected an error; uncontest takes no reason")
+	}
+}
+
+func TestParseCommandRejectsResumeVerb(t *testing.T) {
+	if _, err := approval.ParseCommand("resume my-agent"); err == nil {
+		t.Error("ParseCommand(\"resume my-agent\"): expected an error")
 	}
 }
 
@@ -79,7 +107,7 @@ func TestParseCommandRejectsUnrecognizedVerb(t *testing.T) {
 }
 
 func TestParseCommandRejectsEmptyAndOneWord(t *testing.T) {
-	for _, text := range []string{"", "approve", "   "} {
+	for _, text := range []string{"", "approve", "/kage", "/kage approve", "   "} {
 		if _, err := approval.ParseCommand(text); err == nil {
 			t.Errorf("ParseCommand(%q): expected an error", text)
 		}

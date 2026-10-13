@@ -26,8 +26,20 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval"
 )
+
+// ApprovalCapabilityVerifier optionally verifies that an ActionRecord transitioning to
+// Pending carries a verified broker.approve capability before ResumeController executes it.
+type ApprovalCapabilityVerifier interface {
+	VerifyApprovalForRecord(ctx context.Context, ar *agentv1alpha1.ActionRecord) error
+}
+
+// EventPublisher optionally publishes ActionRecord terminal state transitions to NATS.
+type EventPublisher interface {
+	PublishRecordEvent(ctx context.Context, ar *agentv1alpha1.ActionRecord, res *broker.Result) error
+}
 
 // ResumeController watches ActionRecord for the two things nothing else does: an approval that has
 // arrived (phase Pending, reached only via the ChatOps gateway's threshold write) and a deadline
@@ -36,8 +48,10 @@ import (
 // does, both other pieces run as the gateway.
 type ResumeController struct {
 	client.Client
-	Pipeline *Pipeline
-	Records  RecordStore
+	Pipeline         *Pipeline
+	Records          RecordStore
+	ApprovalVerifier ApprovalCapabilityVerifier
+	Events           EventPublisher
 
 	// Now is injectable for tests; defaults to time.Now.
 	Now func() time.Time
@@ -68,9 +82,31 @@ func (r *ResumeController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if ar.Status.Approvals == nil {
 			return ctrl.Result{}, nil
 		}
+		if r.ApprovalVerifier != nil {
+			if err := r.ApprovalVerifier.VerifyApprovalForRecord(ctx, ar); err != nil {
+				msg := fmt.Sprintf("approval capability verification refused: %v", err)
+				if setErr := r.Records.SetPhase(ctx, ar, agentv1alpha1.PhaseRejected, msg); setErr != nil {
+					return ctrl.Result{}, fmt.Errorf("resume: rejecting unverified approval %s: %w", ar.Name, setErr)
+				}
+				ar.Status.Phase = agentv1alpha1.PhaseRejected
+				if r.Events != nil {
+					_ = r.Events.PublishRecordEvent(ctx, ar, &broker.Result{
+						ActionID:  ar.Spec.ActionID,
+						Namespace: ar.Namespace,
+						Decision:  "refused",
+						Phase:     string(agentv1alpha1.PhaseRejected),
+						Message:   msg,
+					})
+				}
+				return ctrl.Result{}, nil
+			}
+		}
 		res, err := r.Pipeline.Resume(ctx, ar)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("resume: %s: %w", ar.Name, err)
+		}
+		if r.Events != nil {
+			_ = r.Events.PublishRecordEvent(ctx, ar, res)
 		}
 		log.Info("resumed approved action", "record", ar.Name, "decision", res.Decision, "phase", res.Phase)
 		return ctrl.Result{}, nil
@@ -84,8 +120,19 @@ func (r *ResumeController) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if r.now().Before(deadline) {
 			return ctrl.Result{RequeueAfter: deadline.Sub(r.now())}, nil
 		}
-		if err := r.Records.SetPhase(ctx, ar, agentv1alpha1.PhaseExpired, "the approval window closed with insufficient approvals"); err != nil {
+		msg := "the approval window closed with insufficient approvals"
+		if err := r.Records.SetPhase(ctx, ar, agentv1alpha1.PhaseExpired, msg); err != nil {
 			return ctrl.Result{}, fmt.Errorf("resume: expiring %s: %w", ar.Name, err)
+		}
+		ar.Status.Phase = agentv1alpha1.PhaseExpired
+		if r.Events != nil {
+			_ = r.Events.PublishRecordEvent(ctx, ar, &broker.Result{
+				ActionID:  ar.Spec.ActionID,
+				Namespace: ar.Namespace,
+				Decision:  "refused",
+				Phase:     string(agentv1alpha1.PhaseExpired),
+				Message:   msg,
+			})
 		}
 		return ctrl.Result{}, nil
 

@@ -149,6 +149,46 @@ func TestTheMapKeysOnTheServiceAccountTheProvisionJobRunsAs(t *testing.T) {
 	t.Fatal("no provision principal in the rendered map")
 }
 
+func TestTheMapKeysOnTheBrokerServiceAccount(t *testing.T) {
+	agent := authMapTestAgent()
+	want := "system:serviceaccount:" + agent.Namespace + ":" + a2aBrokerName(agent)
+
+	doc, err := renderA2AAuthMap(agent)
+	if err != nil {
+		t.Fatalf("renderA2AAuthMap: %v", err)
+	}
+	var found bool
+	for _, id := range doc.Identities {
+		if id.User == a2aBrokerUser {
+			found = true
+			if id.ServiceAccount != want {
+				t.Errorf("broker principal keys on %q, want %q", id.ServiceAccount, want)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no broker principal in the rendered map")
+	}
+
+	annotated := agent.DeepCopy()
+	annotated.Annotations = map[string]string{a2aBrokerServiceAccountAnnotation: "platform--actor"}
+	docAnnotated, err := renderA2AAuthMap(annotated)
+	if err != nil {
+		t.Fatalf("renderA2AAuthMap(annotated): %v", err)
+	}
+	wantAnnotated := "system:serviceaccount:" + agent.Namespace + ":platform--actor"
+	for _, id := range docAnnotated.Identities {
+		if id.User == a2aBrokerUser {
+			if id.ServiceAccount != wantAnnotated {
+				t.Errorf("annotated broker principal keys on %q, want %q", id.ServiceAccount, wantAnnotated)
+			}
+			return
+		}
+	}
+	t.Fatal("no broker principal in the annotated rendered map")
+}
+
 // The wildcard readability check, asserted because the default JSON encoder
 // silently undoes it. Every subject list here is full of > wildcards and the
 // escaped form is what an operator would be reading at 3 AM.

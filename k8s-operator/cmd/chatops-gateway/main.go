@@ -39,7 +39,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -48,6 +50,11 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval/gateway"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/approval/notify"
+	brokercontroller "github.com/gke-labs/kube-agents/k8s-operator/internal/broker/controller"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/execute"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/rollback"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker/undo"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/journal"
 )
 
 var (
@@ -63,6 +70,7 @@ func init() {
 type options struct {
 	namespace              string
 	addr                   string
+	commandAddr            string
 	metricsAddr            string
 	healthProbeAddr        string
 	leaderElect            bool
@@ -77,6 +85,7 @@ func parseFlags() options {
 	var o options
 	flag.StringVar(&o.namespace, "namespace", envOr("NAMESPACE", "kubeagents-system"), "namespace this gateway runs in and stores delivery state in")
 	flag.StringVar(&o.addr, "addr", envOr("LISTEN_ADDR", ":8443"), "address the webhook HTTP server listens on")
+	flag.StringVar(&o.commandAddr, "command-bind-address", envOr("COMMAND_BIND_ADDRESS", ""), "optional dedicated address for POST /v1alpha1/commands (always also served on --addr)")
 	flag.StringVar(&o.metricsAddr, "metrics-bind-address", "0", "metrics endpoint; \"0\" disables it")
 	flag.StringVar(&o.healthProbeAddr, "health-probe-bind-address", ":8081", "health probe endpoint")
 	flag.BoolVar(&o.leaderElect, "leader-elect", true, "enable leader election; the gateway is single-replica by design (05 §1.8's one-socket rule) and this is what makes a rollout safe rather than a race")
@@ -95,6 +104,14 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func buildHTTPMux(dispatcher *gateway.Dispatcher, slackHandler *gateway.SlackHandler, gchatHandler *gateway.GoogleChatHandler) *http.ServeMux {
+	mux := gateway.NewServeMux(slackHandler, gchatHandler)
+	if dispatcher != nil {
+		mux.Handle("/v1alpha1/commands", dispatcher.CommandHandler())
+	}
+	return mux
 }
 
 func main() {
@@ -137,6 +154,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	undoCfg := rest.CopyConfig(mgr.GetConfig())
+	undoCfg.Impersonate = rest.ImpersonationConfig{
+		UserName: "system:serviceaccount:" + o.namespace + ":kube-agents-undo-controller",
+		Groups:   []string{"system:serviceaccounts", "system:serviceaccounts:" + o.namespace, "system:authenticated"},
+	}
+	if undoClient, err := client.New(undoCfg, client.Options{Scheme: scheme}); err != nil {
+		setupLog.Error(err, "unable to build undo controller client")
+		os.Exit(1)
+	} else {
+		undoRec := &brokercontroller.UndoReconciler{
+			Client: undoClient,
+			Scheme: scheme,
+			Replayer: &liveBrokerReplayer{
+				baseCfg: mgr.GetConfig(),
+				scheme:  scheme,
+			},
+			Now: time.Now,
+		}
+		if err := undoRec.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to set up the undo reconciler")
+			os.Exit(1)
+		}
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -165,7 +206,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	dispatcher := &gateway.Dispatcher{Client: mgr.GetClient()}
+	dispatcher := &gateway.Dispatcher{Client: mgr.GetClient(), WaitTimeout: 15 * time.Second}
 	var slackHandler *gateway.SlackHandler
 	if o.slackSigningSecret != "" {
 		slackHandler = &gateway.SlackHandler{Dispatcher: dispatcher, SigningSecret: o.slackSigningSecret}
@@ -181,15 +222,29 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr:              o.addr,
-		Handler:           gateway.NewServeMux(slackHandler, gchatHandler),
+		Handler:           buildHTTPMux(dispatcher, slackHandler, gchatHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
+	var commandServer *http.Server
+	if o.commandAddr != "" && o.commandAddr != "0" && o.commandAddr != o.addr {
+		cmdMux := http.NewServeMux()
+		cmdMux.Handle("/v1alpha1/commands", dispatcher.CommandHandler())
+		commandServer = &http.Server{
+			Addr:              o.commandAddr,
+			Handler:           cmdMux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+	}
+
 	ctx := ctrl.SetupSignalHandler()
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		setupLog.Info("starting chatops webhook server", "addr", o.addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -198,6 +253,16 @@ func main() {
 		}
 		errCh <- nil
 	}()
+	if commandServer != nil {
+		go func() {
+			setupLog.Info("starting chatops command server", "addr", o.commandAddr)
+			if err := commandServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("command server: %w", err)
+				return
+			}
+			errCh <- nil
+		}()
+	}
 	go func() {
 		setupLog.Info("starting manager (approval notifier)")
 		if err := mgr.Start(ctx); err != nil {
@@ -219,4 +284,42 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	if commandServer != nil {
+		_ = commandServer.Shutdown(shutdownCtx)
+	}
 }
+
+type liveBrokerReplayer struct {
+	baseCfg *rest.Config
+	scheme  *runtime.Scheme
+}
+
+func (l *liveBrokerReplayer) Replay(ctx context.Context, ar *agentv1alpha1.ActionRecord, req *agentv1alpha1.UndoRequest) (string, error) {
+	plan := undo.HydratePlanFromRecord(ar)
+	if plan == nil {
+		return "", fmt.Errorf("action record %s has no undo plan: %w", ar.Name, brokercontroller.ErrReplayRefused)
+	}
+	actorSA := fmt.Sprintf("system:serviceaccount:%s:%s", ar.Namespace, ar.Spec.ActorServiceAccount)
+	cfg := rest.CopyConfig(l.baseCfg)
+	cfg.Impersonate = rest.ImpersonationConfig{
+		UserName: actorSA,
+		Groups:   []string{"system:serviceaccounts", "system:serviceaccounts:" + ar.Namespace, "system:authenticated"},
+	}
+	actorClient, err := client.New(cfg, client.Options{Scheme: l.scheme})
+	if err != nil {
+		return "", fmt.Errorf("build actor client for %s: %w", actorSA, err)
+	}
+	replayer := &rollback.Replayer{
+		Writer: &execute.ClientApplier{Client: actorClient},
+		Reader: &execute.ClientReader{Client: actorClient},
+	}
+	undoID, err := journal.NewULID(time.Now().UTC())
+	if err != nil {
+		return "", fmt.Errorf("mint undo action id: %w", err)
+	}
+	if err := replayer.Rollback(ctx, ar.Spec.ActionID, ar.Spec.AgentIdentity, *plan); err != nil {
+		return "", err
+	}
+	return undoID, nil
+}
+

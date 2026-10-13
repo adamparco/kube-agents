@@ -47,7 +47,7 @@ import (
 // canonicalizes to the 06 §1.2 V-11 principal `<platform>:<id>` and canonicalization has to be
 // total. Given a single free-text field, `U02ABCDEF` is a well-formed Slack member ID, a
 // well-formed nothing, and unresolvable without guessing.
-// +kubebuilder:validation:Enum=slack;googlechat
+// +kubebuilder:validation:Enum=slack;googlechat;discord
 type ApproverPlatform string
 
 const (
@@ -55,6 +55,8 @@ const (
 	ApproverPlatformSlack ApproverPlatform = "slack"
 	// ApproverPlatformGoogleChat is a Google Chat user resource name (`users/…`).
 	ApproverPlatformGoogleChat ApproverPlatform = "googlechat"
+	// ApproverPlatformDiscord is a Discord user ID (`<snowflake>`).
+	ApproverPlatformDiscord ApproverPlatform = "discord"
 )
 
 // Approver is one member of the roster.

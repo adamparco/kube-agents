@@ -6778,7 +6778,7 @@ def _sanitized_log_args(args: tuple[Any, ...], max_length: int = 512) -> tuple[A
     )
 
 
-def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
+def read_only_refusal(argv: list[str]) -> tuple[dict[str, object], str | None] | None:
     """The blocked-response body for `argv`, or None if it may run.
 
     Returns (response_dict, log_hint) for logging, or None if allowed.
@@ -6800,13 +6800,23 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     elif decision.offending_flag:
         log_hint = decision.offending_flag
 
+    tool = argv[0] if argv else ""
+    escalation = command_policy.build_broker_escalation_hint(tool, argv, decision)
+    response: dict[str, object] = {
+        "status": "blocked",
+        "code": "SECURITY_POLICY_BLOCKED",
+        "rule": decision.rule_id,
+        "message": decision.message,
+        "escalation": escalation,
+    }
+    if isinstance(escalation, dict) and escalation.get("action") == "propose_to_broker":
+        response["error"] = (
+            "This agent is read-only; direct cluster writes are blocked. "
+            "Propose this change through the Action Broker (see escalation.cliHint)."
+        )
+
     return (
-        {
-            "status": "blocked",
-            "code": "SECURITY_POLICY_BLOCKED",
-            "rule": decision.rule_id,
-            "message": decision.message,
-        },
+        response,
         log_hint,
     )
 

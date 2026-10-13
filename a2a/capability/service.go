@@ -132,8 +132,10 @@ type Request struct {
 // answering with the capability itself would hand the store's contents to the
 // one party 09 §4 withholds them from.
 type Response struct {
-	Allowed bool   `json:"allowed"`
-	Reason  string `json:"reason,omitempty"`
+	Allowed        bool   `json:"allowed"`
+	Reason         string `json:"reason,omitempty"`
+	Requester      string `json:"requester,omitempty"`
+	EnvelopeSHA256 string `json:"envelopeSha256,omitempty"`
 }
 
 // Service answers verification requests. It holds the only Store in the
@@ -192,7 +194,11 @@ func (s *Service) Answer(ctx context.Context, subject string, data []byte) Respo
 	if err := Permits(leaf, req.Verb, req.Resource); err != nil {
 		return Response{Reason: Reason(err)}
 	}
-	return Response{Allowed: true}
+	return Response{
+		Allowed:        true,
+		Requester:      leaf.Requester,
+		EnvelopeSHA256: leaf.EnvelopeSHA256,
+	}
 }
 
 // WalkRefused is the single answer every chain-walk refusal gets. One string
@@ -322,14 +328,15 @@ func NewClient(nc *nats.Conn, self string) (*Client, error) {
 	return &Client{nc: nc, self: self, subject: subj}, nil
 }
 
-// Check asks whether the capability at ref permits verb v on resource r.
-// A nil error means permitted. Everything else — refused, unreachable,
-// malformed — is a denial, because the alternative is a broker that proceeds
-// when it could not find out.
-func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
+// Verify asks whether the capability at ref permits verb v on resource r, and
+// returns the verifier's Response (including any resolved Requester or
+// EnvelopeSHA256 when Allowed is true). A nil error means permitted.
+// Everything else — refused, unreachable, malformed — is a denial, because the
+// alternative is a broker that proceeds when it could not find out.
+func (c *Client) Verify(ctx context.Context, ref Ref, v Verb, r Scope) (Response, error) {
 	b, err := json.Marshal(Request{Ref: ref, Verb: v, Resource: r})
 	if err != nil {
-		return err
+		return Response{}, err
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -345,26 +352,35 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	// out silently.
 	reply, err := ReplySubject(c.self)
 	if err != nil {
-		return err
+		return Response{}, err
 	}
 	sub, err := c.nc.SubscribeSync(reply)
 	if err != nil {
-		return refuse("the verifier could not be reached")
+		return Response{}, refuse("the verifier could not be reached")
 	}
 	defer func() { _ = sub.Unsubscribe() }()
 	if err := c.nc.PublishRequest(c.subject, reply, b); err != nil {
-		return refuse("the verifier could not be reached")
+		return Response{}, refuse("the verifier could not be reached")
 	}
 	msg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
-		return refuse("the verifier could not be reached")
+		return Response{}, refuse("the verifier could not be reached")
 	}
 	var resp Response
 	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return refuse("the verifier's answer was not well-formed")
+		return Response{}, refuse("the verifier's answer was not well-formed")
 	}
 	if !resp.Allowed {
-		return &Refusal{Rule: resp.Reason}
+		return resp, &Refusal{Rule: resp.Reason}
 	}
-	return nil
+	return resp, nil
+}
+
+// Check asks whether the capability at ref permits verb v on resource r.
+// A nil error means permitted. Everything else — refused, unreachable,
+// malformed — is a denial, because the alternative is a broker that proceeds
+// when it could not find out.
+func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
+	_, err := c.Verify(ctx, ref, v, r)
+	return err
 }

@@ -13,34 +13,45 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf16"
 
+	"github.com/nats-io/nats.go"
+
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-const usage = `a2a - a2a-jetstream topics client
+const usage = `a2a - a2a-jetstream topics and action proposal client
 
 usage:
   a2a topics list                  list the provisioned topics and their retention class
   a2a topics read <topic>          print the latest entry on a topic
   a2a topics write <topic> [flags] publish one entry to a topic
+  a2a propose --file <path|->      mint a broker capability hop and propose an ActionEnvelope
 
 <topic> is a bare name (upgrade-readiness), a scope-qualified name
 (shared.blueprint, agent.platform.upgrade-readiness), or a full subject. A bare
 name that matches more than one provisioned topic is an error, not a guess.
 
 environment:
-  NATS_URL            bus address (required)
+  NATS_URL            bus address (required; A2A_NATS_URL also accepted)
   A2A_BUS_USER        the principal to connect as; also selects the
                       _INBOX.<user> prefix. Rendered by the operator.
   A2A_BUS_TOKEN_FILE  a projected ServiceAccount token to authenticate with
@@ -72,6 +83,10 @@ func run(args []string) error {
 	switch args[0] {
 	case "topics":
 		return runTopics(args[1:])
+	case "propose":
+		return runPropose(args[1:], os.Stdin, os.Stdout)
+	case "mint-root":
+		return runMintRoot(args[1:], os.Stdout)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
@@ -126,6 +141,9 @@ func busUser() string {
 // the failure this ordering exists to prevent.
 func connect(ctx context.Context, name string) (*lib.Client, error) {
 	url := os.Getenv("NATS_URL")
+	if url == "" {
+		url = os.Getenv("A2A_NATS_URL")
+	}
 	if url == "" {
 		return nil, errors.New("NATS_URL is not set")
 	}
@@ -407,3 +425,412 @@ func resolve(ctx context.Context, c *lib.Client, name string) (lib.TopicEntry, e
 	}
 	return lib.ResolveTopic(registry, name)
 }
+
+type proposeMessage struct {
+	CapabilityRef capability.Ref  `json:"capabilityRef"`
+	TaskID        string          `json:"taskId,omitempty"`
+	ActionID      string          `json:"actionId,omitempty"`
+	Envelope      json.RawMessage `json:"envelope"`
+}
+
+type proposeEvent struct {
+	ActionID   string `json:"actionId"`
+	RecordName string `json:"recordName,omitempty"`
+	Namespace  string `json:"namespace"`
+	Phase      string `json:"phase"`
+	Decision   string `json:"decision"`
+	RiskClass  string `json:"riskClass,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Message    string `json:"message,omitempty"`
+	SessionID  string `json:"sessionId,omitempty"`
+}
+
+func loadBrokerEnvDefaults() {
+	raw, err := os.ReadFile("/etc/kage/broker-env.json")
+	if err != nil {
+		return
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return
+	}
+	for k, v := range m {
+		if os.Getenv(k) == "" && v != "" {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
+func runPropose(args []string, in io.Reader, out io.Writer) error {
+	loadBrokerEnvDefaults()
+	fs := flag.NewFlagSet("propose", flag.ContinueOnError)
+	fileFlag := fs.String("file", "-", "path to ActionEnvelope JSON file, or - for stdin")
+	nsFlag := fs.String("namespace", firstNonEmpty(os.Getenv("A2A_NAMESPACE"), os.Getenv("POD_NAMESPACE"), os.Getenv("KUBEAGENTS_AGENT_NAMESPACE")), "target Kubernetes namespace")
+	agentFlag := fs.String("agent", firstNonEmpty(os.Getenv("A2A_AGENT_NAME"), os.Getenv("KUBEAGENTS_AGENT_NAME"), busUser()), "target agent name")
+	timeoutFlag := fs.Duration("timeout", cliTimeout, "timeout waiting for broker response")
+	parentKeyFlag := fs.String("parent-key", os.Getenv("A2A_CAPABILITY_KEY"), "parent capability key in KV bucket cap")
+	parentRevFlag := fs.Uint64("parent-rev", parseUint64Env("A2A_CAPABILITY_REVISION"), "parent capability revision in KV bucket cap")
+	tierFlag := fs.String("tier", firstNonEmpty(os.Getenv("A2A_AUTHORITY_TIER"), string(capability.TierDeveloperTeam)), "capability authority tier")
+	scopeFlag := fs.String("scope", os.Getenv("A2A_AUTHORITY_SCOPE"), "capability authority scope")
+	seqFlag := fs.Int("seq", 1, "starting hop sequence number")
+	taskIDFlag := fs.String("task-id", os.Getenv("A2A_TASK_ID"), "task identifier")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	namespace := strings.TrimSpace(*nsFlag)
+	if namespace == "" {
+		return errors.New("propose: --namespace (or A2A_NAMESPACE / POD_NAMESPACE) is required")
+	}
+	agent := strings.TrimSpace(*agentFlag)
+	if agent == "" {
+		return errors.New("propose: --agent (or A2A_AGENT_NAME) is required")
+	}
+
+	var rawEnv []byte
+	var err error
+	if *fileFlag == "-" || *fileFlag == "" {
+		rawEnv, err = io.ReadAll(in)
+	} else {
+		rawEnv, err = os.ReadFile(strings.TrimPrefix(*fileFlag, "@"))
+	}
+	if err != nil {
+		return fmt.Errorf("propose: reading envelope: %w", err)
+	}
+
+	canonEnv, err := jcsCanonicalize(rawEnv)
+	if err != nil {
+		return fmt.Errorf("propose: canonicalizing ActionEnvelope JSON: %w", err)
+	}
+	sum := sha256.Sum256(canonEnv)
+	envSHA := hex.EncodeToString(sum[:])
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
+	defer cancel()
+
+	c, err := connect(ctx, "propose")
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	writer := firstNonEmpty(os.Getenv("A2A_SESSION"), busUser())
+	if writer == "" {
+		return fmt.Errorf("propose: no writer identity: set A2A_SESSION or %s", lib.EnvBusUser)
+	}
+
+	scope := strings.TrimSpace(*scopeFlag)
+	if scope == "" {
+		scope = string(capability.NamespaceScope(namespace))
+	}
+
+	parentKey := strings.TrimSpace(*parentKeyFlag)
+	parentRev := *parentRevFlag
+	if parentKey == "" || parentRev == 0 {
+		return errors.New("propose: --parent-key / A2A_CAPABILITY_KEY and --parent-rev / A2A_CAPABILITY_REVISION are required to mint a broker capability hop")
+	}
+
+	minter := capability.NewMinter(c.JetStream())
+	entry := capability.Entry{
+		Tier:           capability.Tier(strings.TrimSpace(*tierFlag)),
+		Scope:          capability.Scope(scope),
+		Delegate:       "broker",
+		EnvelopeSHA256: envSHA,
+	}
+	parentRef := capability.Ref{Key: parentKey, Revision: parentRev}
+
+	var childRef capability.Ref
+	var mintErr error
+	startSeq := *seqFlag
+	if startSeq < 1 {
+		startSeq = 1
+	}
+	for seq := startSeq; seq < startSeq+32; seq++ {
+		childRef, mintErr = minter.MintHop(ctx, writer, seq, parentRef, entry)
+		if mintErr == nil {
+			break
+		}
+		if !strings.Contains(strings.ToLower(mintErr.Error()), "key exists") &&
+			!strings.Contains(strings.ToLower(mintErr.Error()), "wrong last sequence") {
+			return fmt.Errorf("propose: minting broker capability hop: %w", mintErr)
+		}
+	}
+	if mintErr != nil {
+		tsSeq := int(time.Now().UnixNano()%1000000000) + 1
+		childRef, mintErr = minter.MintHop(ctx, writer, tsSeq, parentRef, entry)
+	}
+	if mintErr != nil {
+		return fmt.Errorf("propose: minting broker capability hop: %w", mintErr)
+	}
+
+	eventsSubj := "a2a.broker.events." + namespace + ".>"
+	var pullSub *nats.Subscription
+	if js, jsErr := c.Conn().JetStream(); jsErr == nil {
+		pullSub, _ = js.PullSubscribe("a2a.broker.events."+namespace+".*", "", nats.BindStream("BROKER"), nats.DeliverNew(), nats.InactiveThreshold(30*time.Second))
+	}
+
+	var sub *nats.Subscription
+	if pullSub == nil {
+		sub, err = c.Conn().SubscribeSync(eventsSubj)
+		if err != nil {
+			return fmt.Errorf("propose: subscribing to %s: %w", eventsSubj, err)
+		}
+		defer func() { _ = sub.Unsubscribe() }()
+		if err := c.Conn().Flush(); err != nil {
+			return fmt.Errorf("propose: flushing event subscription: %w", err)
+		}
+	}
+
+	msgBytes, err := json.Marshal(proposeMessage{
+		CapabilityRef: childRef,
+		TaskID:        strings.TrimSpace(*taskIDFlag),
+		Envelope:      json.RawMessage(canonEnv),
+	})
+	if err != nil {
+		return fmt.Errorf("propose: marshaling proposal: %w", err)
+	}
+
+	proposeSubj := "a2a.broker.propose." + namespace + "." + agent
+	if err := c.Conn().Publish(proposeSubj, msgBytes); err != nil {
+		return fmt.Errorf("propose: publishing to %s: %w", proposeSubj, err)
+	}
+
+	var evMsg *nats.Msg
+	if pullSub != nil {
+		for ctx.Err() == nil {
+			msgs, fErr := pullSub.Fetch(1, nats.MaxWait(500*time.Millisecond))
+			if fErr == nil && len(msgs) > 0 {
+				evMsg = msgs[0]
+				break
+			}
+		}
+		if evMsg == nil {
+			return fmt.Errorf("propose: waiting for broker event on %s: %w", eventsSubj, ctx.Err())
+		}
+	} else {
+		evMsg, err = sub.NextMsgWithContext(ctx)
+		if err != nil {
+			return fmt.Errorf("propose: waiting for broker event on %s: %w", eventsSubj, err)
+		}
+	}
+
+	_, _ = fmt.Fprintln(out, strings.TrimSpace(string(evMsg.Data)))
+
+	var ev proposeEvent
+	if err := json.Unmarshal(evMsg.Data, &ev); err == nil {
+		if ev.Decision == "refused" || ev.Phase == "Rejected" {
+			return fmt.Errorf("proposal refused (%s): %s", ev.Reason, ev.Message)
+		}
+	}
+	return nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func parseUint64Env(key string) uint64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	n, _ := strconv.ParseUint(v, 10, 64)
+	return n
+}
+
+// jcsCanonicalize implements RFC 8785 JSON Canonicalization Scheme (JCS).
+func jcsCanonicalize(raw []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("trailing data after JSON value")
+	}
+	var buf bytes.Buffer
+	if err := writeJCS(&buf, v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func writeJCS(buf *bytes.Buffer, v any) error {
+	switch val := v.(type) {
+	case nil:
+		buf.WriteString("null")
+	case bool:
+		if val {
+			buf.WriteString("true")
+		} else {
+			buf.WriteString("false")
+		}
+	case json.Number:
+		s, err := formatJCSNumber(val)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(s)
+	case string:
+		writeJCSString(buf, val)
+	case []any:
+		buf.WriteByte('[')
+		for i, elem := range val {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeJCS(buf, elem); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return compareUTF16Units(keys[i], keys[j]) < 0
+		})
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			writeJCSString(buf, k)
+			buf.WriteByte(':')
+			if err := writeJCS(buf, val[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	default:
+		return fmt.Errorf("unsupported JSON value type %T", v)
+	}
+	return nil
+}
+
+func formatJCSNumber(n json.Number) (string, error) {
+	f, err := strconv.ParseFloat(string(n), 64)
+	if err != nil {
+		return "", err
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return "", errors.New("non-finite JSON number")
+	}
+	if f == 0 {
+		return "0", nil
+	}
+	abs := math.Abs(f)
+	if abs >= 1e-6 && abs < 1e21 {
+		return strconv.FormatFloat(f, 'f', -1, 64), nil
+	}
+	s := strconv.FormatFloat(f, 'e', -1, 64)
+	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
+		exp := s[idx+1:]
+		sign := ""
+		if strings.HasPrefix(exp, "+") || strings.HasPrefix(exp, "-") {
+			sign = exp[:1]
+			exp = exp[1:]
+		}
+		exp = strings.TrimLeft(exp, "0")
+		if exp == "" {
+			exp = "0"
+		}
+		s = s[:idx+1] + sign + exp
+	}
+	return s, nil
+}
+
+func writeJCSString(buf *bytes.Buffer, s string) {
+	buf.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			buf.WriteString(`\"`)
+		case '\\':
+			buf.WriteString(`\\`)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(buf, `\u%04x`, r)
+			} else {
+				buf.WriteRune(r)
+			}
+		}
+	}
+	buf.WriteByte('"')
+}
+
+func compareUTF16Units(a, b string) int {
+	ua := utf16.Encode([]rune(a))
+	ub := utf16.Encode([]rune(b))
+	for i := 0; i < len(ua) && i < len(ub); i++ {
+		if ua[i] != ub[i] {
+			if ua[i] < ub[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	if len(ua) < len(ub) {
+		return -1
+	}
+	if len(ua) > len(ub) {
+		return 1
+	}
+	return 0
+}
+
+func runMintRoot(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("a2a mint-root", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var id, tier, scope, delegate, requester string
+	fs.StringVar(&id, "id", "platform-chat", "root request id")
+	fs.StringVar(&tier, "tier", "platform", "authority tier")
+	fs.StringVar(&scope, "scope", "namespace/kubeagents-system", "authority scope")
+	fs.StringVar(&delegate, "delegate", "platform", "delegate principal")
+	fs.StringVar(&requester, "requester", "agent:platform-agent", "canonical requester")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("mint-root: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
+	defer cancel()
+
+	c, err := connect(ctx, "a2a-mint-root")
+	if err != nil {
+		return fmt.Errorf("mint-root: %w", err)
+	}
+	defer c.Close()
+
+	minter := capability.NewMinter(c.JetStream())
+	ref, err := minter.Mint(ctx, id, capability.Entry{
+		Tier:      capability.Tier(tier),
+		Scope:     capability.Scope(scope),
+		Delegate:  delegate,
+		Requester: requester,
+	})
+	if err != nil {
+		return fmt.Errorf("mint-root: %w", err)
+	}
+	b, _ := json.Marshal(ref)
+	fmt.Fprintln(stdout, string(b))
+	return nil
+}
+

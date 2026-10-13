@@ -277,6 +277,12 @@ func TestAPolicyCannotRaiseTheEffectiveCap(t *testing.T) {
 	if got.EffectiveMaxObjects != 10 {
 		t.Fatalf("effective cap = %d, want 10: caps combine with min, so no source can widen another's", got.EffectiveMaxObjects)
 	}
+
+	over := op("patch", "apps", "Deployment", "team-a", "web")
+	over.BlastRadius = BlastRadius{Objects: 11}
+	gotOver := classify(t, c, input(over))
+	wantClass(t, gotOver, ClassGated)
+	wantReason(t, gotOver, RuleBlastRadiusCap)
 }
 
 // A tightening policy really does tighten, and says who tightened it. Without the source name, a

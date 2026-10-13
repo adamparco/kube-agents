@@ -197,13 +197,18 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 
+	chatOpsURL := os.Getenv("CHATOPS_GATEWAY_URL")
+	if chatOpsURL == "" && os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+		chatOpsURL = "http://kube-agents-chatops-gateway.kubeagents-system.svc.cluster.local:8443"
+	}
 	gw, err := gateway.New(gateway.Options{
-		Client:  client,
-		Adapter: adapter,
-		Config:  cfg,
-		Logger:  log,
-		Backend: backend,
-		Metrics: metrics,
+		Client:            client,
+		Adapter:           adapter,
+		Config:            cfg,
+		Logger:            log,
+		Backend:           backend,
+		Metrics:           metrics,
+		ChatOpsGatewayURL: chatOpsURL,
 	})
 	if err != nil {
 		log.Error("gateway", "err", err)

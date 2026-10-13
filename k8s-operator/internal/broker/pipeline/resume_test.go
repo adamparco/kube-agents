@@ -20,8 +20,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/broker/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/broker"
@@ -105,19 +110,21 @@ func TestResumePersistsAFreshPreStateAndUndoPlan(t *testing.T) {
 		r.reader = &fakeReader{obj: liveConfigMap(), absent: false}
 	})
 	ar := park(t, r, applyEnvelope("info"))
-	if len(ar.Spec.PreState) != 0 {
-		t.Fatal("a parked record must carry no pre-state (it is stale by the time anyone approves)")
+	if len(ar.Spec.PreState) == 0 {
+		t.Fatal("a parked record must carry its initial pre-state at creation time (ActionRecord.spec is immutable)")
 	}
+	ar.Spec.PreState = nil
+	ar.Spec.Undo = nil
 	approve(ar)
 
 	if _, err := r.pipeline.Resume(context.Background(), ar); err != nil {
 		t.Fatalf("Resume: %v", err)
 	}
 	if len(ar.Spec.PreState) == 0 {
-		t.Error("expected Resume to persist a freshly-captured pre-state")
+		t.Error("expected Resume to refresh pre-state")
 	}
 	if ar.Spec.Undo == nil {
-		t.Error("expected Resume to persist a freshly-generated undo plan")
+		t.Error("expected Resume to refresh undo plan")
 	}
 }
 
@@ -274,3 +281,149 @@ func TestResumeRefusesWhenTheRosterBecameUnusable(t *testing.T) {
 }
 
 func int32Ptr(i int32) *int32 { return &i }
+
+type fakeApprovalVerifier struct {
+	err error
+}
+
+func (f *fakeApprovalVerifier) VerifyApprovalForRecord(_ context.Context, _ *agentv1alpha1.ActionRecord) error {
+	return f.err
+}
+
+type fakeEventPublisher struct {
+	events []*broker.Result
+}
+
+func (f *fakeEventPublisher) PublishRecordEvent(_ context.Context, _ *agentv1alpha1.ActionRecord, res *broker.Result) error {
+	f.events = append(f.events, res)
+	return nil
+}
+
+func TestResumeControllerRefusesWithoutVerifiedApprovalCapability(t *testing.T) {
+	r := newRig(t, withUsableRoster)
+	ar := park(t, r, createEnvelope())
+	approve(ar)
+
+	scheme := runtime.NewScheme()
+	if err := agentv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ar).Build()
+	pub := &fakeEventPublisher{}
+
+	rc := &ResumeController{
+		Client:           k8sClient,
+		Pipeline:         r.pipeline,
+		Records:          r.records,
+		ApprovalVerifier: &fakeApprovalVerifier{err: errors.New("missing verified approval capability")},
+		Events:           pub,
+	}
+
+	_, err := rc.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: ar.Namespace, Name: ar.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if r.applier.mutations != 0 {
+		t.Fatal("expected unverified approval to be rejected before reaching applier")
+	}
+	if got := r.records.phases[len(r.records.phases)-1]; got != agentv1alpha1.PhaseRejected {
+		t.Fatalf("final phase = %s, want Rejected", got)
+	}
+	if len(pub.events) != 1 || pub.events[0].Phase != string(agentv1alpha1.PhaseRejected) {
+		t.Fatalf("published events = %+v, want 1 Rejected event", pub.events)
+	}
+}
+
+func TestResumeControllerPublishesEventsOnResumeAndExpiry(t *testing.T) {
+	r := newRig(t, withUsableRoster)
+	ar := park(t, r, createEnvelope())
+	approve(ar)
+
+	scheme := runtime.NewScheme()
+	if err := agentv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ar).Build()
+	pub := &fakeEventPublisher{}
+
+	rc := &ResumeController{
+		Client:           k8sClient,
+		Pipeline:         r.pipeline,
+		Records:          r.records,
+		ApprovalVerifier: &fakeApprovalVerifier{err: nil},
+		Events:           pub,
+	}
+
+	_, err := rc.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: ar.Namespace, Name: ar.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile resume: %v", err)
+	}
+	if len(pub.events) != 1 || pub.events[0].Decision != "accepted" {
+		t.Fatalf("published events after resume = %+v, want 1 accepted event", pub.events)
+	}
+
+	// Test expiry event emission.
+	r2 := newRig(t, withUsableRoster)
+	expiredAR := park(t, r2, createEnvelope())
+	past := metav1.NewTime(testClock.Add(-time.Minute))
+	expiredAR.Status.Approvals = &agentv1alpha1.ActionApprovals{
+		Required:  1,
+		ExpiresAt: &past,
+	}
+	k8sClient2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(expiredAR).Build()
+	pub2 := &fakeEventPublisher{}
+	rc2 := &ResumeController{
+		Client:   k8sClient2,
+		Pipeline: r2.pipeline,
+		Records:  r2.records,
+		Events:   pub2,
+		Now:      func() time.Time { return testClock },
+	}
+	_, err = rc2.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: expiredAR.Namespace, Name: expiredAR.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile expiry: %v", err)
+	}
+	if len(pub2.events) != 1 || pub2.events[0].Phase != string(agentv1alpha1.PhaseExpired) {
+		t.Fatalf("published events after expiry = %+v, want 1 Expired event", pub2.events)
+	}
+}
+
+func TestResumeExecutesAnApprovedEffectfulActionWithNoUndoPlan(t *testing.T) {
+	r := newRig(t, withUsableRoster)
+	env := createEnvelope()
+	env.Intent = "run one-shot migration job"
+	env.Operations[0].Target = &broker.Target{
+		Group: "batch", Version: "v1", Kind: "Job", Namespace: testTenantNS, Name: "migrate-db",
+	}
+	env.Operations[0].DesiredState = map[string]any{
+		"apiVersion": "batch/v1",
+		"kind":       "Job",
+		"metadata":   map[string]any{"name": "migrate-db", "namespace": testTenantNS},
+		"spec":       map[string]any{"template": map[string]any{}},
+	}
+
+	ar := park(t, r, env)
+	if ar.Spec.Classification.Undoable {
+		t.Fatal("expected create batch/v1 Job to park with Undoable=false")
+	}
+	approve(ar)
+
+	res, err := r.pipeline.Resume(context.Background(), ar)
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if res.Decision != "accepted" {
+		t.Fatalf("decision = %q, want accepted: %s", res.Decision, res.Message)
+	}
+	if r.applier.mutations == 0 {
+		t.Error("expected the approved effectful Job creation to execute through the applier")
+	}
+}
+
+

@@ -385,3 +385,113 @@ func TestIsSessionCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestParseApprovalCommand(t *testing.T) {
+	valid := []struct {
+		raw           string
+		wantVerb      ApprovalVerb
+		wantID        string
+		wantReason    string
+		wantCanonical string
+	}{
+		{
+			raw:           "/approve ar-01arz3ndektsv4rrffq69g5fav",
+			wantVerb:      ApprovalVerbApprove,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantCanonical: "approve ar-01arz3ndektsv4rrffq69g5fav",
+		},
+		{
+			raw:           "<@U0123ABC> /approve ar-01arz3ndektsv4rrffq69g5fav",
+			wantVerb:      ApprovalVerbApprove,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantCanonical: "approve ar-01arz3ndektsv4rrffq69g5fav",
+		},
+		{
+			raw:           "@kage /reject ar-01arz3ndektsv4rrffq69g5fav freeze window",
+			wantVerb:      ApprovalVerbReject,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantReason:    "freeze window",
+			wantCanonical: "reject ar-01arz3ndektsv4rrffq69g5fav freeze window",
+		},
+		{
+			raw:           "/kage approve ar-01arz3ndektsv4rrffq69g5fav",
+			wantVerb:      ApprovalVerbApprove,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantCanonical: "approve ar-01arz3ndektsv4rrffq69g5fav",
+		},
+		{
+			raw:           "kage /undo ar-01arz3ndektsv4rrffq69g5fav bad rollout",
+			wantVerb:      ApprovalVerbUndo,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantReason:    "bad rollout",
+			wantCanonical: "undo ar-01arz3ndektsv4rrffq69g5fav bad rollout",
+		},
+		{
+			raw:           "/undo ar-01arz3ndektsv4rrffq69g5fav",
+			wantVerb:      ApprovalVerbUndo,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantCanonical: "undo ar-01arz3ndektsv4rrffq69g5fav",
+		},
+		{
+			raw:           "/uncontest ar-01arz3ndektsv4rrffq69g5fav",
+			wantVerb:      ApprovalVerbUncontest,
+			wantID:        "ar-01arz3ndektsv4rrffq69g5fav",
+			wantCanonical: "uncontest ar-01arz3ndektsv4rrffq69g5fav",
+		},
+	}
+
+	for _, tc := range valid {
+		cmd, matched, err := ParseApprovalCommand(tc.raw)
+		if !matched {
+			t.Fatalf("ParseApprovalCommand(%q) matched = false, want true", tc.raw)
+		}
+		if err != nil {
+			t.Fatalf("ParseApprovalCommand(%q) unexpected error: %v", tc.raw, err)
+		}
+		if cmd.Verb != tc.wantVerb || cmd.ActionID != tc.wantID || cmd.Reason != tc.wantReason {
+			t.Errorf("ParseApprovalCommand(%q) = %+v, want verb=%q id=%q reason=%q",
+				tc.raw, cmd, tc.wantVerb, tc.wantID, tc.wantReason)
+		}
+		if got := cmd.CanonicalText(); got != tc.wantCanonical {
+			t.Errorf("CanonicalText(%q) = %q, want %q", tc.raw, got, tc.wantCanonical)
+		}
+	}
+
+	malformed := []string{
+		"/approve",
+		"/approve ar-1 extra",
+		"/uncontest",
+		"/uncontest ar-1 extra",
+		"/reject",
+		"/undo",
+		"/kage",
+		"/kage unknown ar-1",
+		"<@U123> /approve",
+	}
+	for _, raw := range malformed {
+		cmd, matched, err := ParseApprovalCommand(raw)
+		if !matched {
+			t.Errorf("ParseApprovalCommand(%q) matched = false, want true (must not leak to LLM)", raw)
+		}
+		if err == nil {
+			t.Errorf("ParseApprovalCommand(%q) expected error, got cmd=%+v", raw, cmd)
+		}
+	}
+
+	nonCommands := []string{
+		"",
+		"   ",
+		"please approve the deployment",
+		"can we undo the last rollout?",
+		"/session",
+		"/session off",
+		"<@U123> check pods in default",
+	}
+	for _, raw := range nonCommands {
+		cmd, matched, err := ParseApprovalCommand(raw)
+		if matched || err != nil || cmd != nil {
+			t.Errorf("ParseApprovalCommand(%q) = (%+v, %v, %v), want (nil, false, nil)", raw, cmd, matched, err)
+		}
+	}
+}
+

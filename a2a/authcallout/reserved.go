@@ -27,8 +27,8 @@ import (
 //     comma-separated list. The callout does not read nats.conf: that file
 //     carries every static user's password, and the callout has no reason to
 //     hold any of them.
-//   - The identity map's own users (provision, agent, verifier, session, and
-//     whatever else the map holds). authorize mints each entry that is not
+//   - The identity map's own users (provision, agent, verifier, broker, session,
+//     and whatever else the map holds). authorize mints each entry that is not
 //     narrowed under its `user`, and that entry's grants carry
 //     `_INBOX.<user>.>`, so these are the names whose inboxes a same-named pod
 //     would share. The narrowed entry's own user (session) is never minted,
