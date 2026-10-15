@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Deterministic (no-LLM) delivery for first-time onboarding.
 
-This script backs the ``bootstrap-inventory-delivery`` cron job, which runs
+This is the delivery stage of the ``oobe`` cron job (``oobe.py``), which runs
 with ``no_agent: true``. Its stdout is delivered verbatim by the cron
 scheduler to the job's configured target (``deliver: origin`` — the chat the
-user first spoke in, bound by the ``bootstrap_onboarding`` plugin).
+user first spoke in, bound by the ``bootstrap_onboarding`` plugin). It backed
+the ``bootstrap-inventory-delivery`` job before ``oobe`` took it over; that
+entry ships disabled.
 
 Delivery is claimed exactly once, and only when discovery has finished AND a
 human has connected:
@@ -33,8 +35,10 @@ cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
 With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
-total, the top rows, and "Fix the first one" and "See all N" buttons), posted here
-through ``slack_blocks_post`` because the scheduler's delivery takes text only.
+total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
+buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
+takes text only. Under ``spec.mode: next`` the same card goes through the A2A
+gateway as a chat message instead (``_posted_through_gateway``).
 Then nothing is printed; any failure prints the text. A failure after the request was
 sent may have posted, so that path can send the report twice; see
 ``_posted_as_blocks``.
@@ -66,10 +70,12 @@ what the user sees, verbatim or, on Slack with the flag on, laid out again by
 (``INVENTORY.raw.md``) and are never delivered from here.
 """
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -79,8 +85,11 @@ from pathlib import Path
 
 import sandbox_exec
 
+# The two jobs oobe took over, removed once onboarding is done.
 SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
+# The job that runs this stage, and so the one the plugin links to the chat.
+OOBE_JOB_ID = "oobe"
 
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
@@ -454,14 +463,14 @@ def _cleanup(data_dir: Path, in_sandbox: bool, shown: bool = False) -> None:
 
 
 def _retire_jobs() -> None:
-    """Remove both onboarding cron jobs, in-process.
+    """Remove the two disabled onboarding cron jobs, in-process.
 
-    Only a run with nothing to deliver may call this. Removing a job while it
-    runs drops the run's fire claim, and the scheduler then discards that run's
-    output instead of posting it. So the run that delivers the report leaves
-    both jobs in place, and a later run, which finds ``.bootstrap_completed``
-    and has nothing to post, removes them and loses nothing. The delivery job
-    goes last because removing it ends this run.
+    Only a run with nothing to deliver may call this, and ``oobe`` removes
+    itself only after it. Removing a job while it runs drops the run's fire
+    claim, and the scheduler then discards that run's output instead of posting
+    it. So the run that delivers the report leaves every job in place, and a
+    later run, which finds ``.bootstrap_completed`` and has nothing to post,
+    removes them and loses nothing.
     """
     try:
         from cron.jobs import remove_job  # type: ignore import-not-found
@@ -484,8 +493,12 @@ def _origin() -> dict:
     try:
         from cron.jobs import get_job  # type: ignore import-not-found
 
-        job = get_job(DELIVERY_JOB_ID) or {}
-        return job.get(ORIGIN_KEY) or {}
+        # oobe's when it runs this stage; the old job's on an install still delivering through it.
+        for job_id in (OOBE_JOB_ID, DELIVERY_JOB_ID):
+            origin = (get_job(job_id) or {}).get(ORIGIN_KEY)
+            if origin:
+                return origin
+        return {}
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: could not read the delivery origin: {e}\n")
         return {}
@@ -535,6 +548,10 @@ def _posted_as_blocks(content: str) -> bool:
         channel = str(origin.get(CHAT_ID_KEY) or "")
         if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
             return False
+        import chat_notify
+
+        if chat_notify.routes(PRESENTED_PLATFORM):
+            return _posted_through_gateway(content, channel, str(origin.get(THREAD_ID_KEY) or ""))
         import inventory_presenter
         import slack_blocks_post
 
@@ -553,6 +570,49 @@ def _posted_as_blocks(content: str) -> bool:
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     return False
+
+
+def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
+    """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
+
+    The gateway holds Slack there and the broker's relay is gone, so the card
+    goes as ``a2a notify --chat-file`` (``inventory_presenter.chat``) into the
+    origin's thread, which the gateway posts only when it is a thread of its
+    home channel. False, and the caller prints the text, with no thread to
+    reply on (a bare post would land in the home channel, wherever the origin
+    is), a report that does not parse, or any failure, including one that may
+    have posted, for the reason ``_posted_as_blocks`` gives.
+    """
+    import chat_notify
+    import inventory_presenter
+
+    built = inventory_presenter.chat(content) if thread else None
+    if built is None:
+        return False
+    chat, text = built
+    path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(chat, handle)
+            path = handle.name
+        res = subprocess.run(
+            chat_notify.chat_command(
+                PRESENTED_PLATFORM, f"{channel}/{thread}", text, path, chat_notify.NOTIFY_WAIT_SECONDS
+            ),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS,
+            check=False,
+        )
+    finally:
+        if path:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+    if res.returncode != 0:
+        sys.stderr.write(f"bootstrap_delivery: the gateway did not post the report card: {res.stderr.strip()}\n")
+        return False
+    return True
 
 
 def main(data_dir: Path | None = None) -> int:

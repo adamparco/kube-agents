@@ -161,6 +161,8 @@ QUEUED_LINES_KEY = "queued_lines"
 NEEDS_YOU_KIND = "blocked"
 UNBLOCKED_KIND = "unblocked"
 PR_REPORT_KIND = "completed"
+#: The completed event's payload key holding the worker's one-line status.
+SUMMARY_KEY = "summary"
 
 #: With ``KAGE_SLACK_UX`` on, a card beneath a fan-out folds its report into
 #: its row in the thread's plan rather than posting it, when its nearest
@@ -286,6 +288,18 @@ SILENT_PLAN_KINDS = ("archived", "unblocked")
 #: earliest event of a run the notifier claims, since ``claimed`` and
 #: ``spawned`` are not among its kinds. See :func:`silent_event`.
 STARTED_KIND = "heartbeat"
+
+#: The kind the ``pr_opened`` plugin (``agents/platform/plugins/pr_opened``)
+#: records on a worker's card when the broker opens a proposal for it: the
+#: forge's ``url``, ``number`` and ``title``. Claimed beside ``heartbeat`` and
+#: given no formatter, so it posts no line and wakes no one; with
+#: ``KAGE_SLACK_UX`` on, :func:`silent_event` posts the PR from it.
+PR_OPENED_KIND = "pr_opened"
+
+#: Under ``spec.mode: next``, the terminal kind whose report is laid out as an
+#: answer (its first sentence the headline, the rest the detail) when it goes
+#: out through the chat.notify stand-in (:func:`_with_answer`).
+ANSWER_KIND = "completed"
 
 #: Kinds that settle a plan row past an earlier ``unblocked`` in the same
 #: batch: every kind ``slack_status.TASK_STATUS_BY_KIND`` maps to a status
@@ -661,6 +675,17 @@ async def _settle_question(moments: Any, adapter: Any, sub: dict, kind: str, eve
         logger.debug("kanban progress: settling the question for %s failed: %s", sub.get("task_id"), exc)
 
 
+def _with_summary(ev: Any, message: str) -> str:
+    """The completion's message plus the worker's summary when the message dropped it.
+
+    The message can be the result alone, so a PR the summary names is still one this card
+    opened; both completion paths (posted, and folded into a plan row) scan this.
+    """
+    payload = getattr(ev, "payload", None)
+    summary = str(payload.get(SUMMARY_KEY) or "").strip() if isinstance(payload, dict) else ""
+    return message if not summary or summary in message else f"{message}\n{summary}"
+
+
 async def _pr_opened(moments: Any, adapter: Any, sub: dict, text: str, result: Any) -> None:
     if moments is None or getattr(result, "success", True) is False:
         return
@@ -735,6 +760,54 @@ async def _started(notification: Any, ev: Any) -> None:
         logger.debug("kanban progress: opening the plan row on a start failed: %s", exc)
 
 
+def _later_words(notification: Any, ev: Any) -> str:
+    """The worker's words after ``ev`` in its batch: each note, and the completion's summary."""
+    event_id = int(getattr(ev, "id", 0) or 0)
+    batch = getattr(notification, "d", None)
+    events = batch.get("events") if isinstance(batch, dict) else None
+    words = []
+    for later in events or ():
+        if int(getattr(later, "id", 0) or 0) <= event_id:
+            continue
+        payload = getattr(later, "payload", None)
+        kind = str(getattr(later, "kind", "") or "")
+        if kind == STARTED_KIND:
+            words.append(progress_note(payload, limit=0))
+        elif kind == PR_REPORT_KIND and isinstance(payload, dict):
+            words.append(str(payload.get(SUMMARY_KEY) or ""))
+    return "\n".join(word for word in words if word)
+
+
+async def _pr_event(notification: Any, ev: Any) -> None:
+    """Post the PR a ``pr_opened`` event recorded: see :data:`PR_OPENED_KIND`.
+
+    Posted whatever the worker says about it, so a note with no "opened" in it
+    ("Both fixes are up for review in PR #99") still gets the PR's message.
+    Its evidence line is the worker's first line naming the PR later in the
+    batch, else the PR's title. A later note or report that also says it
+    opened the PR posts nothing more: ``slack_ux_moments`` keeps one record of
+    each thread's PRs for both paths. Not for a wake-only subscription, which
+    is sent nothing, nor for an event replayed (:func:`_replayed`);
+    one a later event settles past still posts, since the PR was opened. Only
+    with ``KAGE_SLACK_UX`` on for a Slack card, and never raises: it runs
+    inside the send loop.
+    """
+    try:
+        # A wake-only subscription is sent no messages; upstream runs this hook before that check.
+        if _replayed(notification, ev) or getattr(notification, "send_passive", True) is False:
+            return
+        sub = notification.sub
+        adapter = getattr(notification, "adapter", None)
+        moments = _slack_moments(_slack_quiet(sub))
+        if adapter is None or moments is None:
+            return
+        await moments.pr_event(
+            adapter, sub, getattr(ev, "payload", None), _later_words(notification, ev),
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail a delivery on the PR message
+        logger.debug("kanban progress: the PR message for a pr_opened event failed: %s", exc)
+
+
 async def silent_event(notification: Any, ev: Any) -> None:
     """Move a Slack card's plan row on a kind upstream keeps silent.
 
@@ -751,10 +824,13 @@ async def silent_event(notification: Any, ev: Any) -> None:
     the later event would settle as unanswered; one posted for that later
     event is newer than the unblock and left alone. A noteless heartbeat
     goes to :func:`_started` instead, and touches neither the question nor
-    the ask's reaction.
+    the ask's reaction. A ``pr_opened`` event goes to :func:`_pr_event`.
     """
     try:
         kind = str(getattr(ev, "kind", "") or "")
+        if kind == PR_OPENED_KIND:
+            await _pr_event(notification, ev)
+            return
         if kind == STARTED_KIND:
             await _started(notification, ev)
             return
@@ -778,6 +854,44 @@ async def silent_event(notification: Any, ev: Any) -> None:
     await _settle_question(moments, adapter, sub, kind, int(getattr(ev, "id", 0) or 0))
     # An unblocked card no longer waits on the user, so its ask loses its pause.
     await _settle_reaction(adapter, sub, kind, getattr(notification, "board_slug", None))
+
+
+def _chat_notify() -> Any:
+    """``kanban_chat_notify``, or None in an image without it."""
+    try:
+        from gateway import kanban_chat_notify
+    except ImportError:
+        try:  # Unit tests import the patch modules flat.
+            import kanban_chat_notify
+        except ImportError:
+            return None
+    return kanban_chat_notify
+
+
+def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
+    """``metadata`` with a completed card's report laid out as an answer, for the chat.notify stand-in.
+
+    Under ``spec.mode: next`` the gateway lays the report out from a
+    ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
+    ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
+    whose call to action stays in view as today, and never raises: anything
+    that goes wrong posts the text alone, as today.
+    """
+    notify = _chat_notify()
+    if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
+        return metadata
+    try:
+        import chat_message
+
+        if quiet.actionable_report(message):
+            return metadata
+        chat = chat_message.answer_message(message)
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: laying out the answer for chat.notify failed: %s", exc)
+        return metadata
+    if chat is None:
+        return metadata
+    return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
 
 
 def _explained_by_wake(quiet: Any, sub: dict, kind: str) -> bool:
@@ -883,7 +997,8 @@ async def deliver(
     (:func:`slack_line`). A card blocked on ``needs_input``
     posts its question instead of the blocked line, once however often the
     notifier replays the event, and loses that question's buttons at its next
-    event; a note or report saying a PR was opened is
+    event; a PR the card opened, read from its ``pr_opened`` event or, as the
+    fallback, from a note or report saying a PR was opened, is
     followed by that PR as a message of its own. See
     ``gateway/slack_ux_moments.py``.
     """
@@ -931,14 +1046,14 @@ async def deliver(
         if kind == FOLDED_KIND and shown and await _folds(sub, board):
             # The row says it; the creator's completion carries the answer.
             await _settle_reaction(adapter, sub, kind, board)
-            await _pr_opened(moments, adapter, sub, message, None)
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
         if _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
             await _settle_reaction(adapter, sub, kind, board)
             return None
-        result = await adapter.send(chat_id, message, metadata=metadata)
+        result = await adapter.send(chat_id, message, metadata=_with_answer(adapter, quiet, kind, message, metadata))
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's
         # MAX_SEND_FAILURES it drops the subscription instead, and the ask
@@ -946,7 +1061,7 @@ async def deliver(
         if getattr(result, "success", True) is not False:
             await _settle_reaction(adapter, sub, kind, board)
         if kind == PR_REPORT_KIND:
-            await _pr_opened(moments, adapter, sub, message, result)
+            await _pr_opened(moments, adapter, sub, _with_summary(ev, message), result)
         return result
 
     payload = getattr(ev, "payload", None)

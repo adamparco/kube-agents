@@ -762,13 +762,21 @@ Consequences:
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
   rejected with `400` rather than honored.
 - A cache miss costs one `get-credentials`, preceded by one
-  `clusters describe` to decide whether the control plane should be reached
-  over its DNS endpoint. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command. That
-  describe is memoised per cluster for a minute rather than for the life of the
-  broker: the endpoint can be opened or closed on a running cluster, and the
-  proxy is a daemon that would otherwise keep acting on the configuration it
-  first saw.
+  `clusters describe` to decide which control-plane endpoint to reach (DNS,
+  private, or gcloud's default), plus a describe of the agent's own cluster
+  when the private endpoint is a candidate. A caller's
+  own `get-credentials` that names no endpoint flag, and names its cluster
+  and location (the project may come from the broker's own), gets the same
+  decision spliced in, since its output
+  becomes the managed kubeconfig for that cluster;
+  `docs/designs/private-endpoint-selection.md` has the rule. The common paths
+  warm the cache themselves, since profile scaffolding and context switching
+  both begin with that command. The target describe is memoised per cluster
+  for a minute rather than for the life of the broker: the endpoint can be
+  opened or closed on a running cluster, and the proxy is a daemon that would
+  otherwise keep acting on the configuration it first saw. The own-cluster
+  describe is kept for the life of the broker once it has answered, because
+  the install's VPC does not move; a failed one is retried after a minute.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
@@ -859,9 +867,11 @@ Consequences:
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
   requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
-  sets limits equal to requests, so the proxy's limit there is its 512Mi request, and a
+  sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents.
+  it prevents. The operator declares that request at 1Gi, above the floor, so that the
+  budget engages there too, admitting four; the floor remains for a CR override that
+  sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
