@@ -544,6 +544,9 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 	rep := sess.StatusReport(ctx)
 	snap := s.store.Snapshot()
 	conv := s.store.ActiveConversation()
+	if jetskiID := firstNonEmptyStr(args.JetskiConversationID, callMetaFromContext(ctx).ConversationID); jetskiID != "" {
+		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
+	}
 	return FormatBusStatusMarkdown(rep, conv, snap.Push, s.store.ResolveJetskiConversationID()), nil
 }
 
@@ -555,6 +558,9 @@ func (s *Server) handleConnectionStatus(ctx context.Context) (string, error) {
 	rep := sess.StatusReport(ctx)
 	snap := s.store.Snapshot()
 	conv := s.store.ActiveConversation()
+	if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
+		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
+	}
 	return FormatBusStatusMarkdown(rep, conv, snap.Push, s.store.ResolveJetskiConversationID()), nil
 }
 
@@ -589,6 +595,10 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		}
 	} else {
 		conv = s.store.ActiveConversation()
+	}
+	if jetskiID := firstNonEmptyStr(args.JetskiConversationID, callMetaFromContext(ctx).ConversationID); jetskiID != "" {
+		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
+		conv, _ = s.store.EnsureConversation(conv.Alias, false, "")
 	}
 
 	waitTimeout := defaultTurnWaitTimeout
@@ -687,6 +697,9 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		if err != nil {
 			return "", err
 		}
+		if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
+			s.store.BindConversationJetskiID(entry.Alias, jetskiID)
+		}
 		return fmt.Sprintf("✅ Created and switched to new conversation **`%s`** (token `console:%s`).", entry.Alias, entry.Token), nil
 
 	case actionSwitch:
@@ -696,6 +709,9 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		entry, err := s.store.EnsureConversation(targetAlias, false, args.Description)
 		if err != nil {
 			return "", err
+		}
+		if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
+			s.store.BindConversationJetskiID(entry.Alias, jetskiID)
 		}
 		return fmt.Sprintf("✅ Switched active conversation to **`%s`** (token `console:%s`, sessionMode=`%v`).", entry.Alias, entry.Token, entry.SessionMode), nil
 

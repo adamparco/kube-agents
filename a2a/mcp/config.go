@@ -72,20 +72,22 @@ type DeploymentProfile struct {
 
 // ConversationEntry tracks a named console conversation token and its mode.
 type ConversationEntry struct {
-	Alias       string    `json:"alias"`
-	Token       string    `json:"token"`
-	SessionMode bool      `json:"sessionMode"`
-	Description string    `json:"description,omitempty"`
-	CreatedAt   time.Time `json:"createdAt"`
-	LastUsedAt  time.Time `json:"lastUsedAt"`
+	Alias                string    `json:"alias"`
+	Token                string    `json:"token"`
+	SessionMode          bool      `json:"sessionMode"`
+	Description          string    `json:"description,omitempty"`
+	JetskiConversationID string    `json:"jetskiConversationId,omitempty"`
+	CreatedAt            time.Time `json:"createdAt"`
+	LastUsedAt           time.Time `json:"lastUsedAt"`
 }
 
 // PushConfig configures bi-directional event push into Jetski.
 type PushConfig struct {
-	Enabled              bool      `json:"enabled"`
-	JetskiConversationID string    `json:"jetskiConversationId,omitempty"`
-	AgentAPIPath         string    `json:"agentApiPath,omitempty"`
-	UpdatedAt            time.Time `json:"updatedAt,omitempty"`
+	Enabled                  bool      `json:"enabled"`
+	JetskiConversationID     string    `json:"jetskiConversationId,omitempty"`
+	KnownJetskiConversations []string  `json:"knownJetskiConversations,omitempty"`
+	AgentAPIPath             string    `json:"agentApiPath,omitempty"`
+	UpdatedAt                time.Time `json:"updatedAt,omitempty"`
 }
 
 // PersistentConfig is the on-disk schema stored in ~/.config/kube-agents/mcp-config.json.
@@ -475,8 +477,16 @@ func (s *ConfigStore) SetDebugMode(enabled bool) error {
 func (s *ConfigStore) UpdatePushConfig(jetskiConvID string, enabled *bool, agentAPIPath string) (PushConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if strings.TrimSpace(jetskiConvID) != "" {
-		s.cfg.Push.JetskiConversationID = strings.TrimSpace(jetskiConvID)
+	trimmedID := strings.TrimSpace(jetskiConvID)
+	if trimmedID != "" {
+		s.cfg.Push.JetskiConversationID = trimmedID
+		s.addKnownJetskiConvLocked(trimmedID)
+		if s.cfg.ActiveConversation != "" {
+			if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok {
+				active.JetskiConversationID = trimmedID
+				s.cfg.Conversations[s.cfg.ActiveConversation] = active
+			}
+		}
 	}
 	if enabled != nil {
 		s.cfg.Push.Enabled = *enabled
@@ -497,6 +507,85 @@ func (s *ConfigStore) UpdatePushConfig(jetskiConvID string, enabled *bool, agent
 		}
 	}
 	return s.cfg.Push, s.saveLocked()
+}
+
+func (s *ConfigStore) addKnownJetskiConvLocked(id string) {
+	if id == "" {
+		return
+	}
+	for _, existing := range s.cfg.Push.KnownJetskiConversations {
+		if existing == id {
+			return
+		}
+	}
+	s.cfg.Push.KnownJetskiConversations = append(s.cfg.Push.KnownJetskiConversations, id)
+}
+
+// BindConversationJetskiID associates a console conversation (by alias or token) with a Jetski conversation UUID.
+func (s *ConfigStore) BindConversationJetskiID(aliasOrToken, jetskiConvID string) {
+	trimmedID := strings.TrimSpace(jetskiConvID)
+	if trimmedID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.Push.JetskiConversationID = trimmedID
+	s.cfg.Push.Enabled = true
+	s.addKnownJetskiConvLocked(trimmedID)
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	if target == "" {
+		target = s.cfg.ActiveConversation
+	}
+	for alias, entry := range s.cfg.Conversations {
+		if alias == target || entry.Token == target {
+			entry.JetskiConversationID = trimmedID
+			s.cfg.Conversations[alias] = entry
+			break
+		}
+	}
+	_ = s.saveLocked()
+}
+
+// IsKnownJetskiConversation returns true if jetskiConvID has been registered via an MCP tool call or conversation binding.
+func (s *ConfigStore) IsKnownJetskiConversation(jetskiConvID string) bool {
+	trimmed := strings.TrimSpace(jetskiConvID)
+	if trimmed == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Push.JetskiConversationID == trimmed {
+		return true
+	}
+	for _, id := range s.cfg.Push.KnownJetskiConversations {
+		if id == trimmed {
+			return true
+		}
+	}
+	for _, entry := range s.cfg.Conversations {
+		if entry.JetskiConversationID == trimmed {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveJetskiConversationIDForEvent returns the Jetski conversation ID bound to a specific console conversation
+// (e.g. "console:jetski-ba15db52c803"), falling back to ResolveJetskiConversationID().
+func (s *ConfigStore) ResolveJetskiConversationIDForEvent(consoleConv string) string {
+	token := strings.TrimPrefix(strings.TrimSpace(consoleConv), "console:")
+	if token != "" {
+		s.mu.Lock()
+		for _, entry := range s.cfg.Conversations {
+			if (entry.Token == token || entry.Alias == token) && strings.TrimSpace(entry.JetskiConversationID) != "" {
+				id := strings.TrimSpace(entry.JetskiConversationID)
+				s.mu.Unlock()
+				return id
+			}
+		}
+		s.mu.Unlock()
+	}
+	return s.ResolveJetskiConversationID()
 }
 
 // ResolveJetskiConversationID returns the best known active Jetski conversation ID,

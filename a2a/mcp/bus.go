@@ -296,6 +296,7 @@ type BusSession struct {
 	consoleNotices    []ConsoleOutFrame
 	watchedConvs      map[string]int
 	watchedTasks      map[string]int
+	foregroundTasks   map[string]time.Time
 	prevReportedSteps map[string]int
 	lastReportedSteps map[string]int
 }
@@ -367,6 +368,7 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 		agentCards:    make(map[string]map[string]any),
 		watchedConvs:      make(map[string]int),
 		watchedTasks:      make(map[string]int),
+		foregroundTasks:   make(map[string]time.Time),
 		lastReportedSteps: make(map[string]int),
 	}
 
@@ -557,6 +559,14 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			}
 		}
 	}
+	if rec.Conversation == "" && rec.ContextID != "" {
+		for _, other := range s.tasks {
+			if other != rec && other.ContextID == rec.ContextID && other.Conversation != "" {
+				rec.Conversation = other.Conversation
+				break
+			}
+		}
+	}
 
 	var pushToFire *PushEvent
 	watched := s.isWatchedLocked(rec.Conversation, rec.TaskID, rec.DelegatedFromTaskID)
@@ -743,7 +753,34 @@ func (s *BusSession) isWatchedLocked(conv, taskID, parentTaskID string) bool {
 	if parentTaskID != "" && s.watchedTasks[parentTaskID] > 0 {
 		return true
 	}
+	now := time.Now()
+	if taskID != "" && s.foregroundTasks != nil {
+		if exp, ok := s.foregroundTasks[taskID]; ok && now.Before(exp) {
+			return true
+		}
+	}
+	if parentTaskID != "" && s.foregroundTasks != nil {
+		if exp, ok := s.foregroundTasks[parentTaskID]; ok && now.Before(exp) {
+			return true
+		}
+	}
 	return false
+}
+
+func (s *BusSession) markForegroundStepTask(taskID string, settled bool) {
+	if taskID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.foregroundTasks == nil {
+		s.foregroundTasks = make(map[string]time.Time)
+	}
+	if settled {
+		s.foregroundTasks[taskID] = time.Now().Add(24 * time.Hour)
+	} else {
+		s.foregroundTasks[taskID] = time.Now().Add(25 * time.Second)
+	}
 }
 
 func (s *BusSession) ingestAgentCard(subject string, data []byte) {
@@ -1097,11 +1134,15 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 	baseline := s.getReportedStepCount(primaryID)
 	if !streamSteps {
 		timedOut := s.waitForTaskAndDelegations(ctx, primaryID)
+		if !timedOut {
+			s.markForegroundStepTask(primaryID, true)
+		}
 		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", timedOut))
 		s.recordStepProgress(primaryID, baseline, len(steps))
 		return timedOut
 	}
 
+	s.markForegroundStepTask(primaryID, false)
 	window := defaultStepStreamWindow
 	if baseline == 0 {
 		window = initialStepStreamWindow
@@ -1121,6 +1162,7 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 		curCount := len(steps)
 
 		if settled {
+			s.markForegroundStepTask(primaryID, true)
 			s.recordStepProgress(primaryID, baseline, curCount)
 			return false
 		}
@@ -1131,6 +1173,7 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 				firstSeenAboveBaseline = now
 			}
 			if now.Sub(startedAt) >= minStepBatchWait && now.Sub(firstSeenAboveBaseline) >= stepDebounceWait {
+				s.markForegroundStepTask(primaryID, false)
 				s.recordStepProgress(primaryID, baseline, baseline+1)
 				return true
 			}
@@ -1141,9 +1184,11 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 			finalSettled := s.IsTaskTreeSettled(primaryID)
 			finalSteps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !finalSettled))
 			if finalSettled {
+				s.markForegroundStepTask(primaryID, true)
 				s.recordStepProgress(primaryID, baseline, len(finalSteps))
 				return false
 			}
+			s.markForegroundStepTask(primaryID, false)
 			nextCount := baseline
 			if len(finalSteps) > baseline {
 				nextCount = baseline + 1

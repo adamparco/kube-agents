@@ -125,8 +125,7 @@ func (d *PushDispatcher) tryReactiveWakeup(ctx context.Context) {
 		return
 	}
 	snap := d.store.Snapshot()
-	convID := d.store.ResolveJetskiConversationID()
-	if !snap.Push.Enabled || convID == "" {
+	if !snap.Push.Enabled {
 		return
 	}
 	apiPath := snap.Push.AgentAPIPath
@@ -139,6 +138,11 @@ func (d *PushDispatcher) tryReactiveWakeup(ctx context.Context) {
 
 	pending := d.store.PeekPendingEvents()
 	if len(pending) == 0 {
+		return
+	}
+
+	convID := d.store.ResolveJetskiConversationIDForEvent(pending[len(pending)-1].Conversation)
+	if convID == "" {
 		return
 	}
 
@@ -219,8 +223,14 @@ func HandleJetskiHook(store *ConfigStore, r io.Reader, w io.Writer) error {
 			ConversationID string `json:"conversationId"`
 		}
 		if json.Unmarshal(raw, &payload) == nil && strings.TrimSpace(payload.ConversationID) != "" {
+			cid := strings.TrimSpace(payload.ConversationID)
+			existing := store.Snapshot().Push.JetskiConversationID
+			if existing != "" && !store.IsKnownJetskiConversation(cid) {
+				_, _ = io.WriteString(w, emptyJSONResponse)
+				return nil
+			}
 			enabled := true
-			_, _ = store.UpdatePushConfig(strings.TrimSpace(payload.ConversationID), &enabled, "")
+			_, _ = store.UpdatePushConfig(cid, &enabled, "")
 		}
 	}
 	events, err := store.DrainPendingEvents()

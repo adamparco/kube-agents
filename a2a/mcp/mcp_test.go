@@ -547,7 +547,7 @@ func TestBiDirectionalPushPiggybackAndAgentAPIWakeup(t *testing.T) {
 		t.Errorf("unexpected agentapi invocation: %v", call)
 	}
 
-	// Part C: Test HandleJetskiHook binding conversationId and injecting pending events.
+	// Part C: Test HandleJetskiHook ignores unrelated conversations and injects pending events only for known kube-agents conversations.
 	_ = store.AppendPendingEvents(PushEvent{
 		ID:        "hook-ev-1",
 		Kind:      eventKindNoticePR,
@@ -556,12 +556,20 @@ func TestBiDirectionalPushPiggybackAndAgentAPIWakeup(t *testing.T) {
 		PRLinks:   []string{"https://github.com/example-org/example-infra/pull/77"},
 		Timestamp: time.Now().UTC(),
 	})
-	var hookOut bytes.Buffer
-	if err := HandleJetskiHook(store, strings.NewReader(`{"conversationId":"conv-from-hook-99"}`), &hookOut); err != nil {
-		t.Fatalf("HandleJetskiHook: %v", err)
+	var unrelatedOut bytes.Buffer
+	if err := HandleJetskiHook(store, strings.NewReader(`{"conversationId":"unrelated-coding-conv-99"}`), &unrelatedOut); err != nil {
+		t.Fatalf("HandleJetskiHook (unrelated): %v", err)
 	}
-	if store.ResolveJetskiConversationID() != "conv-from-hook-99" {
-		t.Errorf("ResolveJetskiConversationID = %q, want conv-from-hook-99", store.ResolveJetskiConversationID())
+	if store.ResolveJetskiConversationID() != testJetskiConvID {
+		t.Errorf("ResolveJetskiConversationID after unrelated hook = %q, want %q", store.ResolveJetskiConversationID(), testJetskiConvID)
+	}
+	if strings.TrimSpace(unrelatedOut.String()) != "{}" {
+		t.Errorf("expected unrelated hook to not drain events, got: %s", unrelatedOut.String())
+	}
+
+	var hookOut bytes.Buffer
+	if err := HandleJetskiHook(store, strings.NewReader(fmt.Sprintf(`{"conversationId":%q}`, testJetskiConvID)), &hookOut); err != nil {
+		t.Fatalf("HandleJetskiHook: %v", err)
 	}
 	if !strings.Contains(hookOut.String(), "ephemeralMessage") || !strings.Contains(hookOut.String(), "PR #77 Opened") {
 		t.Errorf("unexpected hook output: %s", hookOut.String())
