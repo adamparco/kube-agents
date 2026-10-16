@@ -1336,26 +1336,37 @@ func TestActivity_PostAPIRequestBecomesThinkingArtifact(t *testing.T) {
 post("post_api_request", "", {}, {
     "api_call_count": 1,
     "finish_reason": "tool_calls",
-    "assistant_message": {
-        "content": "<think>Checking GKE cluster inventory first.</think>",
-        "tool_calls": [
-            {
-                "id": "call_1",
-                "type": "function",
-                "function": {
-                    "name": "mcp__gke__list_clusters",
-                    "arguments": json.dumps({"project_id": "my-proj", "token": "secret123"})
+    "assistant_message": "ChatCompletionMessage(content='<think>Checking GKE cluster inventory first.</think>', role='assistant', tool_calls=[...])",
+    "response": {
+        "finish_reason": "tool_calls",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "<think>Checking GKE cluster inventory first.</think>",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__gke__list_clusters",
+                        "arguments": json.dumps({"project_id": "my-proj", "token": "secret123"})
+                    }
                 }
-            }
-        ]
+            ]
+        }
     }
 })
 call("mcp__gke__list_clusters", {"project_id": "my-proj"}, "call_1")
 post("post_api_request", "", {}, {
     "api_call_count": 2,
     "finish_reason": "stop",
-    "assistant_message": {
-        "content": "Here is the fleet summary."
+    "assistant_message": "ChatCompletionMessage(content='Here is the fleet summary.', role='assistant', tool_calls=None)",
+    "response": {
+        "finish_reason": "stop",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "Here is the fleet summary.",
+            "tool_calls": []
+        }
     }
 })
 print("Here is the fleet summary.")

@@ -37,6 +37,9 @@ func main() {
 		}
 		return
 	}
+	rpcOut := os.Stdout
+	os.Stdout = os.Stderr
+
 	srv, err := mcp.NewServer(mcp.ServerOptions{Store: store})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kube-agents-mcp: %v\n", err)
@@ -47,7 +50,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := srv.ServeStdio(ctx, os.Stdin, os.Stdout); err != nil {
+	if err := srv.ServeStdio(ctx, os.Stdin, rpcOut); err != nil {
 		fmt.Fprintf(os.Stderr, "kube-agents-mcp: %v\n", err)
 		os.Exit(errExitCode)
 	}

@@ -779,8 +779,10 @@ func (a *activityState) thinkingUnderBudget() bool {
 }
 
 var (
-	thinkTagPattern      = regexp.MustCompile(`(?is)<think>(.*?)</think>`)
-	scratchpadTagPattern = regexp.MustCompile(`(?is)<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>`)
+	thinkTagPattern         = regexp.MustCompile(`(?is)<think>(.*?)</think>`)
+	scratchpadTagPattern    = regexp.MustCompile(`(?is)<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>`)
+	pyReprReasoningPattern1 = regexp.MustCompile(`reasoning(?:_content)?='([^']+)'`)
+	pyReprReasoningPattern2 = regexp.MustCompile(`reasoning(?:_content)?="([^"]+)"`)
 )
 
 type hookAssistantMessage struct {
@@ -806,17 +808,46 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 		step = int(n)
 	}
 	var msg hookAssistantMessage
-	rawMsg := d.Extra.AssistantMessage
-	if trimmedRaw := strings.TrimSpace(string(rawMsg)); trimmedRaw == "" || trimmedRaw == "null" {
-		var resp struct {
-			AssistantMessage json.RawMessage `json:"assistant_message"`
-		}
-		if json.Unmarshal(d.Extra.Response, &resp) == nil && len(resp.AssistantMessage) > 0 {
-			rawMsg = resp.AssistantMessage
+	if len(d.Extra.AssistantMessage) > 0 {
+		if json.Unmarshal(d.Extra.AssistantMessage, &msg) != nil {
+			var pyRepr string
+			if json.Unmarshal(d.Extra.AssistantMessage, &pyRepr) == nil && pyRepr != "" {
+				if m := pyReprReasoningPattern1.FindStringSubmatch(pyRepr); len(m) > 1 && m[1] != "None" {
+					msg.ReasoningContent = m[1]
+				} else if m := pyReprReasoningPattern2.FindStringSubmatch(pyRepr); len(m) > 1 && m[1] != "None" {
+					msg.ReasoningContent = m[1]
+				}
+			}
 		}
 	}
-	if len(rawMsg) > 0 {
-		_ = json.Unmarshal(rawMsg, &msg)
+	if len(d.Extra.Response) > 0 {
+		var resp struct {
+			FinishReason     string               `json:"finish_reason"`
+			AssistantMessage hookAssistantMessage `json:"assistant_message"`
+		}
+		if json.Unmarshal(d.Extra.Response, &resp) == nil {
+			if d.Extra.FinishReason == "" && resp.FinishReason != "" {
+				d.Extra.FinishReason = resp.FinishReason
+			}
+			if msg.Content == "" {
+				msg.Content = resp.AssistantMessage.Content
+			}
+			if msg.ReasoningContent == "" {
+				msg.ReasoningContent = resp.AssistantMessage.ReasoningContent
+			}
+			if msg.Reasoning == "" {
+				msg.Reasoning = resp.AssistantMessage.Reasoning
+			}
+			if len(msg.ReasoningDetails) == 0 {
+				msg.ReasoningDetails = resp.AssistantMessage.ReasoningDetails
+			}
+			if len(msg.AnthropicContentBlocks) == 0 {
+				msg.AnthropicContentBlocks = resp.AssistantMessage.AnthropicContentBlocks
+			}
+			if len(msg.ToolCalls) == 0 {
+				msg.ToolCalls = resp.AssistantMessage.ToolCalls
+			}
+		}
 	}
 
 	var reasoningParts []string

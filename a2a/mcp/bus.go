@@ -315,6 +315,7 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 		nats.Timeout(natsConnectTimeout),
 		nats.ReconnectWait(natsReconnectWait),
 		nats.MaxReconnects(-1),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {}),
 	}
 	if prof.BusAuthValue != "" {
 		opts = append(opts, nats.UserInfo(user, prof.BusAuthValue))
@@ -365,6 +366,7 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 			nats.ReconnectWait(natsReconnectWait),
 			nats.MaxReconnects(-1),
 			nats.UserInfo(observerUserGateway, prof.ObserverAuthValue),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {}),
 		}
 		if obsNC, obsErr := nats.Connect(natsURL, obsOpts...); obsErr == nil {
 			s.observerNC = obsNC
