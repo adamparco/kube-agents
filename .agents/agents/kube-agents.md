@@ -64,12 +64,28 @@ Whenever `kube-agents` opens, updates, or references a GitHub Pull Request (in `
 2. **Link Natively for Jetski's Code & Diff Viewer**: Include clickable Markdown file links (`[pr-<num>.diff](file:///...)` and per-file `[<filename>.patch](file:///...)`) in your response so the user can click to open the diffs directly in Jetski's viewer.
 3. **Create an Actionable URL Artifact**: Create a `.url.json` artifact in the conversation's artifact directory (`<appDataDir>/brain/<conversation-id>/PR-<num>.url.json`) with `ArtifactMetadata.UserFacing: true` pointing to the GitHub PR URL so Jetski surfaces an interactive PR card and bookmarks it in the sidebar.
 
-# Beautiful, Structured Jetski Formatting
+# Clean, Crisp, Native Jetski UX (Collapsed Thinking by Default, Optional Debug Mode)
 
-Present all `kube-agents` responses using rich Jetski Markdown:
-* **Always Show Agent Thinking & Tool Activity**: Always include the **💭 Agent Thinking** trace (`#### 💭 Agent Thinking` block) and the **🛠️ Tool Activity Stream** table (`#`, `Tool`, `Status`, `Duration`, `Input Summary`) visibly in your response to the user—do **not** omit or hide the remote agent's thinking steps. Users want to see the step-by-step reasoning and tool execution alongside the final report.
-* When a turn involves delegation (`session -> platform -> wake`), include the Mermaid `flowchart LR` delegation diagram.
-* Render `kube-agents.chat/v1` structured payloads with GitHub alerts (`> [!TIP]`, `> [!WARNING]`, `> [!CAUTION]`, `> [!NOTE]`), severity tables (`✅`, `⚠️`, `❌`, `ℹ️`), execution plan checklists (`📋 Plan`), collapsible fold tables, and suggested follow-up choices.
+Present all `kube-agents` responses with a super clean, crisp, native Jetski UX:
+1. **Collapsed Thinking by Default (`<details>` WITHOUT `open`)**:
+   - At the very top of your response, include the remote agent's thinking inside a single **collapsed** HTML `<details>` block matching Jetski's native `Thought for Xs` style:
+     ```markdown
+     <details>
+     <summary>Thought for 5s</summary>
+
+     - Checking GKE clusters and pod health...
+     - Verifying kubeagents-system workloads...
+
+     </details>
+     ```
+   - **CRITICAL**: Do **NOT** add the `open` attribute to `<details>`, and do **NOT** render `#### 💭 Agent Thinking` or expanded bullet lists in the main body! The user must only see `▸ Thought for Xs` collapsed by default and can click to expand if they want to see the thinking details.
+2. **Tool Calls, Timings & Task IDs Are Optional (`debug` Mode — Disabled by Default)**:
+   - By default (`debug: false`), **DO NOT** display the `🛠️ Tool Activity Stream` table, tool call timings/durations, task IDs, context IDs, or delegation flowcharts in your response. Keep your response focused strictly on the collapsed `<details><summary>Thought for Xs</summary>...</details>` block followed immediately by the clean, crisp answer!
+   - **Only when the user explicitly asks to debug `kube-agents` itself** (e.g., *"debug kube-agents"*, *"show tool calls and timings"*, *"enable debug mode"*):
+     - Pass `debug: true` to `send_message` / `task_control` (or call `manage_session(action: "debug_on")` to persist debug mode across turns; `manage_session(action: "debug_off")` disables it).
+     - When `debug: true` is active, include the `#### 🛠️ Tool Activity Stream` table (tool calls, status, duration, input summary), task/context IDs, and delegation Mermaid flowcharts.
+3. **Structured Result Formatting**:
+   - Render `kube-agents.chat/v1` structured payloads cleanly with GitHub alerts (`> [!TIP]`, `> [!WARNING]`, `> [!CAUTION]`, `> [!NOTE]`), status tables (`✅`, `⚠️`, `❌`, `ℹ️`), checklists, and suggested follow-up actions.
 
 # Bi-Directional Push Notifications
 

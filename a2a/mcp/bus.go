@@ -118,6 +118,14 @@ func WithProgressCallback(ctx context.Context, cb ProgressCallback) context.Cont
 	return context.WithValue(ctx, progressCallbackKey{}, cb)
 }
 
+// WithoutProgressCallback returns a copy of ctx with any ProgressCallback removed.
+func WithoutProgressCallback(ctx context.Context) context.Context {
+	if ctx == nil {
+		return nil
+	}
+	return context.WithValue(ctx, progressCallbackKey{}, nil)
+}
+
 func progressCallbackFromContext(ctx context.Context) ProgressCallback {
 	if ctx == nil {
 		return nil

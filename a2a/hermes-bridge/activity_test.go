@@ -1386,13 +1386,12 @@ print("Here is the fleet summary.")
 		t.Fatalf("thinking artifact = %+v, want 2 parts", thinking)
 	}
 	first := thinking.Parts[0].Text
-	if !strings.Contains(first, "Step 1: Checking GKE cluster inventory first.") ||
-		!strings.Contains(first, "listing GKE clusters (mcp__gke__list_clusters) [project_id]") ||
+	if first != "Checking GKE cluster inventory first." ||
 		strings.Contains(first, "secret123") || strings.Contains(first, "my-proj") {
 		t.Fatalf("first thinking part = %q", first)
 	}
 	second := thinking.Parts[1].Text
-	if !strings.Contains(second, "Step 2: Synthesizing findings from 1 completed tool call(s)") {
+	if second != "Synthesizing findings into final response." {
 		t.Fatalf("second thinking part = %q", second)
 	}
 }

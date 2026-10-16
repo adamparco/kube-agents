@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -173,11 +174,31 @@ func FormatBusStatusMarkdown(rep BusStatusReport, conv ConversationEntry, push P
 	return sb.String()
 }
 
-// FormatTurnOutcomeMarkdown renders a complete turn outcome, including console notices,
-// primary task execution, thinking, tool calls, delegated child tasks, and wake synthesis.
+var (
+	legacyStepPrefixRe    = regexp.MustCompile(`^Step\s+\d+:\s*`)
+	legacyPlanPrefixRe    = regexp.MustCompile(`(?i)^Planning\s*&\s*executing\s+\d+\s+tool\s+call\(s\)\s*[—-]\s*`)
+	legacyActionPrefixRe  = regexp.MustCompile(`^→\s*Action:\s*`)
+	legacySynthPrefixRe   = regexp.MustCompile(`(?i)^Synthesizing findings from \d+ completed tool call\(s\) into final response\.?$`)
+	legacyKeyBracketSufRe = regexp.MustCompile(`\s*\[[A-Za-z0-9_,\s-]+\]$`)
+)
+
+// FormatTurnOutcomeMarkdown renders a turn outcome using the default clean, collapsed-thinking Jetski UX.
 func FormatTurnOutcomeMarkdown(outcome *TurnOutcome) string {
+	return FormatTurnOutcomeMarkdownWithOptions(outcome, false)
+}
+
+// FormatTurnOutcomeMarkdownWithOptions renders a turn outcome.
+// When debug is false (the default), it renders a super clean, crisp native Jetski view:
+// a collapsed-by-default <details><summary>Thought for Xs</summary>...</details> block followed
+// directly by the final answer, hiding tool call tables, timings, and task metadata.
+// When debug is true, it includes the full Tool Activity Stream table (tool calls, timings, inputs),
+// task/context IDs, gateway notices, and delegation flow diagrams for debugging kube-agents itself.
+func FormatTurnOutcomeMarkdownWithOptions(outcome *TurnOutcome, debug bool) string {
 	if outcome == nil {
 		return ""
+	}
+	if !debug {
+		return formatCleanTurnOutcomeMarkdown(outcome)
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## 💬 Kube-Agents Turn (`%s` / `console:%s`)\n\n", outcome.ConversationAlias, outcome.ConversationToken)
@@ -204,17 +225,17 @@ func FormatTurnOutcomeMarkdown(outcome *TurnOutcome) string {
 	}
 
 	if outcome.PrimaryTask != nil {
-		sb.WriteString(FormatTaskRecordMarkdown(outcome.PrimaryTask, "Primary Task"))
+		sb.WriteString(FormatTaskRecordMarkdownWithOptions(outcome.PrimaryTask, "Primary Task", true))
 	}
 
 	for i, child := range outcome.ChildTasks {
 		sb.WriteString("\n---\n")
-		sb.WriteString(FormatTaskRecordMarkdown(child, fmt.Sprintf("Delegated Child Task #%d", i+1)))
+		sb.WriteString(FormatTaskRecordMarkdownWithOptions(child, fmt.Sprintf("Delegated Child Task #%d", i+1), true))
 	}
 
 	if outcome.WakeTask != nil {
 		sb.WriteString("\n---\n")
-		sb.WriteString(FormatTaskRecordMarkdown(outcome.WakeTask, "Session Wake Synthesis Task"))
+		sb.WriteString(FormatTaskRecordMarkdownWithOptions(outcome.WakeTask, "Session Wake Synthesis Task", true))
 	}
 
 	allPRs := collectOutcomePRs(outcome)
@@ -233,43 +254,248 @@ func FormatTurnOutcomeMarkdown(outcome *TurnOutcome) string {
 	return sb.String()
 }
 
-// FormatTaskRecordMarkdown renders a single TaskRecord with thinking, activities, progress, and result.
-func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
+func formatCleanTurnOutcomeMarkdown(outcome *TurnOutcome) string {
+	var sb strings.Builder
+
+	// Pure control command (e.g. /session or /session off) with no task:
+	if outcome.PrimaryTask == nil {
+		for _, n := range outcome.ConsoleNotices {
+			if txt := strings.TrimSpace(n.Text); txt != "" {
+				fmt.Fprintf(&sb, "%s\n", txt)
+			}
+		}
+		return strings.TrimSpace(sb.String())
+	}
+
+	// Collect clean, deduplicated thinking steps across primary, child, and wake tasks.
+	var thoughts []string
+	addThoughts := func(rec *TaskRecord) {
+		if rec == nil {
+			return
+		}
+		raw := strings.TrimSpace(rec.Thinking)
+		if raw == "" {
+			raw = SynthesizeThinkingFromActivities(rec)
+		}
+		for _, line := range cleanAndDedupeThinking(raw) {
+			if len(thoughts) == 0 || thoughts[len(thoughts)-1] != line {
+				thoughts = append(thoughts, line)
+			}
+		}
+	}
+	addThoughts(outcome.PrimaryTask)
+	for _, child := range outcome.ChildTasks {
+		addThoughts(child)
+	}
+	addThoughts(outcome.WakeTask)
+
+	summaryLabel := formatThoughtSummaryLabel(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask)
+	if len(thoughts) > 0 {
+		sb.WriteString("<details>\n")
+		fmt.Fprintf(&sb, "<summary>%s</summary>\n\n", summaryLabel)
+		for _, line := range thoughts {
+			fmt.Fprintf(&sb, "- %s\n", line)
+		}
+		sb.WriteString("\n</details>\n\n")
+	}
+
+	// Render the final answer cleanly without task metadata or tool call tables.
+	resultBody := renderTaskAnswerBody(outcome.WakeTask)
+	if resultBody == "" && len(outcome.ChildTasks) > 0 {
+		var parts []string
+		if pBody := renderTaskAnswerBody(outcome.PrimaryTask); pBody != "" {
+			parts = append(parts, pBody)
+		}
+		for _, child := range outcome.ChildTasks {
+			if cBody := renderTaskAnswerBody(child); cBody != "" {
+				parts = append(parts, cBody)
+			}
+		}
+		resultBody = strings.Join(parts, "\n\n")
+	}
+	if resultBody == "" {
+		resultBody = renderTaskAnswerBody(outcome.PrimaryTask)
+	}
+	if resultBody != "" {
+		sb.WriteString(resultBody)
+		if !strings.HasSuffix(resultBody, "\n") {
+			sb.WriteString("\n")
+		}
+	}
+
+	allPRs := collectOutcomePRs(outcome)
+	var missingPRs []string
+	for _, pr := range allPRs {
+		if !strings.Contains(resultBody, pr) {
+			missingPRs = append(missingPRs, pr)
+		}
+	}
+	if len(missingPRs) > 0 {
+		sb.WriteString("\n**Pull Request**: " + strings.Join(missingPRs, ", ") + "\n")
+	}
+
+	if outcome.TimedOut && outcome.PrimaryTask != nil {
+		sb.WriteString("\n> [!NOTE]\n")
+		fmt.Fprintf(&sb, "> Task `%s` is still in flight (`%s`). Wait for the automatic background push wakeup or call `task_control` (`action: \"get\"`, `task_id: %q`).\n",
+			outcome.PrimaryTask.TaskID, outcome.PrimaryTask.State, outcome.PrimaryTask.TaskID)
+	}
+
+	return strings.TrimSpace(sb.String()) + "\n"
+}
+
+func renderTaskAnswerBody(rec *TaskRecord) string {
 	if rec == nil {
 		return ""
 	}
 	var sb strings.Builder
-	if titlePrefix == "" {
-		titlePrefix = "Task"
+	if rec.ResultChat != nil || strings.TrimSpace(rec.ResultText) != "" {
+		if rec.ResultChat != nil {
+			sb.WriteString(FormatChatMessageMarkdown(rec.ResultChat))
+			if strings.TrimSpace(rec.ResultText) != "" && rec.ResultChat.Detail == "" && len(rec.ResultChat.Rows) == 0 {
+				fmt.Fprintf(&sb, "\n%s\n", strings.TrimSpace(rec.ResultText))
+			}
+		} else {
+			fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(rec.ResultText))
+		}
+	} else if !rec.Terminal && (rec.ProgressChat != nil || strings.TrimSpace(rec.ProgressText) != "") {
+		if rec.ProgressChat != nil {
+			sb.WriteString(FormatChatMessageMarkdown(rec.ProgressChat))
+		} else {
+			fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(rec.ProgressText))
+		}
+	} else if rec.StatusText != "" {
+		fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(rec.StatusText))
 	}
-	fmt.Fprintf(&sb, "### %s: `%s` → `%s` (%s)\n\n",
-		titlePrefix, rec.TaskID, rec.Addressee, formatTaskStateBadge(rec.State))
+	return strings.TrimSpace(sb.String())
+}
 
-	fmt.Fprintf(&sb, "- **Context ID**: `%s`", rec.ContextID)
-	if rec.Conversation != "" {
-		fmt.Fprintf(&sb, " | **Conversation**: `%s`", rec.Conversation)
+func formatThoughtSummaryLabel(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord) string {
+	if primary == nil {
+		return "Thought"
 	}
-	if rec.DelegatedFromTaskID != "" {
-		fmt.Fprintf(&sb, " | **Delegated From**: `%s`", rec.DelegatedFromTaskID)
+	start := primary.CreatedAt
+	end := primary.UpdatedAt
+	for _, c := range children {
+		if c != nil && c.UpdatedAt.After(end) {
+			end = c.UpdatedAt
+		}
 	}
-	if rec.WakeFromChildTaskID != "" {
-		fmt.Fprintf(&sb, " | **Wake From Child**: `%s`", rec.WakeFromChildTaskID)
+	if wake != nil && wake.UpdatedAt.After(end) {
+		end = wake.UpdatedAt
 	}
-	sb.WriteString("\n\n")
+	if !start.IsZero() && end.After(start) {
+		sec := int(end.Sub(start).Round(time.Second).Seconds())
+		if sec >= 1 {
+			return fmt.Sprintf("Thought for %ds", sec)
+		}
+	}
+	var totalMs int64
+	for _, a := range primary.Activities {
+		totalMs += a.DurationMs
+	}
+	for _, c := range children {
+		if c != nil {
+			for _, a := range c.Activities {
+				totalMs += a.DurationMs
+			}
+		}
+	}
+	if totalMs >= 1000 {
+		return fmt.Sprintf("Thought for %ds", int((time.Duration(totalMs)*time.Millisecond).Round(time.Second).Seconds()))
+	}
+	return "Thought"
+}
+
+func cleanAndDedupeThinking(raw string) []string {
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, ">")
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "• ")
+		line = legacyStepPrefixRe.ReplaceAllString(line, "")
+		line = legacyActionPrefixRe.ReplaceAllString(line, "")
+		line = legacyPlanPrefixRe.ReplaceAllString(line, "")
+		line = legacyKeyBracketSufRe.ReplaceAllString(line, "")
+		if legacySynthPrefixRe.MatchString(line) {
+			line = "Synthesizing findings into final response."
+		}
+		switch {
+		case strings.Contains(line, "running cluster/shell diagnostic"):
+			line = "Running cluster and workspace diagnostics."
+		case strings.Contains(line, "listing GKE clusters"):
+			line = "Listing GKE clusters in the fleet."
+		case strings.Contains(line, "inspecting GKE cluster details"):
+			line = "Inspecting GKE cluster configuration."
+		case strings.Contains(line, "querying GKE MCP"):
+			line = "Querying GKE cluster state."
+		case strings.Contains(line, "updating/querying Kanban board"):
+			line = "Updating task status on the Kanban board."
+		case strings.Contains(line, "inspecting workspace files"):
+			line = "Inspecting files in the workspace."
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(out) == 0 || out[len(out)-1] != line {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// FormatTaskRecordMarkdown renders a single TaskRecord using default clean formatting.
+func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
+	return FormatTaskRecordMarkdownWithOptions(rec, titlePrefix, false)
+}
+
+// FormatTaskRecordMarkdownWithOptions renders a single TaskRecord.
+// When debug is false, thinking is rendered inside a collapsed <details> block and the Tool Activity
+// Stream table is omitted. When debug is true, full task metadata and the Tool Activity Stream table
+// (tool calls, durations, statuses, inputs) are included.
+func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, debug bool) string {
+	if rec == nil {
+		return ""
+	}
+	var sb strings.Builder
+	if debug {
+		if titlePrefix == "" {
+			titlePrefix = "Task"
+		}
+		fmt.Fprintf(&sb, "### %s: `%s` → `%s` (%s)\n\n",
+			titlePrefix, rec.TaskID, rec.Addressee, formatTaskStateBadge(rec.State))
+
+		fmt.Fprintf(&sb, "- **Context ID**: `%s`", rec.ContextID)
+		if rec.Conversation != "" {
+			fmt.Fprintf(&sb, " | **Conversation**: `%s`", rec.Conversation)
+		}
+		if rec.DelegatedFromTaskID != "" {
+			fmt.Fprintf(&sb, " | **Delegated From**: `%s`", rec.DelegatedFromTaskID)
+		}
+		if rec.WakeFromChildTaskID != "" {
+			fmt.Fprintf(&sb, " | **Wake From Child**: `%s`", rec.WakeFromChildTaskID)
+		}
+		sb.WriteString("\n\n")
+	}
 
 	thinkingText := strings.TrimSpace(rec.Thinking)
 	if thinkingText == "" {
 		thinkingText = SynthesizeThinkingFromActivities(rec)
 	}
-	if thinkingText != "" {
-		sb.WriteString("#### 💭 Agent Thinking\n\n")
-		for _, line := range strings.Split(thinkingText, "\n") {
-			fmt.Fprintf(&sb, "> %s\n", line)
+	thoughts := cleanAndDedupeThinking(thinkingText)
+	if len(thoughts) > 0 {
+		label := formatThoughtSummaryLabel(rec, nil, nil)
+		sb.WriteString("<details>\n")
+		fmt.Fprintf(&sb, "<summary>%s</summary>\n\n", label)
+		for _, line := range thoughts {
+			fmt.Fprintf(&sb, "- %s\n", line)
 		}
-		sb.WriteString("\n")
+		sb.WriteString("\n</details>\n\n")
 	}
 
-	if len(rec.Activities) > 0 {
+	if debug && len(rec.Activities) > 0 {
 		sb.WriteString("#### 🛠️ Tool Activity Stream\n\n")
 		sb.WriteString("| # | Tool | Status | Duration | Input Summary |\n")
 		sb.WriteString("| ---: | :--- | :--- | ---: | :--- |\n")
@@ -291,7 +517,7 @@ func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
 		sb.WriteString("\n")
 	}
 
-	if len(rec.Delegates) > 0 {
+	if debug && len(rec.Delegates) > 0 {
 		sb.WriteString("#### 🤝 Delegations Requested\n")
 		for _, d := range rec.Delegates {
 			childInfo := ""
@@ -303,14 +529,14 @@ func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
 		sb.WriteString("\n")
 	}
 
-	if len(rec.IntermediateTurns) > 0 {
+	if debug && len(rec.IntermediateTurns) > 0 {
 		sb.WriteString("#### 🔄 Intermediate Turns\n")
 		for _, t := range rec.IntermediateTurns {
 			fmt.Fprintf(&sb, "> %s\n\n", strings.TrimSpace(t))
 		}
 	}
 
-	if len(rec.Notices) > 0 {
+	if debug && len(rec.Notices) > 0 {
 		sb.WriteString("#### 📌 Task Notices\n")
 		for _, n := range rec.Notices {
 			fmt.Fprintf(&sb, "- %s\n", n)
@@ -318,127 +544,75 @@ func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
 		sb.WriteString("\n")
 	}
 
-	if !rec.Terminal && (rec.ProgressChat != nil || strings.TrimSpace(rec.ProgressText) != "") {
-		sb.WriteString("#### 📡 Live Progress\n\n")
-		if rec.ProgressChat != nil {
-			sb.WriteString(FormatChatMessageMarkdown(rec.ProgressChat))
-		} else {
-			fmt.Fprintf(&sb, "%s\n\n", strings.TrimSpace(rec.ProgressText))
+	body := renderTaskAnswerBody(rec)
+	if body != "" {
+		if debug {
+			sb.WriteString("#### 🎯 Result\n\n")
 		}
-	}
-
-	if rec.ResultChat != nil || strings.TrimSpace(rec.ResultText) != "" {
-		sb.WriteString("#### 🎯 Result\n\n")
-		if rec.ResultChat != nil {
-			sb.WriteString(FormatChatMessageMarkdown(rec.ResultChat))
-			if strings.TrimSpace(rec.ResultText) != "" && rec.ResultChat.Detail == "" && len(rec.ResultChat.Rows) == 0 {
-				fmt.Fprintf(&sb, "\n%s\n", strings.TrimSpace(rec.ResultText))
-			}
-		} else {
-			fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(rec.ResultText))
-		}
-	} else if rec.StatusText != "" {
-		fmt.Fprintf(&sb, "**Status Detail**: %s\n", rec.StatusText)
+		sb.WriteString(body + "\n")
 	}
 
 	return sb.String()
 }
 
-// SynthesizeThinkingFromActivities builds a human-readable thinking trace when a task
+// SynthesizeThinkingFromActivities builds a clean human-readable thinking trace when a task
 // executed tool calls or progress updates without explicit thinking artifact chunks.
 func SynthesizeThinkingFromActivities(rec *TaskRecord) string {
 	if rec == nil {
 		return ""
 	}
 	var lines []string
-	for i, act := range rec.Activities {
-		dur := ""
-		if act.DurationMs > 0 {
-			dur = fmt.Sprintf(" (%dms)", act.DurationMs)
+	addLine := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
 		}
-		status := act.Status
-		if status == "" {
-			status = "completed"
+		if len(lines) == 0 || lines[len(lines)-1] != s {
+			lines = append(lines, s)
 		}
-		lines = append(lines, fmt.Sprintf("Step %d: Executed `%s` [%s%s]", i+1, act.Tool, status, dur))
+	}
+	for _, act := range rec.Activities {
+		switch {
+		case act.Tool == "mcp__gke__list_clusters":
+			addLine("Listing GKE clusters in the fleet.")
+		case act.Tool == "mcp__gke__get_cluster":
+			addLine("Inspecting GKE cluster configuration.")
+		case strings.HasPrefix(act.Tool, "mcp__gke__"):
+			addLine("Querying GKE cluster state.")
+		case act.Tool == "terminal" || act.Tool == "kubectl" || act.Tool == "run_kubectl":
+			addLine("Running cluster and workspace diagnostics.")
+		case strings.HasPrefix(act.Tool, "kanban_"):
+			addLine("Updating task status on the Kanban board.")
+		default:
+			addLine(fmt.Sprintf("Running %s.", act.Tool))
+		}
 	}
 	if prog := strings.TrimSpace(rec.ProgressText); prog != "" {
-		lines = append(lines, "Progress: "+prog)
+		addLine(prog)
 	}
 	return strings.Join(lines, "\n")
 }
 
-// FormatLiveTaskProgress renders a concise live streaming status message suitable for
-// MCP notifications/progress frames in Jetski's UI while a turn is in flight.
+// FormatLiveTaskProgress renders a concise single-line live status message suitable for
+// MCP notifications/progress frames when debug mode is enabled.
 func FormatLiveTaskProgress(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord, elapsed time.Duration) string {
 	if primary == nil {
-		return "⏳ Waiting for kube-agents task..."
+		return "Waiting for kube-agents task..."
 	}
-	var sb strings.Builder
 	rounded := elapsed.Round(time.Second)
 	if rounded < time.Second {
 		rounded = time.Second
 	}
-	fmt.Fprintf(&sb, "⏳ Task %s → %s (%s, %s elapsed)", primary.TaskID, primary.Addressee, primary.State, rounded)
-
-	thinking := strings.TrimSpace(primary.Thinking)
-	if thinking == "" {
-		thinking = SynthesizeThinkingFromActivities(primary)
+	msg := fmt.Sprintf("Task %s → %s (%s, %s elapsed, %d tool calls)",
+		primary.TaskID, primary.Addressee, primary.State, rounded, len(primary.Activities))
+	if len(children) > 0 {
+		lastChild := children[len(children)-1]
+		msg += fmt.Sprintf(" • Delegated to %s (%s)", lastChild.Addressee, lastChild.State)
 	}
-	if thinking != "" {
-		lines := strings.Split(thinking, "\n")
-		if len(lines) > 6 {
-			lines = lines[len(lines)-6:]
-		}
-		sb.WriteString("\n💭 Thinking:\n")
-		for _, l := range lines {
-			l = strings.TrimSpace(l)
-			if l != "" {
-				fmt.Fprintf(&sb, "  • %s\n", l)
-			}
-		}
-	}
-
-	if len(primary.Activities) > 0 {
-		fmt.Fprintf(&sb, "\n🛠️ Tool Activity (%d call(s)):\n", len(primary.Activities))
-		startIdx := 0
-		if len(primary.Activities) > 4 {
-			startIdx = len(primary.Activities) - 4
-		}
-		for i := startIdx; i < len(primary.Activities); i++ {
-			act := primary.Activities[i]
-			icon := "✓"
-			if act.Status == "error" || act.Status == "interrupted" {
-				icon = "✗"
-			}
-			dur := ""
-			if act.DurationMs > 0 {
-				dur = fmt.Sprintf(" (%dms)", act.DurationMs)
-			}
-			fmt.Fprintf(&sb, "  %s #%d %s%s\n", icon, i+1, act.Tool, dur)
-		}
-	}
-
-	if prog := strings.TrimSpace(primary.ProgressText); prog != "" && !strings.Contains(thinking, prog) {
-		fmt.Fprintf(&sb, "\n📡 Progress: %s\n", prog)
-	}
-
-	for i, child := range children {
-		fmt.Fprintf(&sb, "\n🔀 Delegated Child #%d: %s → %s (%s)", i+1, child.TaskID, child.Addressee, child.State)
-		if childThinking := strings.TrimSpace(child.Thinking); childThinking != "" {
-			cLines := strings.Split(childThinking, "\n")
-			fmt.Fprintf(&sb, " — %s", cLines[len(cLines)-1])
-		} else if len(child.Activities) > 0 {
-			lastAct := child.Activities[len(child.Activities)-1]
-			fmt.Fprintf(&sb, " — %d tool call(s), last: %s", len(child.Activities), lastAct.Tool)
-		}
-	}
-
 	if wake != nil {
-		fmt.Fprintf(&sb, "\n🌅 Wake Synthesis: %s → %s (%s)", wake.TaskID, wake.Addressee, wake.State)
+		msg += fmt.Sprintf(" • Wake synthesis (%s)", wake.State)
 	}
-
-	return strings.TrimSpace(sb.String())
+	return msg
 }
 
 // FormatChatMessageMarkdown renders a structured kube-agents.chat/v1 Message into rich Jetski Markdown.

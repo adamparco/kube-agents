@@ -501,6 +501,7 @@ type activityState struct {
 	dropped           int // calls past the trace's share, reported once at the terminal
 	lastTool          string
 	lastThinking      string
+	prevThinking      string
 	startedAt         time.Time
 	appended          map[string]bool // artifact name -> a first part went out
 
@@ -641,7 +642,11 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	switch d.Event {
 	case hookPostAPIRequest:
 		a.apiCalls++
-		a.lastThinking = formatAPIRequestThinking(d, a.apiCalls, a.calls)
+		cand := formatAPIRequestThinking(d, a.apiCalls, a.calls)
+		if cand != "" && cand != a.prevThinking {
+			a.lastThinking = cand
+			a.prevThinking = cand
+		}
 		return ActivityEntry{}, false
 	case hookPreToolCall:
 		if _, seen := a.open[id]; !seen {
@@ -779,10 +784,8 @@ func (a *activityState) thinkingUnderBudget() bool {
 }
 
 var (
-	thinkTagPattern         = regexp.MustCompile(`(?is)<think>(.*?)</think>`)
-	scratchpadTagPattern    = regexp.MustCompile(`(?is)<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>`)
-	pyReprReasoningPattern1 = regexp.MustCompile(`reasoning(?:_content)?='([^']+)'`)
-	pyReprReasoningPattern2 = regexp.MustCompile(`reasoning(?:_content)?="([^"]+)"`)
+	thinkTagPattern      = regexp.MustCompile(`(?is)<think>(.*?)</think>`)
+	scratchpadTagPattern = regexp.MustCompile(`(?is)<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>`)
 )
 
 type hookAssistantMessage struct {
@@ -802,6 +805,50 @@ type hookAssistantMessage struct {
 	} `json:"tool_calls"`
 }
 
+func extractPyReprField(pyRepr, field string) string {
+	prefix := field + "="
+	idx := strings.Index(pyRepr, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := pyRepr[idx+len(prefix):]
+	if len(rest) < 2 || strings.HasPrefix(rest, "None") {
+		return ""
+	}
+	quote := rest[0]
+	if quote != '\'' && quote != '"' {
+		return ""
+	}
+	var sb strings.Builder
+	escaped := false
+	for i := 1; i < len(rest); i++ {
+		ch := rest[i]
+		if escaped {
+			switch ch {
+			case 'n':
+				sb.WriteByte('\n')
+			case 't':
+				sb.WriteByte('\t')
+			case 'r':
+				sb.WriteByte('\r')
+			default:
+				sb.WriteByte(ch)
+			}
+			escaped = false
+			continue
+		}
+		if ch == '\\' {
+			escaped = true
+			continue
+		}
+		if ch == quote {
+			return strings.TrimSpace(sb.String())
+		}
+		sb.WriteByte(ch)
+	}
+	return ""
+}
+
 func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) string {
 	step := fallbackStep
 	if n := durationMillis(d.Extra.APICallCount); n > 0 {
@@ -812,10 +859,10 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 		if json.Unmarshal(d.Extra.AssistantMessage, &msg) != nil {
 			var pyRepr string
 			if json.Unmarshal(d.Extra.AssistantMessage, &pyRepr) == nil && pyRepr != "" {
-				if m := pyReprReasoningPattern1.FindStringSubmatch(pyRepr); len(m) > 1 && m[1] != "None" {
-					msg.ReasoningContent = m[1]
-				} else if m := pyReprReasoningPattern2.FindStringSubmatch(pyRepr); len(m) > 1 && m[1] != "None" {
-					msg.ReasoningContent = m[1]
+				if rc := extractPyReprField(pyRepr, "reasoning_content"); rc != "" {
+					msg.ReasoningContent = rc
+				} else if r := extractPyReprField(pyRepr, "reasoning"); r != "" {
+					msg.Reasoning = r
 				}
 			}
 		}
@@ -912,6 +959,15 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 	}
 
 	var plannedTools []string
+	addPlannedTool := func(desc string) {
+		desc = strings.TrimSpace(desc)
+		if desc == "" {
+			return
+		}
+		if !slices.Contains(plannedTools, desc) {
+			plannedTools = append(plannedTools, desc)
+		}
+	}
 	for _, tc := range msg.ToolCalls {
 		name := strings.TrimSpace(tc.Function.Name)
 		if name == "" {
@@ -922,21 +978,19 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 			argsRaw = tc.Arguments
 		}
 		for _, expanded := range expandPlannedToolCall(name, argsRaw) {
-			plannedTools = append(plannedTools, expanded)
+			addPlannedTool(expanded)
 		}
 	}
 
 	explicit := strings.Join(reasoningParts, "\n")
 	var out string
 	switch {
-	case explicit != "" && len(plannedTools) > 0:
-		out = fmt.Sprintf("Step %d: %s\n→ Action: %s", step, explicit, strings.Join(plannedTools, "; "))
 	case explicit != "":
-		out = fmt.Sprintf("Step %d: %s", step, explicit)
+		out = explicit
 	case len(plannedTools) > 0:
-		out = fmt.Sprintf("Step %d: Planning & executing %d tool call(s) — %s", step, len(plannedTools), strings.Join(plannedTools, "; "))
+		out = strings.Join(plannedTools, "\n")
 	case d.Extra.FinishReason == "stop" && (step > 1 || completedTools > 0):
-		out = fmt.Sprintf("Step %d: Synthesizing findings from %d completed tool call(s) into final response.", step, completedTools)
+		out = "Synthesizing findings into final response."
 	default:
 		return ""
 	}
@@ -963,14 +1017,14 @@ func expandPlannedToolCall(toolName string, argsRaw json.RawMessage) []string {
 					continue
 				}
 				subArgs, _ := cm[wrapperCallArgsKey].(map[string]any)
-				out = append(out, describePlannedTool(subName, safeSchemaKeysFromMap(subArgs)))
+				out = append(out, describePlannedTool(subName, subArgs))
 			}
 			if len(out) > 0 {
 				return out
 			}
 		}
 	}
-	return []string{describePlannedTool(toolName, safeSchemaKeysFromMap(parsed))}
+	return []string{describePlannedTool(toolName, parsed)}
 }
 
 func decodeToolArgsMap(raw json.RawMessage) map[string]any {
@@ -989,43 +1043,57 @@ func decodeToolArgsMap(raw json.RawMessage) map[string]any {
 	return m
 }
 
-func safeSchemaKeysFromMap(m map[string]any) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	var keys []string
-	for k := range m {
-		if schemaKeyPattern.MatchString(k) && !tokenShapedKey(k) && !secretLookingKey(k) {
-			keys = append(keys, k)
-		}
-	}
-	slices.Sort(keys)
-	if len(keys) > 6 {
-		keys = keys[:6]
-	}
-	return keys
-}
-
-func describePlannedTool(toolName string, safeKeys []string) string {
-	label := toolName
+func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 	switch {
 	case toolName == "mcp__gke__list_clusters":
-		label = "listing GKE clusters (" + toolName + ")"
+		return "Listing GKE clusters in the fleet."
 	case toolName == "mcp__gke__get_cluster":
-		label = "inspecting GKE cluster details (" + toolName + ")"
+		return "Inspecting GKE cluster configuration."
 	case strings.HasPrefix(toolName, "mcp__gke__"):
-		label = "querying GKE MCP (" + toolName + ")"
+		return "Querying GKE cluster state."
 	case toolName == "terminal" || toolName == "kubectl":
-		label = "running cluster/shell diagnostic (" + toolName + ")"
+		cmd, _ := parsedArgs["command"].(string)
+		if cmd == "" {
+			cmd, _ = parsedArgs["cmd"].(string)
+		}
+		return classifyShellIntent(cmd)
 	case strings.HasPrefix(toolName, "kanban_"):
-		label = "updating/querying Kanban board (" + toolName + ")"
+		return "Updating task status on the Kanban board."
 	case toolName == "read_file" || toolName == "search_files" || toolName == "list_dir":
-		label = "inspecting workspace files (" + toolName + ")"
+		return "Inspecting files in the workspace."
+	default:
+		return "Running " + toolName + "."
 	}
-	if len(safeKeys) > 0 {
-		label += " [" + strings.Join(safeKeys, ", ") + "]"
+}
+
+func classifyShellIntent(cmd string) string {
+	lower := strings.ToLower(cmd)
+	switch {
+	case strings.Contains(lower, "gh pr create") || strings.Contains(lower, "gh pr "):
+		return "Opening a GitHub Pull Request."
+	case strings.Contains(lower, "git commit") || strings.Contains(lower, "git push"):
+		return "Committing and pushing manifest changes."
+	case strings.Contains(lower, "git checkout") || strings.Contains(lower, "git switch") || strings.Contains(lower, "git branch"):
+		return "Preparing a feature branch in the GitOps repository."
+	case strings.Contains(lower, "git clone") || strings.Contains(lower, "git fetch") || strings.Contains(lower, "git pull"):
+		return "Cloning and syncing the GitOps repository."
+	case strings.Contains(lower, "git status") || strings.Contains(lower, "git diff") || strings.Contains(lower, "git log"):
+		return "Reviewing repository status and manifest diff."
+	case strings.Contains(lower, "kubectl get nodes") || strings.Contains(lower, "kubectl describe node"):
+		return "Checking Kubernetes node status and readiness."
+	case strings.Contains(lower, "kubectl get pods") || strings.Contains(lower, "kubectl describe pod") || strings.Contains(lower, "kubectl logs"):
+		return "Inspecting Kubernetes pods and workload health."
+	case strings.Contains(lower, "kubectl get deploy") || strings.Contains(lower, "replicas") || strings.Contains(lower, "scale"):
+		return "Inspecting deployment replica configuration."
+	case strings.Contains(lower, "kubectl"):
+		return "Querying Kubernetes cluster resources."
+	case strings.Contains(lower, "gcloud container clusters"):
+		return "Querying GKE cluster inventory."
+	case strings.Contains(lower, "sed ") || strings.Contains(lower, "awk ") || strings.Contains(lower, "yq ") || strings.Contains(lower, "python") || strings.Contains(lower, "cat "):
+		return "Inspecting and updating workload manifests."
+	default:
+		return "Running cluster and workspace diagnostics."
 	}
-	return label
 }
 
 // truncationMarker is the entry that stands for the calls the budget cut,

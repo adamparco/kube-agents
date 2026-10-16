@@ -61,6 +61,8 @@ const (
 	actionSessionEndAlias      = "end"
 	actionHelp                 = "help"
 	actionTranscript           = "transcript"
+	actionDebugOn              = "debug_on"
+	actionDebugOff             = "debug_off"
 	actionGet                  = "get"
 	actionStatus               = "status"
 	actionSteer                = "steer"
@@ -321,6 +323,17 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 			})
 		}
 		res := s.CallTool(callCtx, callParams.Name, callParams.Arguments)
+		if !res.IsError && len(res.Content) > 0 && (callParams.Meta.ConversationID != "" || callParams.Meta.ProgressToken != nil) {
+			txt := res.Content[0].Text
+			if wrapped, err := json.Marshal(map[string]any{
+				"_custom_tool_result": true,
+				"_version":            1,
+				"result":              txt,
+				"markdown":            txt,
+			}); err == nil {
+				res.Content[0].Text = string(wrapped)
+			}
+		}
 		return marshalRPCResult(req.ID, res)
 	case methodResourcesList:
 		return marshalRPCResult(req.ID, map[string]any{
@@ -539,6 +552,7 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		WaitTimeoutSeconds   int    `json:"wait_timeout_seconds"`
 		TimeoutSeconds       int    `json:"timeout_seconds"`
 		JetskiConversationID string `json:"jetski_conversation_id"`
+		Debug                bool   `json:"debug"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -568,9 +582,15 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		waitTimeout = time.Duration(args.TimeoutSeconds) * time.Second
 	}
 
+	debug := args.Debug || s.store.DebugMode()
+	turnCtx := ctx
+	if !debug {
+		turnCtx = WithoutProgressCallback(ctx)
+	}
+
 	msgText := firstNonEmptyStr(args.Message, args.Prompt)
-	outcome, err := sess.SendTurn(ctx, s.store, conv, msgText, args.Mode, waitTimeout)
-	md := FormatTurnOutcomeMarkdown(outcome)
+	outcome, err := sess.SendTurn(turnCtx, s.store, conv, msgText, args.Mode, waitTimeout)
+	md := FormatTurnOutcomeMarkdownWithOptions(outcome, debug)
 	return md, err
 }
 
@@ -580,6 +600,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		Alias        string `json:"alias"`
 		Conversation string `json:"conversation"`
 		Description  string `json:"description"`
+		Debug        bool   `json:"debug"`
 	}
 	if len(rawArgs) > 0 {
 		_ = json.Unmarshal(rawArgs, &args)
@@ -589,12 +610,14 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 	if action == "" {
 		action = actionList
 	}
+	debug := args.Debug || s.store.DebugMode()
 
 	switch action {
 	case actionList:
 		snap := s.store.Snapshot()
 		var sb strings.Builder
 		sb.WriteString("## 💬 Saved Kube-Agents Conversations & Sessions\n\n")
+		fmt.Fprintf(&sb, "- **Debug Mode (Tool Calls & Timings)**: `%v`\n\n", snap.DebugMode)
 		sb.WriteString("| Active | Alias | Console Token | Mode | Last Used | Description |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
 		aliases := make([]string, 0, len(snap.Conversations))
@@ -616,6 +639,18 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 				act, c.Alias, c.Token, mLabel, c.LastUsedAt.Format(time.RFC3339), firstNonEmptyStr(c.Description, "—"))
 		}
 		return sb.String(), nil
+
+	case actionDebugOn:
+		if err := s.store.SetDebugMode(true); err != nil {
+			return "", err
+		}
+		return "✅ Enabled `kube-agents` **Debug Mode** (`debugMode=true`). Tool call tables, timings, and task metadata will be shown.", nil
+
+	case actionDebugOff:
+		if err := s.store.SetDebugMode(false); err != nil {
+			return "", err
+		}
+		return "✅ Disabled `kube-agents` **Debug Mode** (`debugMode=false`). Thinking is collapsed by default and tool call tables/timings are hidden.", nil
 
 	case actionNew:
 		alias := strings.TrimSpace(targetAlias)
@@ -661,8 +696,12 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		case actionHelp:
 			cmd = cmdHelp
 		}
-		outcome, err := sess.SendTurn(ctx, s.store, conv, cmd, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdown(outcome), err
+		turnCtx := ctx
+		if !debug {
+			turnCtx = WithoutProgressCallback(ctx)
+		}
+		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmd, modeAuto, controlNoticeWait)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
 
 	case actionTranscript:
 		sess, err := s.ensureConnected(ctx)
@@ -681,14 +720,14 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		fmt.Fprintf(&sb, "## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
 		for i := len(tasks) - 1; i >= 0; i-- {
 			t := tasks[i]
-			fmt.Fprintf(&sb, "### Prompt: %s\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"))
-			sb.WriteString(FormatTaskRecordMarkdown(t, "Task"))
+			fmt.Fprintf(&sb, "### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
+			sb.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
 			sb.WriteString("\n---\n")
 		}
 		return sb.String(), nil
 
 	default:
-		return "", fmt.Errorf("unknown manage_session action %q (expected list, new, switch, session_on, session_off, status, help, transcript)", action)
+		return "", fmt.Errorf("unknown manage_session action %q (expected list, new, switch, session_on, session_off, debug_on, debug_off, status, help, transcript)", action)
 	}
 }
 
@@ -701,6 +740,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		OnlyActive         bool   `json:"only_active"`
 		Limit              int    `json:"limit"`
 		WaitTimeoutSeconds int    `json:"wait_timeout_seconds"`
+		Debug              bool   `json:"debug"`
 	}
 	if len(rawArgs) > 0 {
 		_ = json.Unmarshal(rawArgs, &args)
@@ -717,6 +757,11 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			action = actionList
 		}
 	}
+	debug := args.Debug || s.store.DebugMode()
+	turnCtx := ctx
+	if !debug {
+		turnCtx = WithoutProgressCallback(ctx)
+	}
 
 	switch action {
 	case actionGet:
@@ -725,7 +770,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		}
 		taskID := strings.TrimSpace(args.TaskID)
 		if args.WaitTimeoutSeconds > 0 {
-			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
+			waitCtx, cancel := context.WithTimeout(turnCtx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
 			sess.watchTask(taskID, 1)
 			_ = sess.waitForTaskAndDelegations(waitCtx, taskID)
 			sess.watchTask(taskID, -1)
@@ -736,14 +781,14 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			return "", fmt.Errorf("task %q not found on TASKS stream", args.TaskID)
 		}
 		var sb strings.Builder
-		sb.WriteString(FormatTaskRecordMarkdown(rec, "Task Detail"))
+		sb.WriteString(FormatTaskRecordMarkdownWithOptions(rec, "Task Detail", debug))
 		children := sess.findChildTasks(rec.TaskID)
 		for i, c := range children {
 			sb.WriteString("\n---\n")
-			sb.WriteString(FormatTaskRecordMarkdown(c, fmt.Sprintf("Delegated Child Task #%d", i+1)))
+			sb.WriteString(FormatTaskRecordMarkdownWithOptions(c, fmt.Sprintf("Delegated Child Task #%d", i+1), debug))
 			if wake := sess.findWakeTask(c.TaskID); wake != nil {
 				sb.WriteString("\n---\n")
-				sb.WriteString(FormatTaskRecordMarkdown(wake, "Session Wake Synthesis Task"))
+				sb.WriteString(FormatTaskRecordMarkdownWithOptions(wake, "Session Wake Synthesis Task", debug))
 			}
 		}
 		return sb.String(), nil
@@ -780,13 +825,13 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 
 	case actionStatus:
 		conv := s.resolveConvArg(args.Conversation)
-		outcome, err := sess.SendTurn(ctx, s.store, conv, cmdStatus, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdown(outcome), err
+		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStatus, modeAuto, controlNoticeWait)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
 
 	case actionStop, actionCancelAlias:
 		conv := s.resolveConvArg(args.Conversation)
-		outcome, err := sess.SendTurn(ctx, s.store, conv, cmdStop, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdown(outcome), err
+		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStop, modeAuto, controlNoticeWait)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
 
 	case actionSteer:
 		if strings.TrimSpace(args.Message) == "" {
@@ -797,8 +842,8 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		if args.WaitTimeoutSeconds > 0 {
 			waitTimeout = time.Duration(args.WaitTimeoutSeconds) * time.Second
 		}
-		outcome, err := sess.SendTurn(ctx, s.store, conv, args.Message, modeAuto, waitTimeout)
-		return FormatTurnOutcomeMarkdown(outcome), err
+		outcome, err := sess.SendTurn(turnCtx, s.store, conv, args.Message, modeAuto, waitTimeout)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
 
 	default:
 		return "", fmt.Errorf("unknown task_control action %q (expected get, list, status, steer, stop)", action)
@@ -1121,18 +1166,22 @@ func (s *Server) toolDefinitions() []mcpToolDefinition {
 						"type":        "string",
 						"description": "Optional active Jetski conversation UUID to bind for real-time agentapi push notifications.",
 					},
+					"debug": map[string]any{
+						"type":        "boolean",
+						"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
+					},
 				},
 			},
 		},
 		{
 			Name:        toolManageSession,
-			Description: "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, or view the conversation transcript.",
+			Description: "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, toggle debug mode on/off, or view the conversation transcript.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"action": map[string]any{
 						"type":        "string",
-						"enum":        []string{"list", "new", "switch", "session_on", "session_off", "transcript"},
+						"enum":        []string{"list", "new", "switch", "session_on", "session_off", "debug_on", "debug_off", "transcript"},
 						"description": "Session management action to perform.",
 					},
 					"alias": map[string]any{
@@ -1142,6 +1191,10 @@ func (s *Server) toolDefinitions() []mcpToolDefinition {
 					"description": map[string]any{
 						"type":        "string",
 						"description": "Optional human-readable description when creating or switching a conversation.",
+					},
+					"debug": map[string]any{
+						"type":        "boolean",
+						"description": "Optional debug flag (default: false) to include tool call tables and timings when viewing a transcript.",
 					},
 				},
 			},
@@ -1180,6 +1233,10 @@ func (s *Server) toolDefinitions() []mcpToolDefinition {
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
 						"description": "Optional seconds to wait (with live streaming progress) when action is 'get' or 'steer' on an in-flight task.",
+					},
+					"debug": map[string]any{
+						"type":        "boolean",
+						"description": "Optional debug mode (default: false). Set to true ONLY when the user explicitly asks to debug kube-agents itself (shows tool call tables, timings, and task metadata).",
 					},
 				},
 			},

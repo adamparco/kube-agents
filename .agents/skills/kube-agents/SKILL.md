@@ -32,13 +32,15 @@ Use **`send_message`** to execute turns on the remote `kube-agents` bus and stre
 - **`mode: "session"`**: Automatically spawns a dedicated interactive session worker pod (`session-<tok>`) via `/session` on `chat.console.<tok>.in` if none is active, then routes the prompt through `chat.console.<tok>.in`.
 - **`mode: "delegate"`**: Ensures a `/session` worker is active and prefixes the prompt with `delegate: ` so the session worker delegates heavy multi-step work to `platform`, tracks child task progress, and synthesizes the result via a `wake` turn.
 
-### Streaming & Rich Output
-Every `send_message` call streams real-time MCP `notifications/progress` frames directly into Jetski's tool card while in flight, and folds:
-1. **`thinking` (`lib.ArtifactThinking`)**: Step-by-step LLM reasoning and planned tool actions (`#### 💭 Agent Thinking`), rendered expanded and visible by default. Always preserve and display this thinking trace in your response to the user.
-2. **`activity` (`lib.ArtifactActivity`)**: Tool call execution table (`#### 🛠️ Tool Activity Stream` with `kubectl`, `gke`, `gh`, blackboard reads, durations, and safe schema keys). Always include this table in your response.
-3. **`progress` (`lib.ArtifactProgress`)**: Live `kube-agents.chat/v1` checklist and progress updates.
-4. **`delegate` (`lib.ArtifactDelegate`)**: Full delegation chain (`session task -> child platform task -> wake synthesis task`) rendered as a Mermaid flowchart.
-5. **`result` (`lib.ArtifactResult`)**: Structured `kube-agents.chat/v1` report (`headline`, `tone`, `rows`, `plan`, `fold`, `choices`, `links`).
+### Clean, Native UX (Collapsed Thinking by Default & Optional `debug` Mode)
+Every `send_message` call folds the remote turn into a clean, crisp native Jetski response:
+1. **Collapsed Thinking by Default (`lib.ArtifactThinking`)**:
+   - Thinking is formatted inside a **collapsed** `<details>\n<summary>Thought for Xs</summary>\n\n- ...\n\n</details>` block (never `<details open>`).
+   - Always preserve this collapsed `<details><summary>Thought for Xs</summary>...</details>` block at the top of your reply so it looks native to Jetski (`▸ Thought for Xs`) and expands only if the user clicks it.
+2. **Optional Debug Mode (`debug: false` by Default)**:
+   - By default (`debug: false`), tool call tables (`🛠️ Tool Activity Stream`), timings/durations, task/context IDs, and MCP `notifications/progress` tool-card expansion are **hidden** so the UI remains super clean and crisp.
+   - If the user asks to debug `kube-agents` itself (e.g., to see tool calls, durations, task IDs, or delegation flowcharts), pass `debug: true` on `send_message` / `task_control` or toggle persistent debug mode via `manage_session(action: "debug_on")` (and `action: "debug_off"` to turn it back off).
+3. **`result` (`lib.ArtifactResult`)**: Structured `kube-agents.chat/v1` report (`headline`, `tone`, `rows`, `plan`, `fold`, `choices`, `links`).
 
 ---
 

@@ -299,6 +299,7 @@ func TestBusSessionAndMCPServerEndToEnd(t *testing.T) {
 	}
 
 	// 5. Send message in session mode triggering thinking -> activity -> delegate -> child -> wake -> chat/v1 result!
+	// By default (debug == false), thinking is rendered collapsed (<details><summary>Thought...) and tool call tables/timings are hidden.
 	sendArgs, _ := json.Marshal(map[string]any{
 		"message":              "Check upgrade readiness and open a PR if needed",
 		"mode":                 modeSession,
@@ -310,25 +311,52 @@ func TestBusSessionAndMCPServerEndToEnd(t *testing.T) {
 	}
 	outText := sendRes.Content[0].Text
 	for _, expectedSnippet := range []string{
-		"session started",
-		"flowchart LR",
-		"Agent Thinking",
+		"<details>\n<summary>Thought",
 		"Analyzing cluster upgrade readiness",
-		"run_kubectl",
-		"Delegated Child Task #1",
-		"Session Wake Synthesis Task",
 		"Upgrade Readiness Confirmed & PR Opened",
 		testPRURL,
 	} {
 		if !strings.Contains(outText, expectedSnippet) {
-			t.Errorf("send_message output missing %q:\n%s", expectedSnippet, outText)
+			t.Errorf("send_message default output missing %q:\n%s", expectedSnippet, outText)
+		}
+	}
+	for _, hiddenByDefault := range []string{
+		"<details open>",
+		"Tool Activity Stream",
+		"run_kubectl",
+		"flowchart LR",
+	} {
+		if strings.Contains(outText, hiddenByDefault) {
+			t.Errorf("send_message default output should NOT contain %q when debug=false:\n%s", hiddenByDefault, outText)
 		}
 	}
 
-	// 6. Verify task_control 'get' on parent task shows the full chain.
-	tcRes := mcpSrv.CallTool(ctx, toolTaskControl, json.RawMessage(`{"action":"get","task_id":"`+testParentTaskID+`"}`))
-	if tcRes.IsError || !strings.Contains(tcRes.Content[0].Text, testWakeTaskID) {
+	// 6. Verify task_control 'get' with debug=true shows the full chain, tool calls, timings, and task IDs.
+	tcRes := mcpSrv.CallTool(ctx, toolTaskControl, json.RawMessage(`{"action":"get","task_id":"`+testParentTaskID+`","debug":true}`))
+	if tcRes.IsError {
 		t.Fatalf("task_control get failed: %s", tcRes.Content[0].Text)
+	}
+	debugText := tcRes.Content[0].Text
+	for _, expectedDebugSnippet := range []string{
+		testWakeTaskID,
+		"Tool Activity Stream",
+		"run_kubectl",
+		"85ms",
+		"Delegated Child Task #1",
+		"Session Wake Synthesis Task",
+	} {
+		if !strings.Contains(debugText, expectedDebugSnippet) {
+			t.Errorf("task_control debug=true output missing %q:\n%s", expectedDebugSnippet, debugText)
+		}
+	}
+	// Also test manage_session debug_on and debug_off toggles.
+	msDebugOn := mcpSrv.CallTool(ctx, toolManageSession, json.RawMessage(`{"action":"debug_on"}`))
+	if msDebugOn.IsError || !store.DebugMode() {
+		t.Fatalf("manage_session debug_on failed: %+v", msDebugOn)
+	}
+	msDebugOff := mcpSrv.CallTool(ctx, toolManageSession, json.RawMessage(`{"action":"debug_off"}`))
+	if msDebugOff.IsError || store.DebugMode() {
+		t.Fatalf("manage_session debug_off failed: %+v", msDebugOff)
 	}
 
 	// 7. Verify manage_session list, new, switch, transcript, and task_control list.
@@ -928,20 +956,54 @@ func TestProgressNotificationsAndAutoMetaBinding(t *testing.T) {
 	})
 	_ = mcpSrv.CallTool(ctx, toolConnectDeployment, connectArgs)
 
-	callLine := `{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check upgrade readiness","mode":"session","wait_timeout_seconds":10},"_meta":{"progressToken":"mcp-progress-77","antigravity.google/conversation_id":"conv-auto-bound-77"}}}` + "\n"
-	var stdioOut bytes.Buffer
-	if err := mcpSrv.ServeStdio(ctx, strings.NewReader(callLine), &stdioOut); err != nil {
-		t.Fatalf("ServeStdio: %v", err)
+	// 1. Default mode (debug=false): suppresses notifications/progress so Jetski's tool card stays collapsed by default,
+	// and wraps output in _custom_tool_result with collapsed <details><summary>Thought...</summary></details>.
+	callLineDefault := `{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check upgrade readiness","mode":"session","wait_timeout_seconds":10},"_meta":{"progressToken":"mcp-progress-77","antigravity.google/conversation_id":"conv-auto-bound-77"}}}` + "\n"
+	var stdioOutDefault bytes.Buffer
+	if err := mcpSrv.ServeStdio(ctx, strings.NewReader(callLineDefault), &stdioOutDefault); err != nil {
+		t.Fatalf("ServeStdio default: %v", err)
 	}
-	output := stdioOut.String()
-	if !strings.Contains(output, `"method":"notifications/progress"`) || !strings.Contains(output, `"progressToken":"mcp-progress-77"`) {
-		t.Fatalf("expected MCP notifications/progress frames in stdio output, got:\n%s", output)
+	outputDefault := stdioOutDefault.String()
+	if strings.Contains(outputDefault, `"method":"notifications/progress"`) {
+		t.Fatalf("expected NO notifications/progress frames when debug=false (keeps tool card collapsed), got:\n%s", outputDefault)
 	}
-	if !strings.Contains(output, "Thinking:") {
-		t.Fatalf("expected live Thinking stream in progress notification, got:\n%s", output)
+	if !strings.Contains(outputDefault, `_custom_tool_result`) {
+		t.Fatalf("expected _custom_tool_result wrapper in stdio output, got:\n%s", outputDefault)
 	}
 	if gotConv := store.ResolveJetskiConversationID(); gotConv != "conv-auto-bound-77" {
 		t.Fatalf("ResolveJetskiConversationID = %q, want conv-auto-bound-77", gotConv)
+	}
+
+	// 2. Debug mode (debug=true): emits live MCP notifications/progress frames with Thinking and Tool Activity.
+	srv2, nc2, _ := startEmbeddedJetStream(t)
+	startSimulatedGatewayAndWorkers(t, nc2)
+	store2, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config-2.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpSrv2, err := NewServer(ServerOptions{Store: store2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mcpSrv2.Close)
+	connectArgs2, _ := json.Marshal(map[string]any{
+		"deployment":      testClusterName,
+		"namespace":       testNamespace,
+		"direct_nats_url": srv2.ClientURL(),
+	})
+	_ = mcpSrv2.CallTool(ctx, toolConnectDeployment, connectArgs2)
+
+	callLineDebug := `{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check upgrade readiness","mode":"session","wait_timeout_seconds":10,"debug":true},"_meta":{"progressToken":"mcp-progress-78"}}}` + "\n"
+	var stdioOutDebug bytes.Buffer
+	if err := mcpSrv2.ServeStdio(ctx, strings.NewReader(callLineDebug), &stdioOutDebug); err != nil {
+		t.Fatalf("ServeStdio debug: %v", err)
+	}
+	outputDebug := stdioOutDebug.String()
+	if !strings.Contains(outputDebug, `"method":"notifications/progress"`) || !strings.Contains(outputDebug, `"progressToken":"mcp-progress-78"`) {
+		t.Fatalf("expected MCP notifications/progress frames in stdio output when debug=true, got:\n%s", outputDebug)
+	}
+	if !strings.Contains(outputDebug, "Task t-parent-101") || !strings.Contains(outputDebug, "Tool Activity Stream") {
+		t.Fatalf("expected live task progress and Tool Activity Stream when debug=true, got:\n%s", outputDebug)
 	}
 }
 

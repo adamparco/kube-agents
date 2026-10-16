@@ -92,6 +92,7 @@ type PushConfig struct {
 type PersistentConfig struct {
 	ActiveDeployment   string                       `json:"activeDeployment,omitempty"`
 	ActiveConversation string                       `json:"activeConversation,omitempty"`
+	DebugMode          bool                         `json:"debugMode,omitempty"`
 	Deployments        map[string]DeploymentProfile `json:"deployments"`
 	Conversations      map[string]ConversationEntry `json:"conversations"`
 	Push               PushConfig                   `json:"push"`
@@ -450,6 +451,24 @@ func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMod
 		}
 	}
 	return ConversationEntry{}, fmt.Errorf("conversation %q not found", target)
+}
+
+// DebugMode returns whether kube-agents debug output (tool call tables & timings) is enabled by default.
+func (s *ConfigStore) DebugMode() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.DebugMode
+}
+
+// SetDebugMode sets whether kube-agents debug output (tool call tables & timings) is enabled by default.
+func (s *ConfigStore) SetDebugMode(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.DebugMode = enabled
+	return s.saveLocked()
 }
 
 // UpdatePushConfig updates the bi-directional Jetski push configuration.
