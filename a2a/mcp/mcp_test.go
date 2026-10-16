@@ -906,6 +906,45 @@ func TestWireActivityObjectAndConsoleBoolEdit(t *testing.T) {
 	}
 }
 
+func TestProgressNotificationsAndAutoMetaBinding(t *testing.T) {
+	srv, nc, _ := startEmbeddedJetStream(t)
+	ctx := context.Background()
+	startSimulatedGatewayAndWorkers(t, nc)
+
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpSrv, err := NewServer(ServerOptions{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mcpSrv.Close)
+
+	connectArgs, _ := json.Marshal(map[string]any{
+		"deployment":      testClusterName,
+		"namespace":       testNamespace,
+		"direct_nats_url": srv.ClientURL(),
+	})
+	_ = mcpSrv.CallTool(ctx, toolConnectDeployment, connectArgs)
+
+	callLine := `{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check upgrade readiness","mode":"session","wait_timeout_seconds":10},"_meta":{"progressToken":"mcp-progress-77","antigravity.google/conversation_id":"conv-auto-bound-77"}}}` + "\n"
+	var stdioOut bytes.Buffer
+	if err := mcpSrv.ServeStdio(ctx, strings.NewReader(callLine), &stdioOut); err != nil {
+		t.Fatalf("ServeStdio: %v", err)
+	}
+	output := stdioOut.String()
+	if !strings.Contains(output, `"method":"notifications/progress"`) || !strings.Contains(output, `"progressToken":"mcp-progress-77"`) {
+		t.Fatalf("expected MCP notifications/progress frames in stdio output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "Thinking:") {
+		t.Fatalf("expected live Thinking stream in progress notification, got:\n%s", output)
+	}
+	if gotConv := store.ResolveJetskiConversationID(); gotConv != "conv-auto-bound-77" {
+		t.Fatalf("ResolveJetskiConversationID = %q, want conv-auto-bound-77", gotConv)
+	}
+}
+
 func publishTaskEnv(t *testing.T, nc *nats.Conn, subject string, env lib.Envelope) {
 	t.Helper()
 	raw, err := json.Marshal(env)

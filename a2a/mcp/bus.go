@@ -65,8 +65,9 @@ const (
 	controlNoticeWait            = 2500 * time.Millisecond
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
-	defaultTurnWaitTimeout       = 90 * time.Second
+	defaultTurnWaitTimeout       = 150 * time.Second
 	pollTickInterval             = 100 * time.Millisecond
+	progressHeartbeatInterval    = 2 * time.Second
 	natsConnectTimeout           = 10 * time.Second
 	natsReconnectWait            = 1 * time.Second
 	maxConsoleNoticesRetained    = 100
@@ -102,6 +103,30 @@ var (
 	}
 	errNotConnected = errors.New("not connected to any kube-agents deployment")
 )
+
+// ProgressCallback receives live progress updates (step number and formatted status text)
+// while an A2A turn is executing on the bus.
+type ProgressCallback func(step int, message string)
+
+type progressCallbackKey struct{}
+
+// WithProgressCallback attaches a live ProgressCallback to ctx.
+func WithProgressCallback(ctx context.Context, cb ProgressCallback) context.Context {
+	if cb == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, progressCallbackKey{}, cb)
+}
+
+func progressCallbackFromContext(ctx context.Context) ProgressCallback {
+	if ctx == nil {
+		return nil
+	}
+	if cb, ok := ctx.Value(progressCallbackKey{}).(ProgressCallback); ok {
+		return cb
+	}
+	return nil
+}
 
 // ConsoleInFrame is the wire payload published to chat.console.<token>.in.
 type ConsoleInFrame struct {
@@ -593,7 +618,12 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			chatMsg := extractChatMessage(art.Parts)
 			switch art.Name {
 			case lib.ArtifactThinking:
-				if au.Append {
+				if au.Append && rec.Thinking != "" && text != "" {
+					if !strings.HasSuffix(rec.Thinking, "\n") && !strings.HasPrefix(text, "\n") {
+						rec.Thinking += "\n"
+					}
+					rec.Thinking += text
+				} else if au.Append {
 					rec.Thinking += text
 				} else {
 					rec.Thinking = text
@@ -929,6 +959,10 @@ func (s *BusSession) SendTurn(ctx context.Context, store *ConfigStore, conv Conv
 		return nil, err
 	}
 
+	if cb := progressCallbackFromContext(ctx); cb != nil {
+		cb(1, fmt.Sprintf("📨 Sent message to kube-agents (`%s` / `console:%s`) — waiting for task acceptance on `TASKS`...", conv.Alias, conv.Token))
+	}
+
 	turnCtx, cancel := context.WithTimeout(ctx, waitTimeout)
 	defer cancel()
 
@@ -955,6 +989,10 @@ func (s *BusSession) SendTurn(ctx context.Context, store *ConfigStore, conv Conv
 		if wake := s.findWakeTask(child.TaskID); wake != nil {
 			outcome.WakeTask = wake
 		}
+	}
+
+	if cb := progressCallbackFromContext(ctx); cb != nil && outcome.PrimaryTask != nil {
+		cb(999, FormatLiveTaskProgress(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask, time.Since(outcome.PrimaryTask.CreatedAt)))
 	}
 
 	return outcome, nil
@@ -1086,10 +1124,35 @@ func (s *BusSession) waitForTaskAndDelegations(ctx context.Context, primaryID st
 func (s *BusSession) waitUntilTaskSettled(ctx context.Context, taskID string) bool {
 	ticker := time.NewTicker(pollTickInterval)
 	defer ticker.Stop()
+	cb := progressCallbackFromContext(ctx)
+	startedWait := time.Now()
+	lastEnvCount := -1
+	lastReportAt := time.Time{}
+	step := 1
 	for {
 		rec := s.GetTask(taskID)
-		if rec != nil && (rec.Terminal || rec.State == lib.StateInputRequired) {
-			return true
+		if rec != nil {
+			now := time.Now()
+			if cb != nil && (rec.EnvelopeCount != lastEnvCount || now.Sub(lastReportAt) >= progressHeartbeatInterval) {
+				step++
+				lastEnvCount = rec.EnvelopeCount
+				lastReportAt = now
+				elapsed := now.Sub(startedWait)
+				if !rec.CreatedAt.IsZero() && now.After(rec.CreatedAt) {
+					elapsed = now.Sub(rec.CreatedAt)
+				}
+				children := s.findChildTasks(taskID)
+				var wake *TaskRecord
+				for _, ch := range children {
+					if w := s.findWakeTask(ch.TaskID); w != nil {
+						wake = w
+					}
+				}
+				cb(step, FormatLiveTaskProgress(rec, children, wake, elapsed))
+			}
+			if rec.Terminal || rec.State == lib.StateInputRequired {
+				return true
+			}
 		}
 		select {
 		case <-ctx.Done():

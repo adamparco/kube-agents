@@ -358,7 +358,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
@@ -1327,5 +1327,61 @@ func TestServeActivity_CloseIsNotAStoppedDoor(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if strings.Contains(logs.String(), "activity door stopped") {
 		t.Fatalf("close logged a stopped door: %s", logs.String())
+	}
+}
+
+func TestActivity_PostAPIRequestBecomesThinkingArtifact(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+post("post_api_request", "", {}, {
+    "api_call_count": 1,
+    "finish_reason": "tool_calls",
+    "assistant_message": {
+        "content": "<think>Checking GKE cluster inventory first.</think>",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "mcp__gke__list_clusters",
+                    "arguments": json.dumps({"project_id": "my-proj", "token": "secret123"})
+                }
+            }
+        ]
+    }
+})
+call("mcp__gke__list_clusters", {"project_id": "my-proj"}, "call_1")
+post("post_api_request", "", {}, {
+    "api_call_count": 2,
+    "finish_reason": "stop",
+    "assistant_message": {
+        "content": "Here is the fleet summary."
+    }
+})
+print("Here is the fleet summary.")
+`), nil)
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-thinking", "list the fleet")
+	task := waitTerminal(t, c, "task-thinking")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	thinking := task.Artifact(lib.ArtifactThinking)
+	if thinking == nil || len(thinking.Parts) != 2 {
+		t.Fatalf("thinking artifact = %+v, want 2 parts", thinking)
+	}
+	first := thinking.Parts[0].Text
+	if !strings.Contains(first, "Step 1: Checking GKE cluster inventory first.") ||
+		!strings.Contains(first, "listing GKE clusters (mcp__gke__list_clusters) [project_id]") ||
+		strings.Contains(first, "secret123") || strings.Contains(first, "my-proj") {
+		t.Fatalf("first thinking part = %q", first)
+	}
+	second := thinking.Parts[1].Text
+	if !strings.Contains(second, "Step 2: Synthesizing findings from 1 completed tool call(s)") {
+		t.Fatalf("second thinking part = %q", second)
 	}
 }

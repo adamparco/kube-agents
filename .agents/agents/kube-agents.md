@@ -53,6 +53,7 @@ When selected as the custom agent in Jetski, your mission is to make the remote 
 * **Conversation & Task Control**:
   - Use `manage_session` (`new`, `switch`, `session_on`, `session_off`, `list`, `transcript`) when the user wants a fresh session, wants to switch threads, or toggles `/session`.
   - Use `task_control` (`get`, `list`, `status`, `steer`, `stop`) to inspect in-flight tasks, steer a running task with follow-up instructions, or cancel (`stop`) a task.
+  - **No Rapid Polling Loops**: `send_message` waits up to 150 seconds while streaming live `notifications/progress` frames (thinking & tool activity) directly into Jetski's UI. If a long-running task is still `working` when `send_message` returns, **do NOT loop** calling `task_control(get)` / `manage_session(transcript)` / `poll_events` without waiting. Either call `task_control(action: "get", task_id: "<id>", wait_timeout_seconds: 120)` (which waits and continues streaming live progress to the UI) or share the in-flight thinking & activity snapshot with the user and stop—the background `agentapi` push listener will automatically wake this conversation when the task finishes.
 * **Blackboard Topics & Agent Directory**:
   - Use `read_topics` (`list`, `read`, `cards`) to inspect standing state on `TOPICS-STATE` and `TOPICS-JOURNAL` (such as `upgrade-readiness`, `blueprint`, `annotations`) and registered `DIRECTORY` agent cards.
 
@@ -66,8 +67,7 @@ Whenever `kube-agents` opens, updates, or references a GitHub Pull Request (in `
 # Beautiful, Structured Jetski Formatting
 
 Present all `kube-agents` responses using rich Jetski Markdown:
-* Preserve collapsible `<details><summary>💭 <b>Agent Thinking</b> ...</summary>...</details>` blocks so the user can inspect the remote agent's reasoning without clutter.
-* Render the **Tool Activity Stream** table (`Tool`, `Status`, `Duration`, `Input Summary`) so every remote `kubectl`, `gke`, or `git` tool execution is transparent.
+* **Always Show Agent Thinking & Tool Activity**: Always include the **💭 Agent Thinking** trace (`#### 💭 Agent Thinking` block) and the **🛠️ Tool Activity Stream** table (`#`, `Tool`, `Status`, `Duration`, `Input Summary`) visibly in your response to the user—do **not** omit or hide the remote agent's thinking steps. Users want to see the step-by-step reasoning and tool execution alongside the final report.
 * When a turn involves delegation (`session -> platform -> wake`), include the Mermaid `flowchart LR` delegation diagram.
 * Render `kube-agents.chat/v1` structured payloads with GitHub alerts (`> [!TIP]`, `> [!WARNING]`, `> [!CAUTION]`, `> [!NOTE]`), severity tables (`✅`, `⚠️`, `❌`, `ℹ️`), execution plan checklists (`📋 Plan`), collapsible fold tables, and suggested follow-up choices.
 

@@ -257,15 +257,16 @@ func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
 	}
 	sb.WriteString("\n\n")
 
-	if strings.TrimSpace(rec.Thinking) != "" {
-		thinkingClean := strings.TrimSpace(rec.Thinking)
-		preview := truncateText(strings.ReplaceAll(thinkingClean, "\n", " "), thinkingPreviewChars)
-		sb.WriteString("<details>\n")
-		fmt.Fprintf(&sb, "<summary>💭 <b>Agent Thinking</b> — <i>%s</i></summary>\n\n", preview)
-		for _, line := range strings.Split(thinkingClean, "\n") {
+	thinkingText := strings.TrimSpace(rec.Thinking)
+	if thinkingText == "" {
+		thinkingText = SynthesizeThinkingFromActivities(rec)
+	}
+	if thinkingText != "" {
+		sb.WriteString("#### 💭 Agent Thinking\n\n")
+		for _, line := range strings.Split(thinkingText, "\n") {
 			fmt.Fprintf(&sb, "> %s\n", line)
 		}
-		sb.WriteString("\n</details>\n\n")
+		sb.WriteString("\n")
 	}
 
 	if len(rec.Activities) > 0 {
@@ -341,6 +342,103 @@ func FormatTaskRecordMarkdown(rec *TaskRecord, titlePrefix string) string {
 	}
 
 	return sb.String()
+}
+
+// SynthesizeThinkingFromActivities builds a human-readable thinking trace when a task
+// executed tool calls or progress updates without explicit thinking artifact chunks.
+func SynthesizeThinkingFromActivities(rec *TaskRecord) string {
+	if rec == nil {
+		return ""
+	}
+	var lines []string
+	for i, act := range rec.Activities {
+		dur := ""
+		if act.DurationMs > 0 {
+			dur = fmt.Sprintf(" (%dms)", act.DurationMs)
+		}
+		status := act.Status
+		if status == "" {
+			status = "completed"
+		}
+		lines = append(lines, fmt.Sprintf("Step %d: Executed `%s` [%s%s]", i+1, act.Tool, status, dur))
+	}
+	if prog := strings.TrimSpace(rec.ProgressText); prog != "" {
+		lines = append(lines, "Progress: "+prog)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// FormatLiveTaskProgress renders a concise live streaming status message suitable for
+// MCP notifications/progress frames in Jetski's UI while a turn is in flight.
+func FormatLiveTaskProgress(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord, elapsed time.Duration) string {
+	if primary == nil {
+		return "⏳ Waiting for kube-agents task..."
+	}
+	var sb strings.Builder
+	rounded := elapsed.Round(time.Second)
+	if rounded < time.Second {
+		rounded = time.Second
+	}
+	fmt.Fprintf(&sb, "⏳ Task %s → %s (%s, %s elapsed)", primary.TaskID, primary.Addressee, primary.State, rounded)
+
+	thinking := strings.TrimSpace(primary.Thinking)
+	if thinking == "" {
+		thinking = SynthesizeThinkingFromActivities(primary)
+	}
+	if thinking != "" {
+		lines := strings.Split(thinking, "\n")
+		if len(lines) > 6 {
+			lines = lines[len(lines)-6:]
+		}
+		sb.WriteString("\n💭 Thinking:\n")
+		for _, l := range lines {
+			l = strings.TrimSpace(l)
+			if l != "" {
+				fmt.Fprintf(&sb, "  • %s\n", l)
+			}
+		}
+	}
+
+	if len(primary.Activities) > 0 {
+		fmt.Fprintf(&sb, "\n🛠️ Tool Activity (%d call(s)):\n", len(primary.Activities))
+		startIdx := 0
+		if len(primary.Activities) > 4 {
+			startIdx = len(primary.Activities) - 4
+		}
+		for i := startIdx; i < len(primary.Activities); i++ {
+			act := primary.Activities[i]
+			icon := "✓"
+			if act.Status == "error" || act.Status == "interrupted" {
+				icon = "✗"
+			}
+			dur := ""
+			if act.DurationMs > 0 {
+				dur = fmt.Sprintf(" (%dms)", act.DurationMs)
+			}
+			fmt.Fprintf(&sb, "  %s #%d %s%s\n", icon, i+1, act.Tool, dur)
+		}
+	}
+
+	if prog := strings.TrimSpace(primary.ProgressText); prog != "" && !strings.Contains(thinking, prog) {
+		fmt.Fprintf(&sb, "\n📡 Progress: %s\n", prog)
+	}
+
+	for i, child := range children {
+		fmt.Fprintf(&sb, "\n🔀 Delegated Child #%d: %s → %s (%s)", i+1, child.TaskID, child.Addressee, child.State)
+		if childThinking := strings.TrimSpace(child.Thinking); childThinking != "" {
+			cLines := strings.Split(childThinking, "\n")
+			fmt.Fprintf(&sb, " — %s", cLines[len(cLines)-1])
+		} else if len(child.Activities) > 0 {
+			lastAct := child.Activities[len(child.Activities)-1]
+			fmt.Fprintf(&sb, " — %d tool call(s), last: %s", len(child.Activities), lastAct.Tool)
+		}
+	}
+
+	if wake != nil {
+		fmt.Fprintf(&sb, "\n🌅 Wake Synthesis: %s → %s (%s)", wake.TaskID, wake.Addressee, wake.State)
+	}
+
+	return strings.TrimSpace(sb.String())
 }
 
 // FormatChatMessageMarkdown renders a structured kube-agents.chat/v1 Message into rich Jetski Markdown.

@@ -33,9 +33,9 @@ Use **`send_message`** to execute turns on the remote `kube-agents` bus and stre
 - **`mode: "delegate"`**: Ensures a `/session` worker is active and prefixes the prompt with `delegate: ` so the session worker delegates heavy multi-step work to `platform`, tracks child task progress, and synthesizes the result via a `wake` turn.
 
 ### Streaming & Rich Output
-Every `send_message` call streams and folds:
-1. **`thinking` (`lib.ArtifactThinking`)**: Rendered in collapsible `<details>` blocks.
-2. **`activity` (`lib.ArtifactActivity`)**: Tool call execution table (`kubectl`, `gh`, blackboard reads, etc.).
+Every `send_message` call streams real-time MCP `notifications/progress` frames directly into Jetski's tool card while in flight, and folds:
+1. **`thinking` (`lib.ArtifactThinking`)**: Step-by-step LLM reasoning and planned tool actions (`#### 💭 Agent Thinking`), rendered expanded and visible by default. Always preserve and display this thinking trace in your response to the user.
+2. **`activity` (`lib.ArtifactActivity`)**: Tool call execution table (`#### 🛠️ Tool Activity Stream` with `kubectl`, `gke`, `gh`, blackboard reads, durations, and safe schema keys). Always include this table in your response.
 3. **`progress` (`lib.ArtifactProgress`)**: Live `kube-agents.chat/v1` checklist and progress updates.
 4. **`delegate` (`lib.ArtifactDelegate`)**: Full delegation chain (`session task -> child platform task -> wake synthesis task`) rendered as a Mermaid flowchart.
 5. **`result` (`lib.ArtifactResult`)**: Structured `kube-agents.chat/v1` report (`headline`, `tone`, `rows`, `plan`, `fold`, `choices`, `links`).
@@ -45,15 +45,15 @@ Every `send_message` call streams and folds:
 ## 3. Session Lifecycle & Live Task Control
 
 - **`manage_session`**:
-  - `action: "start"`: Spawn a persistent `/session` worker pod (`session-<tok>`).
-  - `action: "end"`: Gracefully terminate the `/session` worker (`/end`).
-  - `action: "new"`: Rotate the conversation token and start a fresh session.
-  - `action: "status"`: Replay the latest task status from the gateway (`status`).
-  - `action: "help"`: Query gateway control commands (`help`).
+  - `action: "session_on"`: Spawn a persistent `/session` worker pod (`s-<id>`).
+  - `action: "session_off"`: Gracefully terminate the `/session` worker (`/session off`).
+  - `action: "new"` / `"switch"`: Create or switch to a named conversation alias.
+  - `action: "list"` / `"transcript"`: List conversations or view the full conversation transcript.
 - **`task_control`**:
   - `action: "steer"`: Inject a mid-flight steering instruction into a running task (`steer <message>`).
-  - `action: "cancel"`: Cancel the active task on the gateway or `a2a.ctrl.<agent>.<task>`.
-  - `action: "get"` / `"list"`: Inspect full folded task state or list recent tasks on `TASKS`.
+  - `action: "stop"`: Cancel the active task on the gateway or `a2a.ctrl.<agent>.<task>`.
+  - `action: "get"` / `"list"` / `"status"`: Inspect full folded task state (`get` supports `wait_timeout_seconds` to wait and stream live `notifications/progress` frames until the task settles), list recent tasks on `TASKS`, or trigger a gateway `status` replay.
+  - **Important**: Never spin in a rapid polling loop calling `task_control(get)` without `wait_timeout_seconds`. If a task is still running after `send_message`, pass `wait_timeout_seconds: 120` to `task_control(action: "get")` or rely on reactive `agentapi` push wakeups.
 
 ---
 

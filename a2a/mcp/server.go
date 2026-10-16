@@ -20,6 +20,7 @@ const (
 	mcpServerVersion           = "0.4.0"
 	methodInitialize           = "initialize"
 	methodInitialized          = "notifications/initialized"
+	methodProgressNotification = "notifications/progress"
 	methodPing                 = "ping"
 	methodToolsList            = "tools/list"
 	methodToolsCall            = "tools/call"
@@ -128,9 +129,32 @@ type Server struct {
 	apiBaseURL string
 	dispatcher *PushDispatcher
 
-	mu      sync.Mutex
-	session *BusSession
-	writeMu sync.Mutex
+	mu        sync.Mutex
+	session   *BusSession
+	writeMu   sync.Mutex
+	notifyOut io.Writer
+}
+
+type rpcCallToolMeta struct {
+	ProgressToken  any    `json:"progressToken,omitempty"`
+	ConversationID string `json:"antigravity.google/conversation_id,omitempty"`
+	ArtifactsDir   string `json:"antigravity.google/artifacts_dir,omitempty"`
+}
+
+type callMetaContextKey struct{}
+
+func withCallMeta(ctx context.Context, meta rpcCallToolMeta) context.Context {
+	return context.WithValue(ctx, callMetaContextKey{}, meta)
+}
+
+func callMetaFromContext(ctx context.Context) rpcCallToolMeta {
+	if ctx == nil {
+		return rpcCallToolMeta{}
+	}
+	if m, ok := ctx.Value(callMetaContextKey{}).(rpcCallToolMeta); ok {
+		return m
+	}
+	return rpcCallToolMeta{}
 }
 
 // NewServer constructs a new kube-agents MCP server.
@@ -172,6 +196,17 @@ func (s *Server) Close() {
 
 // ServeStdio reads newline-delimited JSON-RPC 2.0 requests from r and writes responses to w.
 func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error {
+	s.writeMu.Lock()
+	s.notifyOut = w
+	s.writeMu.Unlock()
+	defer func() {
+		s.writeMu.Lock()
+		if s.notifyOut == w {
+			s.notifyOut = nil
+		}
+		s.writeMu.Unlock()
+	}()
+
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, scannerInitialBufSize), scannerMaxBufSize)
 	for scanner.Scan() {
@@ -194,6 +229,32 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 		}
 	}
 	return scanner.Err()
+}
+
+// emitProgress writes an MCP notifications/progress JSON-RPC frame to the active stdio writer
+// when a progressToken was provided by the client.
+func (s *Server) emitProgress(progressToken any, step int, message string) {
+	if progressToken == nil || strings.TrimSpace(message) == "" {
+		return
+	}
+	frame, err := json.Marshal(map[string]any{
+		"jsonrpc": jsonRPCVersion,
+		"method":  methodProgressNotification,
+		"params": map[string]any{
+			"progressToken": progressToken,
+			"progress":      step,
+			"total":         0,
+			"message":       message,
+		},
+	})
+	if err != nil {
+		return
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.notifyOut != nil {
+		_, _ = fmt.Fprintf(s.notifyOut, "%s\n", frame)
+	}
 }
 
 // HandleJSONRPC processes a single JSON-RPC 2.0 request frame and returns the marshaled response
@@ -243,11 +304,23 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		var callParams struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
+			Meta      rpcCallToolMeta `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &callParams); err != nil || callParams.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, "tools/call requires tool name")
 		}
-		res := s.CallTool(ctx, callParams.Name, callParams.Arguments)
+		if callParams.Meta.ConversationID != "" && s.store != nil {
+			enabled := true
+			_, _ = s.store.UpdatePushConfig(callParams.Meta.ConversationID, &enabled, "")
+		}
+		callCtx := withCallMeta(ctx, callParams.Meta)
+		if callParams.Meta.ProgressToken != nil {
+			token := callParams.Meta.ProgressToken
+			callCtx = WithProgressCallback(callCtx, func(step int, message string) {
+				s.emitProgress(token, step, message)
+			})
+		}
+		res := s.CallTool(callCtx, callParams.Name, callParams.Arguments)
 		return marshalRPCResult(req.ID, res)
 	case methodResourcesList:
 		return marshalRPCResult(req.ID, map[string]any{
@@ -650,7 +723,15 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		if strings.TrimSpace(args.TaskID) == "" {
 			return "", errors.New("task_control action 'get' requires task_id")
 		}
-		rec := sess.GetTask(strings.TrimSpace(args.TaskID))
+		taskID := strings.TrimSpace(args.TaskID)
+		if args.WaitTimeoutSeconds > 0 {
+			waitCtx, cancel := context.WithTimeout(ctx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
+			sess.watchTask(taskID, 1)
+			_ = sess.waitForTaskAndDelegations(waitCtx, taskID)
+			sess.watchTask(taskID, -1)
+			cancel()
+		}
+		rec := sess.GetTask(taskID)
 		if rec == nil {
 			return "", fmt.Errorf("task %q not found on TASKS stream", args.TaskID)
 		}
@@ -781,7 +862,13 @@ func (s *Server) handleInspectPR(ctx context.Context, rawArgs json.RawMessage) (
 			defaultRepo = prof.GitHubRepo
 		}
 	}
-	insp, err := InspectPullRequest(ctx, s.runner, s.apiBaseURL, args.PR, defaultRepo, args.OutputDir)
+	outputDir := strings.TrimSpace(args.OutputDir)
+	if outputDir == "" {
+		if meta := callMetaFromContext(ctx); meta.ArtifactsDir != "" {
+			outputDir = meta.ArtifactsDir
+		}
+	}
+	insp, err := InspectPullRequest(ctx, s.runner, s.apiBaseURL, args.PR, defaultRepo, outputDir)
 	if err != nil {
 		return "", err
 	}
@@ -1028,7 +1115,7 @@ func (s *Server) toolDefinitions() []mcpToolDefinition {
 					},
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Seconds to wait for task completion before returning a live progress snapshot (default: 90). Background push remains armed if the task continues running.",
+						"description": "Seconds to wait for task completion while live-streaming thinking & tool progress before returning a snapshot (default: 150). Background push remains armed if the task continues running.",
 					},
 					"jetski_conversation_id": map[string]any{
 						"type":        "string",
@@ -1089,6 +1176,10 @@ func (s *Server) toolDefinitions() []mcpToolDefinition {
 					"limit": map[string]any{
 						"type":        "integer",
 						"description": "Maximum number of tasks to return when action is 'list' (default: 20).",
+					},
+					"wait_timeout_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Optional seconds to wait (with live streaming progress) when action is 'get' or 'steer' on an in-flight task.",
 					},
 				},
 			},

@@ -190,9 +190,16 @@ const (
 
 	hookPreToolCall     = "pre_tool_call"
 	hookPostToolCall    = "post_tool_call"
+	hookPostAPIRequest  = "post_api_request"
 	hookSignatureHeader = "X-Hermes-Signature-256"
 	hookSignaturePrefix = "sha256="
 	hookStatusOK        = "ok"
+
+	// activityThinkingCap bounds one thinking chunk published from a
+	// post_api_request delivery, and activityThinkingBudget bounds how many
+	// thinking parts one task may publish onto its events subject.
+	activityThinkingCap    = 4096
+	activityThinkingBudget = 256
 
 	// Statuses on the activity entry. completed and error are the api path's
 	// vocabulary; interrupted is a call whose end never arrived before the
@@ -382,10 +389,14 @@ type hookDelivery struct {
 	// payload; the door attributes an API-executor delivery by it.
 	SessionID string `json:"session_id"`
 	Extra     struct {
-		ToolCallID string      `json:"tool_call_id"`
-		DurationMs json.Number `json:"duration_ms"`
-		Status     string      `json:"status"`
-		ErrorType  string      `json:"error_type"`
+		ToolCallID       string          `json:"tool_call_id"`
+		DurationMs       json.Number     `json:"duration_ms"`
+		Status           string          `json:"status"`
+		ErrorType        string          `json:"error_type"`
+		FinishReason     string          `json:"finish_reason"`
+		APICallCount     json.Number     `json:"api_call_count"`
+		AssistantMessage json.RawMessage `json:"assistant_message"`
+		Response         json.RawMessage `json:"response"`
 	} `json:"extra"`
 }
 
@@ -414,6 +425,10 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.FinishReason = lenientString(extra["finish_reason"])
+	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
+	d.Extra.AssistantMessage = extra["assistant_message"]
+	d.Extra.Response = extra["response"]
 	return nil
 }
 
@@ -478,13 +493,16 @@ type activityState struct {
 	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
 	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
 	seenNext   int
-	calls      int
-	published  int // trace parts sent, against the budget less the reserve
-	heartbeats int // progress parts sent, against the reserve
-	dropped    int // calls past the trace's share, reported once at the terminal
-	lastTool   string
-	startedAt  time.Time
-	appended   map[string]bool // artifact name -> a first part went out
+	calls             int
+	apiCalls          int
+	published         int // trace parts sent, against the budget less the reserve
+	heartbeats        int // progress parts sent, against the reserve
+	thinkingPublished int // thinking parts sent, against activityThinkingBudget
+	dropped           int // calls past the trace's share, reported once at the terminal
+	lastTool          string
+	lastThinking      string
+	startedAt         time.Time
+	appended          map[string]bool // artifact name -> a first part went out
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -601,6 +619,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.lastThinking = ""
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
 			return ActivityEntry{}, false
@@ -616,8 +635,14 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
+	if d.ToolName != "" {
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
+	}
 	switch d.Event {
+	case hookPostAPIRequest:
+		a.apiCalls++
+		a.lastThinking = formatAPIRequestThinking(d, a.apiCalls, a.calls)
+		return ActivityEntry{}, false
 	case hookPreToolCall:
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
@@ -727,6 +752,249 @@ func (a *activityState) heartbeatUnderBudget() bool {
 		return true
 	}
 	return false
+}
+
+// takeThinking returns the thinking text observed on the last delivery (if any)
+// and clears it.
+func (a *activityState) takeThinking() (string, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t := strings.TrimSpace(a.lastThinking)
+	a.lastThinking = ""
+	if t == "" {
+		return "", false
+	}
+	return t, true
+}
+
+// thinkingUnderBudget bounds the thinking parts published for one task.
+func (a *activityState) thinkingUnderBudget() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.thinkingPublished < activityThinkingBudget {
+		a.thinkingPublished++
+		return true
+	}
+	return false
+}
+
+var (
+	thinkTagPattern      = regexp.MustCompile(`(?is)<think>(.*?)</think>`)
+	scratchpadTagPattern = regexp.MustCompile(`(?is)<REASONING_SCRATCHPAD>(.*?)</REASONING_SCRATCHPAD>`)
+)
+
+type hookAssistantMessage struct {
+	Content                string          `json:"content"`
+	ReasoningContent       string          `json:"reasoning_content"`
+	Reasoning              string          `json:"reasoning"`
+	ReasoningDetails       json.RawMessage `json:"reasoning_details"`
+	AnthropicContentBlocks json.RawMessage `json:"anthropic_content_blocks"`
+	ToolCalls              []struct {
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		Function struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"function"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"tool_calls"`
+}
+
+func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) string {
+	step := fallbackStep
+	if n := durationMillis(d.Extra.APICallCount); n > 0 {
+		step = int(n)
+	}
+	var msg hookAssistantMessage
+	rawMsg := d.Extra.AssistantMessage
+	if trimmedRaw := strings.TrimSpace(string(rawMsg)); trimmedRaw == "" || trimmedRaw == "null" {
+		var resp struct {
+			AssistantMessage json.RawMessage `json:"assistant_message"`
+		}
+		if json.Unmarshal(d.Extra.Response, &resp) == nil && len(resp.AssistantMessage) > 0 {
+			rawMsg = resp.AssistantMessage
+		}
+	}
+	if len(rawMsg) > 0 {
+		_ = json.Unmarshal(rawMsg, &msg)
+	}
+
+	var reasoningParts []string
+	addReasoning := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		for _, existing := range reasoningParts {
+			if existing == s || strings.Contains(existing, s) {
+				return
+			}
+		}
+		reasoningParts = append(reasoningParts, s)
+	}
+
+	addReasoning(msg.ReasoningContent)
+	addReasoning(msg.Reasoning)
+
+	if len(msg.ReasoningDetails) > 0 {
+		var details []map[string]any
+		if json.Unmarshal(msg.ReasoningDetails, &details) == nil {
+			for _, item := range details {
+				if txt, ok := item["text"].(string); ok {
+					addReasoning(txt)
+				}
+				if sum, ok := item["summary"].(string); ok {
+					addReasoning(sum)
+				}
+			}
+		}
+	}
+
+	if len(msg.AnthropicContentBlocks) > 0 {
+		var blocks []struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+			Text     string `json:"text"`
+		}
+		if json.Unmarshal(msg.AnthropicContentBlocks, &blocks) == nil {
+			for _, blk := range blocks {
+				if blk.Type == "thinking" {
+					addReasoning(blk.Thinking)
+				}
+			}
+		}
+	}
+
+	content := msg.Content
+	for _, re := range []*regexp.Regexp{thinkTagPattern, scratchpadTagPattern} {
+		matches := re.FindAllStringSubmatch(content, -1)
+		for _, m := range matches {
+			if len(m) > 1 {
+				addReasoning(m[1])
+			}
+		}
+		content = re.ReplaceAllString(content, "")
+	}
+	content = strings.TrimSpace(content)
+	if content != "" && (d.Extra.FinishReason == "tool_calls" || len(msg.ToolCalls) > 0) {
+		addReasoning(content)
+	}
+
+	var plannedTools []string
+	for _, tc := range msg.ToolCalls {
+		name := strings.TrimSpace(tc.Function.Name)
+		if name == "" {
+			name = strings.TrimSpace(tc.Name)
+		}
+		argsRaw := tc.Function.Arguments
+		if len(argsRaw) == 0 {
+			argsRaw = tc.Arguments
+		}
+		for _, expanded := range expandPlannedToolCall(name, argsRaw) {
+			plannedTools = append(plannedTools, expanded)
+		}
+	}
+
+	explicit := strings.Join(reasoningParts, "\n")
+	var out string
+	switch {
+	case explicit != "" && len(plannedTools) > 0:
+		out = fmt.Sprintf("Step %d: %s\n→ Action: %s", step, explicit, strings.Join(plannedTools, "; "))
+	case explicit != "":
+		out = fmt.Sprintf("Step %d: %s", step, explicit)
+	case len(plannedTools) > 0:
+		out = fmt.Sprintf("Step %d: Planning & executing %d tool call(s) — %s", step, len(plannedTools), strings.Join(plannedTools, "; "))
+	case d.Extra.FinishReason == "stop" && (step > 1 || completedTools > 0):
+		out = fmt.Sprintf("Step %d: Synthesizing findings from %d completed tool call(s) into final response.", step, completedTools)
+	default:
+		return ""
+	}
+	return capRunes(out, activityThinkingCap)
+}
+
+func expandPlannedToolCall(toolName string, argsRaw json.RawMessage) []string {
+	toolName = capRunes(strings.TrimSpace(toolName), activityToolNameCap)
+	if toolName == "" {
+		return nil
+	}
+	parsed := decodeToolArgsMap(argsRaw)
+	if toolName == hermesToolCallWrapper && parsed != nil {
+		if calls, ok := parsed[wrapperCallsKey].([]any); ok && len(calls) > 0 {
+			var out []string
+			for _, item := range calls {
+				cm, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				subName, _ := cm[wrapperCallNameKey].(string)
+				subName = capRunes(strings.TrimSpace(subName), activityToolNameCap)
+				if subName == "" || subName == redactedValue {
+					continue
+				}
+				subArgs, _ := cm[wrapperCallArgsKey].(map[string]any)
+				out = append(out, describePlannedTool(subName, safeSchemaKeysFromMap(subArgs)))
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return []string{describePlannedTool(toolName, safeSchemaKeysFromMap(parsed))}
+}
+
+func decodeToolArgsMap(raw json.RawMessage) map[string]any {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var asString string
+	if json.Unmarshal(raw, &asString) == nil {
+		trimmed = strings.TrimSpace(asString)
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(trimmed), &m) != nil {
+		return nil
+	}
+	return m
+}
+
+func safeSchemaKeysFromMap(m map[string]any) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	var keys []string
+	for k := range m {
+		if schemaKeyPattern.MatchString(k) && !tokenShapedKey(k) && !secretLookingKey(k) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	if len(keys) > 6 {
+		keys = keys[:6]
+	}
+	return keys
+}
+
+func describePlannedTool(toolName string, safeKeys []string) string {
+	label := toolName
+	switch {
+	case toolName == "mcp__gke__list_clusters":
+		label = "listing GKE clusters (" + toolName + ")"
+	case toolName == "mcp__gke__get_cluster":
+		label = "inspecting GKE cluster details (" + toolName + ")"
+	case strings.HasPrefix(toolName, "mcp__gke__"):
+		label = "querying GKE MCP (" + toolName + ")"
+	case toolName == "terminal" || toolName == "kubectl":
+		label = "running cluster/shell diagnostic (" + toolName + ")"
+	case strings.HasPrefix(toolName, "kanban_"):
+		label = "updating/querying Kanban board (" + toolName + ")"
+	case toolName == "read_file" || toolName == "search_files" || toolName == "list_dir":
+		label = "inspecting workspace files (" + toolName + ")"
+	}
+	if len(safeKeys) > 0 {
+		label += " [" + strings.Join(safeKeys, ", ") + "]"
+	}
+	return label
 }
 
 // truncationMarker is the entry that stands for the calls the budget cut,
@@ -1057,7 +1325,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
 		"url":        b.ActivityURL(),
-		"events":     []any{hookPreToolCall, hookPostToolCall},
+		"events":     []any{hookPreToolCall, hookPostToolCall, hookPostAPIRequest},
 		"secret_env": ActivitySecretEnv,
 		"timeout":    hookTimeoutSeconds,
 	})
@@ -1260,7 +1528,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
 	run.mu.Lock()
-	if entry, ok := act.observe(d); ok {
+	entry, ok := act.observe(d)
+	if thinking, hasThinking := act.takeThinking(); hasThinking {
+		if run.state == stateRunning && act.thinkingUnderBudget() {
+			b.publishArtifactPart(run, lib.ArtifactThinking, lib.Part{Kind: "text", Text: thinking})
+		}
+	}
+	if ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {
