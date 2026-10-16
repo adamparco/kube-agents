@@ -1061,6 +1061,14 @@ func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 		return "Updating task status on the Kanban board."
 	case toolName == "read_file" || toolName == "search_files" || toolName == "list_dir":
 		return "Inspecting files in the workspace."
+	case toolName == "tool_search":
+		return "Searching available tools."
+	case toolName == "tool_describe":
+		return "Inspecting tool schema."
+	case toolName == "execute_code":
+		return "Running analysis script."
+	case toolName == "skill_view":
+		return "Loading skill instructions."
 	default:
 		return "Running " + toolName + "."
 	}

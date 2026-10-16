@@ -343,19 +343,33 @@ func formatCleanTurnOutcomeMarkdown(outcome *TurnOutcome) string {
 	return strings.TrimSpace(sb.String()) + "\n"
 }
 
+func hasStructuredChatContent(cm *chatmsg.Message) bool {
+	if cm == nil {
+		return false
+	}
+	return strings.TrimSpace(cm.Detail) != "" ||
+		len(cm.Rows) > 0 ||
+		cm.Plan != nil ||
+		cm.Fold != nil ||
+		len(cm.Choices) > 0 ||
+		len(cm.Links) > 0 ||
+		(cm.Tone != "" && cm.Tone != "neutral")
+}
+
 func renderTaskAnswerBody(rec *TaskRecord) string {
 	if rec == nil {
 		return ""
 	}
 	var sb strings.Builder
-	if rec.ResultChat != nil || strings.TrimSpace(rec.ResultText) != "" {
-		if rec.ResultChat != nil {
+	plain := strings.TrimSpace(rec.ResultText)
+	if rec.ResultChat != nil || plain != "" {
+		if rec.ResultChat != nil && (hasStructuredChatContent(rec.ResultChat) || plain == "") {
 			sb.WriteString(FormatChatMessageMarkdown(rec.ResultChat))
-			if strings.TrimSpace(rec.ResultText) != "" && rec.ResultChat.Detail == "" && len(rec.ResultChat.Rows) == 0 {
-				fmt.Fprintf(&sb, "\n%s\n", strings.TrimSpace(rec.ResultText))
+			if plain != "" && rec.ResultChat.Detail == "" && len(rec.ResultChat.Rows) == 0 {
+				fmt.Fprintf(&sb, "\n%s\n", plain)
 			}
 		} else {
-			fmt.Fprintf(&sb, "%s\n", strings.TrimSpace(rec.ResultText))
+			fmt.Fprintf(&sb, "%s\n", plain)
 		}
 	} else if !rec.Terminal && (rec.ProgressChat != nil || strings.TrimSpace(rec.ProgressText) != "") {
 		if rec.ProgressChat != nil {
@@ -434,6 +448,14 @@ func cleanAndDedupeThinking(raw string) []string {
 			line = "Updating task status on the Kanban board."
 		case strings.Contains(line, "inspecting workspace files"):
 			line = "Inspecting files in the workspace."
+		case line == "Running tool_search.":
+			line = "Searching available tools."
+		case line == "Running tool_describe.":
+			line = "Inspecting tool schema."
+		case line == "Running execute_code.":
+			line = "Running analysis script."
+		case line == "Running skill_view.":
+			line = "Loading skill instructions."
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
