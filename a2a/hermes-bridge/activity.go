@@ -1051,7 +1051,11 @@ func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 		return "Inspecting GKE cluster configuration."
 	case strings.HasPrefix(toolName, "mcp__gke__"):
 		return "Querying GKE cluster state."
-	case toolName == "terminal" || toolName == "kubectl":
+	case toolName == "mcp__platform_control__list_cluster_profiles":
+		return "Listing GKE cluster profiles in the fleet."
+	case strings.HasPrefix(toolName, "mcp__platform_control__"):
+		return "Querying platform control state."
+	case toolName == "terminal" || toolName == "kubectl" || toolName == "run_kubectl" || toolName == "bash":
 		cmd, _ := parsedArgs["command"].(string)
 		if cmd == "" {
 			cmd, _ = parsedArgs["cmd"].(string)
@@ -1059,8 +1063,14 @@ func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 		return classifyShellIntent(cmd)
 	case strings.HasPrefix(toolName, "kanban_"):
 		return "Updating task status on the Kanban board."
-	case toolName == "read_file" || toolName == "search_files" || toolName == "list_dir":
+	case toolName == "read_file":
+		return "Reading file in the workspace."
+	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
 		return "Inspecting files in the workspace."
+	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
+		return "Applying patch to manifest in the workspace."
+	case toolName == "write_file" || toolName == "create_file":
+		return "Writing manifest file in the workspace."
 	case toolName == "tool_search":
 		return "Searching available tools."
 	case toolName == "tool_describe":

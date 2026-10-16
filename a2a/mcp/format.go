@@ -281,6 +281,7 @@ func CollectOutcomeSteps(outcome *TurnOutcome) []string {
 			for _, line := range cleanAndDedupeThinking(raw) {
 				appendStep(line)
 			}
+			return
 		}
 		if synth := strings.TrimSpace(SynthesizeThinkingFromActivities(rec)); synth != "" {
 			for _, line := range cleanAndDedupeThinking(synth) {
@@ -311,8 +312,8 @@ func (o *TurnOutcome) PrimaryTaskDelegates() []DelegateItem {
 
 // FormatTurnCustomToolEnvelope builds the Jetski _custom_tool_result fields (title, markdown, result)
 // for a turn outcome so that:
-//  1. Each MCP tool step row in Jetski shows a clean human-readable step title (collapsed by default!),
-//     and when expanded shows ONLY the clean checklist of steps taken so far (never raw Arguments JSON).
+//  1. Each MCP tool step row in Jetski's ToolGroupCollapsible represents ONE incremental step
+//     (appending 1 new item to the collapsible step list rather than creating a whole new duplicate list).
 //  2. While a task is still running (outcome.TimedOut == true), the LLM receives a compact
 //     STREAMING_STEP_CONTINUE instruction to immediately poll the next step via task_control(action: "get")
 //     without emitting intermediate chat prose, so Jetski streams live steps inside its collapsible
@@ -328,70 +329,115 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		return "Executed control command", fullMD, fullMD
 	}
 
-	steps := CollectOutcomeSteps(outcome)
+	allSteps := CollectOutcomeSteps(outcome)
 	sec := computeOutcomeElapsedSeconds(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask)
 	if sec < 1 {
 		sec = 1
 	}
 
+	reported := outcome.ReportedStepCount
+	if reported <= 0 || reported > len(allSteps) {
+		reported = len(allSteps)
+	}
+	prev := outcome.PrevStepCount
+	if prev < 0 {
+		prev = 0
+	}
+	if prev > reported {
+		prev = reported
+	}
+	visibleSteps := allSteps[:reported]
+	deltaSteps := visibleSteps[prev:]
+
 	if outcome.TimedOut {
-		latestStep := fmt.Sprintf("Starting task on %s", firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"))
-		if len(steps) > 0 {
-			latestStep = strings.TrimSuffix(steps[len(steps)-1], ".")
-		}
-		if len(steps) > 0 {
-			title = fmt.Sprintf("%s (%d %s • %ds)", latestStep, len(steps), pluralizeStep(len(steps)), sec)
-		} else {
-			title = fmt.Sprintf("%s (%ds)", latestStep, sec)
+		var currentStep string
+		var stepMD string
+		switch {
+		case len(deltaSteps) == 1:
+			currentStep = strings.TrimSuffix(deltaSteps[0], ".")
+			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
+			stepMD = fmt.Sprintf("✅ **%s.** _(%ds elapsed)_", currentStep, sec)
+		case len(deltaSteps) > 1:
+			currentStep = strings.TrimSuffix(deltaSteps[len(deltaSteps)-1], ".")
+			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
+			var b strings.Builder
+			for _, s := range deltaSteps {
+				fmt.Fprintf(&b, "- ✅ %s\n", s)
+			}
+			stepMD = strings.TrimSpace(b.String())
+		case len(visibleSteps) > 0:
+			currentStep = strings.TrimSuffix(visibleSteps[len(visibleSteps)-1], ".")
+			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
+			stepMD = fmt.Sprintf("🔄 **%s...** _(%ds elapsed)_", currentStep, sec)
+		default:
+			currentStep = fmt.Sprintf("Starting task on %s", firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"))
+			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
+			stepMD = fmt.Sprintf("🔄 **%s...** _(%ds elapsed)_", currentStep, sec)
 		}
 
-		var md strings.Builder
-		fmt.Fprintf(&md, "**Progress (`%d %s • %ds elapsed`)**\n\n", len(steps), pluralizeStep(len(steps)), sec)
-		if len(steps) == 0 {
-			fmt.Fprintf(&md, "- 🔄 **%s...**\n", latestStep)
-		} else {
-			for i, s := range steps {
-				if i == len(steps)-1 {
-					fmt.Fprintf(&md, "- 🔄 **%s**\n", s)
-				} else {
-					fmt.Fprintf(&md, "- ✅ %s\n", s)
-				}
-			}
+		nextSummaryHint := currentStep
+		if len(allSteps) > reported {
+			nextSummaryHint = strings.TrimSuffix(allSteps[reported], ".")
 		}
 
 		var llm strings.Builder
 		fmt.Fprintf(&llm, "STREAMING_STEP_CONTINUE: Task `%s` is actively running on `%s` (%ds elapsed, %d %s recorded).\n",
-			outcome.PrimaryTask.TaskID, firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"), sec, len(steps), pluralizeStep(len(steps)))
-		if len(steps) > 0 {
-			llm.WriteString("Steps taken so far:\n")
-			for _, s := range steps {
-				fmt.Fprintf(&llm, "- %s\n", s)
-			}
+			outcome.PrimaryTask.TaskID, firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"), sec, len(visibleSteps), pluralizeStep(len(visibleSteps)))
+		if len(deltaSteps) > 0 {
+			fmt.Fprintf(&llm, "Latest step: %s\n", deltaSteps[len(deltaSteps)-1])
 		}
-		fmt.Fprintf(&llm, "\nNEXT ACTION REQUIRED: Immediately call `mcp_kube-agents_task_control` with `action: \"get\"`, `task_id: %q`, and `toolSummary: %q` to stream the next step. Do NOT output any assistant text before calling `task_control` so that all progress steps stay cleanly grouped and collapsible in the UI.\n",
-			outcome.PrimaryTask.TaskID, truncateText(latestStep, 48))
+		fmt.Fprintf(&llm, "\nNEXT ACTION REQUIRED: Immediately call `mcp_kube-agents_task_control` with `action: \"get\"`, `task_id: %q`, and `toolSummary: %q` to stream the next step. Do NOT output any assistant text before calling `task_control` so that all progress steps stay in a single collapsible list.\n",
+			outcome.PrimaryTask.TaskID, truncateText(nextSummaryHint, 48))
 
-		return title, strings.TrimSpace(md.String()), strings.TrimSpace(llm.String())
+		return title, stepMD, strings.TrimSpace(llm.String())
 	}
 
 	// Settled / completed task:
-	if len(steps) > 0 {
-		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(steps), pluralizeStep(len(steps)))
-	} else {
-		title = fmt.Sprintf("Completed in %ds", sec)
-	}
-
 	if debug {
+		if len(allSteps) > 0 {
+			title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
+		} else {
+			title = fmt.Sprintf("Completed in %ds", sec)
+		}
 		return title, fullMD, fullMD
 	}
 
+	if prev > 0 {
+		switch {
+		case len(deltaSteps) == 1:
+			lastStep := strings.TrimSuffix(deltaSteps[0], ".")
+			title = fmt.Sprintf("%s (%ds)", lastStep, sec)
+			return title, fmt.Sprintf("✅ **%s.** _(completed in %ds)_", lastStep, sec), fullMD
+		case len(deltaSteps) > 1:
+			lastStep := strings.TrimSuffix(deltaSteps[len(deltaSteps)-1], ".")
+			title = fmt.Sprintf("%s (%ds)", lastStep, sec)
+			var b strings.Builder
+			for _, s := range deltaSteps {
+				fmt.Fprintf(&b, "- ✅ %s\n", s)
+			}
+			return title, strings.TrimSpace(b.String()), fullMD
+		default:
+			title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
+			return title, fmt.Sprintf("✅ **Completed in %ds.**", sec), fullMD
+		}
+	}
+
+	if len(allSteps) == 1 {
+		lastStep := strings.TrimSuffix(allSteps[0], ".")
+		title = fmt.Sprintf("%s (%ds)", lastStep, sec)
+		return title, fmt.Sprintf("✅ **%s.** _(completed in %ds)_", lastStep, sec), fullMD
+	}
+	if len(allSteps) > 1 {
+		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
+	} else {
+		title = fmt.Sprintf("Completed in %ds", sec)
+	}
 	var stepMD strings.Builder
-	fmt.Fprintf(&stepMD, "**Completed in %ds (`%d %s`)**\n\n", sec, len(steps), pluralizeStep(len(steps)))
-	for _, s := range steps {
+	for _, s := range allSteps {
 		fmt.Fprintf(&stepMD, "- ✅ %s\n", s)
 	}
-	if len(steps) == 0 {
-		stepMD.WriteString("- ✅ Task completed.\n")
+	if len(allSteps) == 0 {
+		stepMD.WriteString("✅ **Task completed.**")
 	}
 	return title, strings.TrimSpace(stepMD.String()), fullMD
 }
@@ -596,6 +642,18 @@ func cleanAndDedupeThinking(raw string) []string {
 			line = "Updating task status on the Kanban board."
 		case strings.Contains(line, "inspecting workspace files"):
 			line = "Inspecting files in the workspace."
+		case line == "Running read_file.":
+			line = "Reading file in the workspace."
+		case line == "Running search_files." || line == "Running find_by_name." || line == "Running list_dir." || line == "Running glob.":
+			line = "Inspecting files in the workspace."
+		case line == "Running patch." || line == "Running edit_file." || line == "Running replace_in_file.":
+			line = "Applying patch to manifest in the workspace."
+		case line == "Running write_file." || line == "Running create_file.":
+			line = "Writing manifest file in the workspace."
+		case line == "Running mcp__platform_control__list_cluster_profiles.":
+			line = "Listing GKE cluster profiles in the fleet."
+		case strings.HasPrefix(line, "Running mcp__platform_control__"):
+			line = "Querying platform control state."
 		case line == "Running tool_search.":
 			line = "Searching available tools."
 		case line == "Running tool_describe.":
@@ -745,7 +803,19 @@ func SynthesizeThinkingFromActivities(rec *TaskRecord) string {
 			addLine("Inspecting GKE cluster configuration.")
 		case strings.HasPrefix(act.Tool, "mcp__gke__"):
 			addLine("Querying GKE cluster state.")
-		case act.Tool == "terminal" || act.Tool == "kubectl" || act.Tool == "run_kubectl":
+		case act.Tool == "mcp__platform_control__list_cluster_profiles":
+			addLine("Listing GKE cluster profiles in the fleet.")
+		case strings.HasPrefix(act.Tool, "mcp__platform_control__"):
+			addLine("Querying platform control state.")
+		case act.Tool == "read_file":
+			addLine("Reading file in the workspace.")
+		case act.Tool == "search_files" || act.Tool == "find_by_name" || act.Tool == "list_dir" || act.Tool == "glob":
+			addLine("Inspecting files in the workspace.")
+		case act.Tool == "patch" || act.Tool == "edit_file" || act.Tool == "replace_in_file":
+			addLine("Applying patch to manifest in the workspace.")
+		case act.Tool == "write_file" || act.Tool == "create_file":
+			addLine("Writing manifest file in the workspace.")
+		case act.Tool == "terminal" || act.Tool == "kubectl" || act.Tool == "run_kubectl" || act.Tool == "bash":
 			addLine("Running cluster and workspace diagnostics.")
 		case strings.HasPrefix(act.Tool, "kanban_"):
 			addLine("Updating task status on the Kanban board.")

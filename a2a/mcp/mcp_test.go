@@ -1135,8 +1135,7 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	})
 	_ = mcpSrv.CallTool(ctx, toolConnectDeployment, connectArgs)
 
-	// 1. Call send_message over JSON-RPC with Jetski _meta: should return after the first batch of steps (~1.25s)
-	// with STREAMING_STEP_CONTINUE, custom step title, and clean collapsed-by-default markdown (no raw JSON arguments!).
+	// 1. Call send_message over JSON-RPC with Jetski _meta: should return Step 1 ONLY (not a cumulative list!)
 	req1 := `{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check all pods in kubeagents-system"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
 	resp1Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req1))
 	var resp1 struct {
@@ -1146,10 +1145,10 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 		t.Fatalf("unmarshal resp1: %v", err)
 	}
 	var env1 struct {
-		Custom  bool   `json:"_custom_tool_result"`
-		Title   string `json:"title"`
-		MD      string `json:"markdown"`
-		Result  string `json:"result"`
+		Custom bool   `json:"_custom_tool_result"`
+		Title  string `json:"title"`
+		MD     string `json:"markdown"`
+		Result string `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(resp1.Result.Content[0].Text), &env1); err != nil {
 		t.Fatalf("unmarshal env1: %v\nraw: %s", err, resp1.Result.Content[0].Text)
@@ -1157,18 +1156,18 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	if !env1.Custom {
 		t.Fatalf("expected _custom_tool_result=true in env1")
 	}
-	if !strings.Contains(env1.Title, "Listing GKE clusters in the fleet") || !strings.Contains(env1.Title, "2 steps") {
+	if !strings.Contains(env1.Title, "Searching available tools") {
 		t.Errorf("unexpected step 1 title: %q", env1.Title)
 	}
-	if !strings.Contains(env1.MD, "✅ Searching available tools.") || !strings.Contains(env1.MD, "🔄 **Listing GKE clusters in the fleet.**") {
-		t.Errorf("unexpected step 1 markdown:\n%s", env1.MD)
+	if !strings.Contains(env1.MD, "✅ **Searching available tools.**") || strings.Contains(env1.MD, "Listing GKE clusters") {
+		t.Errorf("expected step 1 markdown to contain ONLY step 1:\n%s", env1.MD)
 	}
 	if !strings.Contains(env1.Result, "STREAMING_STEP_CONTINUE") || !strings.Contains(env1.Result, multiStepTaskID) {
 		t.Errorf("expected STREAMING_STEP_CONTINUE in LLM result:\n%s", env1.Result)
 	}
 
-	// 2. Call task_control(action: "get") over JSON-RPC: waits for step 3 & completion (~500ms more) and returns
-	// the completed envelope with collapsed <details><summary>Thought for ... (3 steps)</summary>...</details> + final answer.
+	// 2. Call task_control(action: "get") #1: advances by 1 step to Step 2 ("Listing GKE clusters in the fleet")
+	// and does NOT repeat Step 1 in its markdown!
 	req2 := `{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"task_control","arguments":{"action":"get","task_id":"` + multiStepTaskID + `"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
 	resp2Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req2))
 	var resp2 struct {
@@ -1178,19 +1177,45 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 		t.Fatalf("unmarshal resp2: %v", err)
 	}
 	var env2 struct {
-		Custom  bool   `json:"_custom_tool_result"`
-		Title   string `json:"title"`
-		MD      string `json:"markdown"`
-		Result  string `json:"result"`
+		Custom bool   `json:"_custom_tool_result"`
+		Title  string `json:"title"`
+		MD     string `json:"markdown"`
+		Result string `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(resp2.Result.Content[0].Text), &env2); err != nil {
 		t.Fatalf("unmarshal env2: %v", err)
 	}
-	if !strings.Contains(env2.Title, "Completed in") || !strings.Contains(env2.Title, "3 steps") {
-		t.Errorf("unexpected completion title: %q", env2.Title)
+	if !strings.Contains(env2.Title, "Listing GKE clusters in the fleet") {
+		t.Errorf("unexpected step 2 title: %q", env2.Title)
 	}
-	if !strings.Contains(env2.MD, "✅ Running cluster and workspace diagnostics.") {
-		t.Errorf("unexpected completion step markdown:\n%s", env2.MD)
+	if !strings.Contains(env2.MD, "✅ **Listing GKE clusters in the fleet.**") || strings.Contains(env2.MD, "Searching available tools") {
+		t.Errorf("expected step 2 markdown to contain ONLY step 2 (not repeating step 1):\n%s", env2.MD)
+	}
+
+	// 3. Call task_control(action: "get") #2: waits for step 3 & completion and returns ONLY step 3 in the step row
+	// (no duplicate cumulative list!), while the LLM result has the full <details><summary>Thought...(3 steps)</summary> + answer.
+	req3 := `{"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"task_control","arguments":{"action":"get","task_id":"` + multiStepTaskID + `"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
+	resp3Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req3))
+	var resp3 struct {
+		Result mcpCallToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(resp3Raw, &resp3); err != nil {
+		t.Fatalf("unmarshal resp3: %v", err)
+	}
+	var env3 struct {
+		Custom bool   `json:"_custom_tool_result"`
+		Title  string `json:"title"`
+		MD     string `json:"markdown"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(resp3.Result.Content[0].Text), &env3); err != nil {
+		t.Fatalf("unmarshal env3: %v", err)
+	}
+	if !strings.Contains(env3.Title, "Running cluster and workspace diagnostics") {
+		t.Errorf("unexpected completion step title: %q", env3.Title)
+	}
+	if !strings.Contains(env3.MD, "✅ **Running cluster and workspace diagnostics.**") || strings.Contains(env3.MD, "Searching available tools") {
+		t.Errorf("expected completion step markdown to contain ONLY step 3 (not repeating steps 1-2):\n%s", env3.MD)
 	}
 	for _, want := range []string{
 		"<details>\n<summary>Thought",
@@ -1200,8 +1225,8 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 		"- ✅ Running cluster and workspace diagnostics.",
 		"All 9 pods in kubeagents-system are Running and Ready.",
 	} {
-		if !strings.Contains(env2.Result, want) {
-			t.Errorf("final LLM result missing %q:\n%s", want, env2.Result)
+		if !strings.Contains(env3.Result, want) {
+			t.Errorf("final LLM result missing %q:\n%s", want, env3.Result)
 		}
 	}
 }

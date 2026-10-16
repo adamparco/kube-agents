@@ -66,10 +66,10 @@ const (
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
 	defaultTurnWaitTimeout       = 150 * time.Second
-	defaultStepStreamWindow      = 6 * time.Second
-	initialStepStreamWindow      = 4 * time.Second
-	minStepBatchWait             = 1200 * time.Millisecond
-	stepDebounceWait             = 450 * time.Millisecond
+	defaultStepStreamWindow      = 8 * time.Second
+	initialStepStreamWindow      = 10 * time.Second
+	minStepBatchWait             = 350 * time.Millisecond
+	stepDebounceWait             = 200 * time.Millisecond
 	pollTickInterval             = 100 * time.Millisecond
 	progressHeartbeatInterval    = 2 * time.Second
 	natsConnectTimeout           = 10 * time.Second
@@ -261,6 +261,8 @@ type TurnOutcome struct {
 	ChildTasks        []*TaskRecord     `json:"childTasks,omitempty"`
 	WakeTask          *TaskRecord       `json:"wakeTask,omitempty"`
 	TimedOut          bool              `json:"timedOut"`
+	PrevStepCount     int               `json:"prevStepCount,omitempty"`
+	ReportedStepCount int               `json:"reportedStepCount,omitempty"`
 }
 
 type authorityWire struct {
@@ -294,6 +296,7 @@ type BusSession struct {
 	consoleNotices    []ConsoleOutFrame
 	watchedConvs      map[string]int
 	watchedTasks      map[string]int
+	prevReportedSteps map[string]int
 	lastReportedSteps map[string]int
 }
 
@@ -998,7 +1001,7 @@ func (s *BusSession) SendTurnWithOptions(ctx context.Context, store *ConfigStore
 		return outcome, err
 	}
 
-	s.setReportedStepCount(primaryID, 0)
+	s.resetStepProgress(primaryID)
 	timedOut := s.WaitForTaskStepOrSettlement(turnCtx, primaryID, streamSteps)
 	built := s.BuildTaskOutcome(primaryID, conv.Alias, conv.Token, text, timedOut)
 	built.ConsoleNotices = append(preNotices, s.consoleNoticesSince(conv.Token, noticeCursor)...)
@@ -1014,12 +1017,15 @@ func (s *BusSession) SendTurnWithOptions(ctx context.Context, store *ConfigStore
 // tasks and session wake synthesis task.
 func (s *BusSession) BuildTaskOutcome(primaryID string, convAlias string, convToken string, sentText string, timedOut bool) *TurnOutcome {
 	primary := s.GetTask(primaryID)
+	prevSteps, reportedSteps := s.getStepProgress(primaryID)
 	outcome := &TurnOutcome{
 		ConversationAlias: convAlias,
 		ConversationToken: convToken,
 		SentText:          sentText,
 		PrimaryTask:       primary,
 		TimedOut:          timedOut,
+		PrevStepCount:     prevSteps,
+		ReportedStepCount: reportedSteps,
 	}
 	if primary == nil {
 		return outcome
@@ -1081,20 +1087,21 @@ func (s *BusSession) IsTaskTreeSettled(primaryID string) bool {
 
 // WaitForTaskStepOrSettlement waits for a task tree. When streamSteps is false, it waits until
 // full settlement or ctx expiration. When streamSteps is true, it waits until either the task tree
-// settles OR at least one new human-readable step arrives (batched over minStepBatchWait + stepDebounceWait)
-// OR the per-step streaming window elapses, returning true if the task is still in flight (timedOut).
+// settles OR the next human-readable step arrives (advancing by 1 step at a time so each step
+// appends a single item to Jetski's collapsible step list rather than creating duplicate sub-lists),
+// returning true if the task is still in flight (timedOut).
 func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID string, streamSteps bool) bool {
 	s.watchTask(primaryID, 1)
 	defer s.watchTask(primaryID, -1)
 
+	baseline := s.getReportedStepCount(primaryID)
 	if !streamSteps {
 		timedOut := s.waitForTaskAndDelegations(ctx, primaryID)
 		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", timedOut))
-		s.setReportedStepCount(primaryID, len(steps))
+		s.recordStepProgress(primaryID, baseline, len(steps))
 		return timedOut
 	}
 
-	baseline := s.getReportedStepCount(primaryID)
 	window := defaultStepStreamWindow
 	if baseline == 0 {
 		window = initialStepStreamWindow
@@ -1106,8 +1113,7 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 	defer ticker.Stop()
 
 	startedAt := time.Now()
-	lastStepCount := baseline
-	lastChangeAt := time.Time{}
+	firstSeenAboveBaseline := time.Time{}
 
 	for {
 		settled := s.IsTaskTreeSettled(primaryID)
@@ -1115,18 +1121,17 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 		curCount := len(steps)
 
 		if settled {
-			s.setReportedStepCount(primaryID, curCount)
+			s.recordStepProgress(primaryID, baseline, curCount)
 			return false
 		}
 
 		now := time.Now()
 		if curCount > baseline {
-			if curCount != lastStepCount {
-				lastStepCount = curCount
-				lastChangeAt = now
+			if firstSeenAboveBaseline.IsZero() {
+				firstSeenAboveBaseline = now
 			}
-			if now.Sub(startedAt) >= minStepBatchWait && !lastChangeAt.IsZero() && now.Sub(lastChangeAt) >= stepDebounceWait {
-				s.setReportedStepCount(primaryID, curCount)
+			if now.Sub(startedAt) >= minStepBatchWait && now.Sub(firstSeenAboveBaseline) >= stepDebounceWait {
+				s.recordStepProgress(primaryID, baseline, baseline+1)
 				return true
 			}
 		}
@@ -1135,8 +1140,16 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 		case <-stepCtx.Done():
 			finalSettled := s.IsTaskTreeSettled(primaryID)
 			finalSteps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !finalSettled))
-			s.setReportedStepCount(primaryID, len(finalSteps))
-			return !finalSettled
+			if finalSettled {
+				s.recordStepProgress(primaryID, baseline, len(finalSteps))
+				return false
+			}
+			nextCount := baseline
+			if len(finalSteps) > baseline {
+				nextCount = baseline + 1
+			}
+			s.recordStepProgress(primaryID, baseline, nextCount)
+			return true
 		case <-ticker.C:
 		}
 	}
@@ -1151,13 +1164,33 @@ func (s *BusSession) getReportedStepCount(taskID string) int {
 	return s.lastReportedSteps[taskID]
 }
 
-func (s *BusSession) setReportedStepCount(taskID string, count int) {
+func (s *BusSession) getStepProgress(taskID string) (prev int, reported int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.prevReportedSteps != nil {
+		prev = s.prevReportedSteps[taskID]
+	}
+	if s.lastReportedSteps != nil {
+		reported = s.lastReportedSteps[taskID]
+	}
+	return prev, reported
+}
+
+func (s *BusSession) resetStepProgress(taskID string) {
+	s.recordStepProgress(taskID, 0, 0)
+}
+
+func (s *BusSession) recordStepProgress(taskID string, prev int, reported int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.prevReportedSteps == nil {
+		s.prevReportedSteps = make(map[string]int)
+	}
 	if s.lastReportedSteps == nil {
 		s.lastReportedSteps = make(map[string]int)
 	}
-	s.lastReportedSteps[taskID] = count
+	s.prevReportedSteps[taskID] = prev
+	s.lastReportedSteps[taskID] = reported
 }
 
 func (s *BusSession) sendControlCommand(ctx context.Context, token string, cmdText string) ([]ConsoleOutFrame, error) {
