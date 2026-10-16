@@ -9,9 +9,15 @@ description: >-
   Jetski, or handling bi-directional push notifications from kube-agents.
 ---
 
-# kube-agents A2A v2/next Skill for Jetski
+# kube-agents A2A v2/next Skill for Jetski (Pure Proxy Mode)
 
 Use the `kube-agents` MCP server tools (`mcp_kube-agents_*` / `call_mcp_tool` on server `kube-agents`) to interact natively with any `kube-agents` deployment running the `v2`/`next` A2A JetStream message bus (`a2a-jetstream/0.4`).
+
+> **CRITICAL — Dumb Proxy Rule (No `kubectl` or Local Shell Calls)**:
+> - When using `kube-agents`, Jetski acts strictly as a proxy to send messages, stream progress/thinking, and format responses (including GitHub PR diffs).
+> - **NEVER** run `kubectl`, `gcloud`, `sqlite3`, or other local shell commands via `run_command` unless the user **explicitly** asks you to run a local `kubectl` or shell command.
+> - Route all questions, status checks, audit queries, and cluster operations through `mcp_kube-agents_*` tools.
+> - Once `send_message` or `task_control(action: "get")` returns a final (non-`STREAMING_STEP_CONTINUE`) response, **do NOT** call `task_control(action: "get")` again on that completed task—format and output the response immediately.
 
 ---
 
@@ -35,7 +41,7 @@ Use **`send_message`** to execute turns on the remote `kube-agents` bus and stre
 ### Live Step-by-Step Streaming & Clean, Native UX (Collapsed by Default, Optional `debug` Mode)
 Every `send_message` and `task_control(action: "get")` call streams live steps into Jetski's UI while keeping all details hidden by default in expandable sections:
 1. **Live Step-by-Step Progress (`STREAMING_STEP_CONTINUE`)**:
-   - While a remote task is executing steps, `send_message` (and follow-up `task_control(action: "get")` calls) return each batch of newly recorded steps via `_custom_tool_result` with a human-readable step `title` (e.g. `Listing GKE clusters in the fleet (2 steps • 5s)`) and a clean step checklist in `markdown` (hidden by default inside the collapsed tool step row; expanding it shows `- ✅ ...` / `- 🔄 ...` without raw JSON arguments).
+   - While a remote task is executing steps, `send_message` (and follow-up `task_control(action: "get")` calls) return 1 new step per poll via `_custom_tool_result` with a human-readable step `title` (e.g. `Listing GKE clusters in the fleet (5s)`) so each poll appends a single step item to Jetski's collapsible `Exploring` / `Explored ›` list.
    - Whenever `send_message` or `task_control(action: "get")` returns `STREAMING_STEP_CONTINUE: Task <id> is actively running...`, **immediately** call `task_control(action: "get", task_id: "<id>", toolSummary: "<current_step>")` **without outputting any intermediate assistant text**. This keeps all streaming steps grouped inside Jetski's collapsible `Exploring` / `Explored ›` section.
 2. **Collapsed Thinking Summary by Default (`<details>` without `open`)**:
    - Once the task settles, the tool output begins with a **collapsed** `<details>\n<summary>Thought for Xs (N steps)</summary>\n\n- ✅ ...\n\n</details>` block (never `<details open>`).
@@ -57,8 +63,8 @@ Every `send_message` and `task_control(action: "get")` call streams live steps i
 - **`task_control`**:
   - `action: "steer"`: Inject a mid-flight steering instruction into a running task (`steer <message>`).
   - `action: "stop"`: Cancel the active task on the gateway or `a2a.ctrl.<agent>.<task>`.
-  - `action: "get"` / `"list"` / `"status"`: Inspect full folded task state (`get` automatically waits up to 6s for the next streaming step when called on an active task, returning `STREAMING_STEP_CONTINUE` until the task settles), list recent tasks on `TASKS`, or trigger a gateway `status` replay.
-  - **Important**: When `STREAMING_STEP_CONTINUE` is returned, immediately call `task_control(action: "get", task_id: "<id>")` with no intermediate prose until the task settles.
+  - `action: "get"` / `"list"` / `"status"`: Inspect full folded task state (`get` automatically waits for the next streaming step when called on an active task, returning `STREAMING_STEP_CONTINUE` until the task settles), list recent tasks on `TASKS`, or trigger a gateway `status` replay.
+  - **Important**: When `STREAMING_STEP_CONTINUE` is returned, immediately call `task_control(action: "get", task_id: "<id>")` with no intermediate prose until the task settles. Once it returns a final response without `STREAMING_STEP_CONTINUE`, do NOT call `task_control(action: "get")` again.
 
 ---
 
