@@ -1,0 +1,37 @@
+{
+  "mcpServers": {
+    "kube-agents": {
+      "command": "kube-agents-mcp",
+      "args": [],
+      "tools": {
+        "discover_deployments": {
+          "eager": true
+        },
+        "connect_deployment": {
+          "eager": true
+        },
+        "connection_status": {
+          "eager": true
+        },
+        "send_message": {
+          "eager": true
+        },
+        "manage_session": {
+          "eager": true
+        },
+        "task_control": {
+          "eager": true
+        },
+        "read_topics": {
+          "eager": true
+        },
+        "inspect_pr": {
+          "eager": true
+        },
+        "poll_events": {
+          "eager": true
+        }
+      }
+    }
+  }
+}

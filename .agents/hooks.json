@@ -1,0 +1,19 @@
+{
+  "kube-agents-push-sync": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "kube-agents-mcp --hook",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "kube-agents-mcp --hook",
+        "timeout": 5
+      }
+    ]
+  }
+}

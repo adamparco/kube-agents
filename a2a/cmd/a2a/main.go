@@ -23,11 +23,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/mcp"
 )
 
 const usage = `a2a - a2a-jetstream topics client
@@ -37,6 +40,7 @@ usage:
   a2a topics read <topic>          print the latest entry on a topic
   a2a topics write <topic> [flags] publish one entry to a topic
   a2a notify --platform <p> [text] post to the chat home channel, or a live conversation, via the gateway
+  a2a mcp [--config <path>] [--hook] run the kube-agents Model Context Protocol (MCP) server over stdio
 
 <topic> is a bare name (upgrade-readiness), a scope-qualified name
 (shared.blueprint, agent.platform.upgrade-readiness), or a full subject. A bare
@@ -83,6 +87,8 @@ func run(args []string) error {
 		return runTopics(args[1:])
 	case "notify":
 		return runNotify(args[1:])
+	case "mcp":
+		return runMCP(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return nil
@@ -90,6 +96,31 @@ func run(args []string) error {
 		fmt.Fprint(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runMCP(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "path to kube-agents MCP configuration file")
+	hookMode := fs.Bool("hook", false, "run as a Jetski SessionStart/PreInvocation hook handler")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := mcp.NewConfigStore(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if *hookMode {
+		return mcp.HandleJetskiHook(store, os.Stdin, os.Stdout)
+	}
+	srv, err := mcp.NewServer(mcp.ServerOptions{Store: store})
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return srv.ServeStdio(ctx, os.Stdin, os.Stdout)
 }
 
 func runTopics(args []string) error {
