@@ -802,23 +802,21 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			return "", "", "", errors.New("task_control action 'get' requires task_id")
 		}
 		taskID := strings.TrimSpace(args.TaskID)
-		if !sess.IsTaskTreeSettled(taskID) {
-			if streamSteps {
-				stepWait := defaultStepStreamWindow
-				if args.WaitTimeoutSeconds > 0 {
-					reqWait := time.Duration(args.WaitTimeoutSeconds) * time.Second
-					if reqWait < stepWait {
-						stepWait = reqWait
-					}
+		if streamSteps {
+			stepWait := defaultStepStreamWindow
+			if args.WaitTimeoutSeconds > 0 {
+				reqWait := time.Duration(args.WaitTimeoutSeconds) * time.Second
+				if reqWait < stepWait {
+					stepWait = reqWait
 				}
-				waitCtx, cancel := context.WithTimeout(turnCtx, stepWait)
-				_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, true)
-				cancel()
-			} else if args.WaitTimeoutSeconds > 0 {
-				waitCtx, cancel := context.WithTimeout(turnCtx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
-				_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, false)
-				cancel()
 			}
+			waitCtx, cancel := context.WithTimeout(turnCtx, stepWait)
+			_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, true)
+			cancel()
+		} else if args.WaitTimeoutSeconds > 0 && !sess.IsTaskTreeSettled(taskID) {
+			waitCtx, cancel := context.WithTimeout(turnCtx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
+			_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, false)
+			cancel()
 		}
 		rec := sess.GetTask(taskID)
 		if rec == nil {

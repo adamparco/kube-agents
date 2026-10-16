@@ -12,7 +12,11 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -331,9 +335,16 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
+		turnStartUnix := time.Now().Unix() - 2
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
+		}
+		if act.cardsFiled.Load() && !run.routeRecorded.Load() {
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, turnStartUnix, turn, text)
+			if !ok {
+				return
+			}
 		}
 		next, nextPrompt := b.runnableSteer(ctx, run)
 		if next == nil {
@@ -607,4 +618,214 @@ func apiExecutorValid(cfg *Config) error {
 		return fmt.Errorf("executor %q: APIURL %q: want an %s:// or %s:// URL with a host", ExecutorAPI, cfg.APIURL, apiURLSchemeHTTP, apiURLSchemeHTTPS)
 	}
 	return nil
+}
+
+const (
+	kanbanPollInterval   = time.Second
+	kanbanMaxEmptyPolls  = 3
+	hermesVenvPythonPath = "/opt/hermes/.venv/bin/python3"
+)
+
+const kanbanPollPyScript = `
+import json, sqlite3, sys
+db_path, session_id, since_ts = sys.argv[1], sys.argv[2], float(sys.argv[3])
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+conn.row_factory = sqlite3.Row
+cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id"
+err_col = "last_failure_error" if "last_failure_error" in cols else "''"
+rows = conn.execute(
+    f"SELECT id, title, status, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
+    f"FROM tasks WHERE {sess_col} = ? AND created_at >= ? ORDER BY created_at ASC, id ASC",
+    (session_id, since_ts),
+).fetchall()
+out = []
+for r in rows:
+    item = dict(r)
+    try:
+        run_row = conn.execute(
+            "SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error "
+            "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (r["id"],),
+        ).fetchone()
+        if run_row:
+            if not item["result"] and run_row["summary"]:
+                item["result"] = run_row["summary"]
+            if not item["err"] and run_row["error"]:
+                item["err"] = run_row["error"]
+    except Exception:
+        pass
+    try:
+        ev_row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'gave_up') ORDER BY id DESC LIMIT 1",
+            (r["id"],),
+        ).fetchone()
+        if ev_row and ev_row[0]:
+            item["block_payload"] = ev_row[0]
+    except Exception:
+        pass
+    out.append(item)
+print(json.dumps(out))
+`
+
+type kanbanCardRow struct {
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Status       string `json:"status"`
+	Result       string `json:"result"`
+	Err          string `json:"err"`
+	BlockPayload string `json:"block_payload"`
+}
+
+func resolveKanbanDBPath() string {
+	var candidates []string
+	if v := strings.TrimSpace(os.Getenv("HERMES_KANBAN_DB")); v != "" {
+		candidates = append(candidates, v)
+	}
+	if v := strings.TrimSpace(os.Getenv("HERMES_HOME")); v != "" {
+		candidates = append(candidates, filepath.Join(v, "kanban.db"))
+	}
+	if v := strings.TrimSpace(os.Getenv("PLATFORM_AGENT_HOME")); v != "" {
+		candidates = append(candidates, filepath.Join(v, "kanban.db"))
+	}
+	candidates = append(candidates, "/opt/data/kanban.db")
+	for _, p := range candidates {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func resolvePythonBin() string {
+	if info, err := os.Stat(hermesVenvPythonPath); err == nil && !info.IsDir() {
+		return hermesVenvPythonPath
+	}
+	return "python3"
+}
+
+func isKanbanStatusSettled(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done", "archived", "completed", "blocked", "failed", "gave_up", "canceled", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatKanbanCardOutput(c kanbanCardRow) string {
+	if res := strings.TrimSpace(c.Result); res != "" {
+		return res
+	}
+	if bp := strings.TrimSpace(c.BlockPayload); bp != "" {
+		var parsed map[string]any
+		if json.Unmarshal([]byte(bp), &parsed) == nil {
+			for _, k := range []string{"question", "reason", "message", "summary"} {
+				if v, ok := parsed[k].(string); ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
+		return bp
+	}
+	if errTxt := strings.TrimSpace(c.Err); errTxt != "" {
+		return errTxt
+	}
+	return ""
+}
+
+func querySessionKanbanCards(ctx context.Context, pythonBin, dbPath, sessionID string, sinceUnix int64) ([]kanbanCardRow, error) {
+	qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanPollPyScript, dbPath, sessionID, strconv.FormatInt(sinceUnix, 10))
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var rows []kanbanCardRow
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// waitForKanbanCards waits for any Kanban card(s) filed during the turn on a
+// conversation with no chat.notify route (such as console:). While waiting,
+// waitingCard is set on act so the Kanban worker's tool-call and thinking
+// webhook deliveries stream onto this A2A task.
+func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *activityState, sessionID string, turnStartUnix int64, turn int, ackText string) (string, bool) {
+	dbPath := resolveKanbanDBPath()
+	if dbPath == "" {
+		return ackText, true
+	}
+	pythonBin := resolvePythonBin()
+
+	run.mu.Lock()
+	if run.state != stateRunning {
+		run.mu.Unlock()
+		return "", false
+	}
+	run.answerHeld = false
+	run.mu.Unlock()
+
+	act.inTurn.Store(false)
+	act.waitingCard.Store(true)
+	defer func() {
+		act.waitingCard.Store(false)
+		act.inTurn.Store(true)
+	}()
+
+	emptyPolls := 0
+	ticker := time.NewTicker(kanbanPollInterval)
+	defer ticker.Stop()
+
+	for {
+		cards, err := querySessionKanbanCards(taskCtx, pythonBin, dbPath, sessionID, turnStartUnix)
+		if err == nil {
+			if len(cards) == 0 {
+				emptyPolls++
+				if emptyPolls >= kanbanMaxEmptyPolls {
+					break
+				}
+			} else {
+				allSettled := true
+				for _, c := range cards {
+					if !isKanbanStatusSettled(c.Status) {
+						allSettled = false
+						break
+					}
+				}
+				if allSettled {
+					var parts []string
+					for _, c := range cards {
+						if out := formatKanbanCardOutput(c); out != "" {
+							parts = append(parts, out)
+						}
+					}
+					if len(parts) > 0 {
+						ackText = strings.Join(parts, "\n\n")
+					}
+					break
+				}
+			}
+		} else if taskCtx.Err() != nil {
+			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+			return "", false
+		}
+
+		select {
+		case <-taskCtx.Done():
+			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
+			return "", false
+		case <-ticker.C:
+		}
+	}
+
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return "", false
+	}
+	run.answerHeld = true
+	return ackText, true
 }

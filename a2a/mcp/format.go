@@ -353,18 +353,10 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		var currentStep string
 		var stepMD string
 		switch {
-		case len(deltaSteps) == 1:
-			currentStep = strings.TrimSuffix(deltaSteps[0], ".")
-			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
-			stepMD = fmt.Sprintf("✅ **%s.** _(%ds elapsed)_", currentStep, sec)
-		case len(deltaSteps) > 1:
+		case len(deltaSteps) >= 1:
 			currentStep = strings.TrimSuffix(deltaSteps[len(deltaSteps)-1], ".")
 			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
-			var b strings.Builder
-			for _, s := range deltaSteps {
-				fmt.Fprintf(&b, "- ✅ %s\n", s)
-			}
-			stepMD = strings.TrimSpace(b.String())
+			stepMD = fmt.Sprintf("✅ **%s.** _(%ds elapsed)_", currentStep, sec)
 		case len(visibleSteps) > 0:
 			currentStep = strings.TrimSuffix(visibleSteps[len(visibleSteps)-1], ".")
 			title = fmt.Sprintf("%s (%ds)", currentStep, sec)
@@ -403,43 +395,22 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 	}
 
 	if prev > 0 {
-		switch {
-		case len(deltaSteps) == 1:
-			lastStep := strings.TrimSuffix(deltaSteps[0], ".")
-			title = fmt.Sprintf("%s (%ds)", lastStep, sec)
-			return title, fmt.Sprintf("✅ **%s.** _(completed in %ds)_", lastStep, sec), fullMD
-		case len(deltaSteps) > 1:
+		if len(deltaSteps) >= 1 {
 			lastStep := strings.TrimSuffix(deltaSteps[len(deltaSteps)-1], ".")
 			title = fmt.Sprintf("%s (%ds)", lastStep, sec)
-			var b strings.Builder
-			for _, s := range deltaSteps {
-				fmt.Fprintf(&b, "- ✅ %s\n", s)
-			}
-			return title, strings.TrimSpace(b.String()), fullMD
-		default:
-			title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
-			return title, fmt.Sprintf("✅ **Completed in %ds.**", sec), fullMD
+			return title, fmt.Sprintf("✅ **%s.** _(completed in %ds)_", lastStep, sec), fullMD
 		}
+		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
+		return title, fmt.Sprintf("✅ **Completed in %ds.**", sec), fullMD
 	}
 
-	if len(allSteps) == 1 {
-		lastStep := strings.TrimSuffix(allSteps[0], ".")
+	if len(allSteps) >= 1 {
+		lastStep := strings.TrimSuffix(allSteps[len(allSteps)-1], ".")
 		title = fmt.Sprintf("%s (%ds)", lastStep, sec)
 		return title, fmt.Sprintf("✅ **%s.** _(completed in %ds)_", lastStep, sec), fullMD
 	}
-	if len(allSteps) > 1 {
-		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allSteps), pluralizeStep(len(allSteps)))
-	} else {
-		title = fmt.Sprintf("Completed in %ds", sec)
-	}
-	var stepMD strings.Builder
-	for _, s := range allSteps {
-		fmt.Fprintf(&stepMD, "- ✅ %s\n", s)
-	}
-	if len(allSteps) == 0 {
-		stepMD.WriteString("✅ **Task completed.**")
-	}
-	return title, strings.TrimSpace(stepMD.String()), fullMD
+	title = fmt.Sprintf("Completed in %ds", sec)
+	return title, "✅ **Task completed.**", fullMD
 }
 
 func pluralizeStep(n int) string {
@@ -662,6 +633,8 @@ func cleanAndDedupeThinking(raw string) []string {
 			line = "Running analysis script."
 		case line == "Running skill_view.":
 			line = "Loading skill instructions."
+		case line == "Running kanban_create.":
+			line = "Delegating task to specialist agent."
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -817,6 +790,8 @@ func SynthesizeThinkingFromActivities(rec *TaskRecord) string {
 			addLine("Writing manifest file in the workspace.")
 		case act.Tool == "terminal" || act.Tool == "kubectl" || act.Tool == "run_kubectl" || act.Tool == "bash":
 			addLine("Running cluster and workspace diagnostics.")
+		case act.Tool == "kanban_create":
+			addLine("Delegating task to specialist agent.")
 		case strings.HasPrefix(act.Tool, "kanban_"):
 			addLine("Updating task status on the Kanban board.")
 		default:

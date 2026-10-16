@@ -480,7 +480,8 @@ type activityState struct {
 	// cardsFiled says a kanban_create call of this task's ended without an
 	// error: the turn handed work to cards, so its terminal keeps the ask
 	// marked (cardsMark in bridge.go).
-	cardsFiled atomic.Bool
+	cardsFiled  atomic.Bool
+	waitingCard atomic.Bool
 
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
@@ -1061,6 +1062,8 @@ func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 			cmd, _ = parsedArgs["cmd"].(string)
 		}
 		return classifyShellIntent(cmd)
+	case toolName == kanbanCreateTool:
+		return "Delegating task to specialist agent."
 	case strings.HasPrefix(toolName, "kanban_"):
 		return "Updating task status on the Kanban board."
 	case toolName == "read_file":
@@ -1695,6 +1698,11 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 	}
 	for _, r := range runs {
 		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && a.inTurn.Load() {
+			return r
+		}
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.waitingCard.Load() && !strings.HasPrefix(d.SessionID, apiSessionIDPrefix) {
 			return r
 		}
 	}
