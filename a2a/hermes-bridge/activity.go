@@ -667,7 +667,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.calls++
 		status := activityStatus(d)
-		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+		if status != ActivityStatusError && (d.ToolName == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(d.ToolInput), kanbanCreateTool))) {
 			a.cardsFiled.Store(true)
 		}
 		e := ActivityEntry{
@@ -986,6 +986,17 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 	explicit := strings.Join(reasoningParts, "\n")
 	var out string
 	switch {
+	case len(plannedTools) > 0 && explicit != "":
+		thoughtSingle := strings.Join(strings.Fields(explicit), " ")
+		var lines []string
+		for i, pt := range plannedTools {
+			if i == 0 && thoughtSingle != "" {
+				lines = append(lines, pt+"\t"+thoughtSingle)
+			} else {
+				lines = append(lines, pt)
+			}
+		}
+		out = strings.Join(lines, "\n")
 	case explicit != "":
 		out = explicit
 	case len(plannedTools) > 0:

@@ -66,8 +66,8 @@ const (
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
 	defaultTurnWaitTimeout       = 150 * time.Second
-	defaultStepStreamWindow      = 8 * time.Second
-	initialStepStreamWindow      = 10 * time.Second
+	defaultStepStreamWindow      = 60 * time.Second
+	initialStepStreamWindow      = 30 * time.Second
 	minStepBatchWait             = 350 * time.Millisecond
 	stepDebounceWait             = 200 * time.Millisecond
 	pollTickInterval             = 100 * time.Millisecond
@@ -269,6 +269,10 @@ type authorityWire struct {
 	Audience struct {
 		Conversation string `json:"conversation"`
 	} `json:"audience"`
+	Via *struct {
+		TaskID  string `json:"taskId"`
+		Session string `json:"session"`
+	} `json:"via,omitempty"`
 	DelegatedFrom *struct {
 		TaskID    string `json:"taskId"`
 		ContextID string `json:"contextId"`
@@ -546,11 +550,17 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			if auth.Audience.Conversation != "" && rec.Conversation == "" {
 				rec.Conversation = auth.Audience.Conversation
 			}
-			if auth.DelegatedFrom != nil && auth.DelegatedFrom.TaskID != "" && rec.DelegatedFromTaskID == "" {
-				rec.DelegatedFromTaskID = auth.DelegatedFrom.TaskID
+			parentTaskID := ""
+			if auth.Via != nil && auth.Via.TaskID != "" {
+				parentTaskID = auth.Via.TaskID
+			} else if auth.DelegatedFrom != nil && auth.DelegatedFrom.TaskID != "" {
+				parentTaskID = auth.DelegatedFrom.TaskID
+			}
+			if parentTaskID != "" && rec.DelegatedFromTaskID == "" {
+				rec.DelegatedFromTaskID = parentTaskID
 				if parent, ok := s.tasks[rec.DelegatedFromTaskID]; ok {
 					for i := range parent.Delegates {
-						if parent.Delegates[i].ChildTaskID == "" {
+						if parent.Delegates[i].ChildTaskID == "" || parent.Delegates[i].ChildTaskID == rec.TaskID {
 							parent.Delegates[i].ChildTaskID = rec.TaskID
 							break
 						}
@@ -681,6 +691,23 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			case lib.ArtifactDelegate:
 				var del DelegateItem
 				if json.Unmarshal([]byte(dataText), &del) == nil && del.Addressee != "" {
+					if del.ChildTaskID == "" {
+						for _, other := range s.tasks {
+							if other.DelegatedFromTaskID == rec.TaskID {
+								alreadyLinked := false
+								for _, existing := range rec.Delegates {
+									if existing.ChildTaskID == other.TaskID {
+										alreadyLinked = true
+										break
+									}
+								}
+								if !alreadyLinked {
+									del.ChildTaskID = other.TaskID
+									break
+								}
+							}
+						}
+					}
 					rec.Delegates = append(rec.Delegates, del)
 				}
 			case lib.ArtifactNotice:
@@ -779,7 +806,7 @@ func (s *BusSession) markForegroundStepTask(taskID string, settled bool) {
 	if settled {
 		s.foregroundTasks[taskID] = time.Now().Add(24 * time.Hour)
 	} else {
-		s.foregroundTasks[taskID] = time.Now().Add(25 * time.Second)
+		s.foregroundTasks[taskID] = time.Now().Add(90 * time.Second)
 	}
 }
 
@@ -1689,13 +1716,24 @@ func extractTaskAddressee(subject string) string {
 }
 
 func extractWakeChildTaskID(prompt string) string {
-	if !strings.HasPrefix(prompt, wakePromptPrefix) {
+	if strings.HasPrefix(prompt, wakePromptPrefix) {
+		rest := strings.TrimPrefix(prompt, wakePromptPrefix)
+		fields := strings.Fields(rest)
+		if len(fields) > 0 {
+			return strings.TrimRight(fields[0], "]")
+		}
 		return ""
 	}
-	rest := strings.TrimPrefix(prompt, wakePromptPrefix)
-	fields := strings.Fields(rest)
-	if len(fields) > 0 {
-		return strings.TrimRight(fields[0], "]")
+	for _, marker := range []string{"The task you delegated to ", "You delegated to "} {
+		if mIdx := strings.Index(prompt, marker); mIdx >= 0 {
+			afterMarker := prompt[mIdx+len(marker):]
+			if idx := strings.Index(afterMarker, "(task "); idx >= 0 && idx < 80 {
+				rest := afterMarker[idx+len("(task "):]
+				if end := strings.IndexByte(rest, ')'); end > 0 {
+					return strings.TrimSpace(rest[:end])
+				}
+			}
+		}
 	}
 	return ""
 }

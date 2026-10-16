@@ -1386,7 +1386,7 @@ print("Here is the fleet summary.")
 		t.Fatalf("thinking artifact = %+v, want 2 parts", thinking)
 	}
 	first := thinking.Parts[0].Text
-	if first != "Checking GKE cluster inventory first." ||
+	if first != "Listing GKE clusters in the fleet.\tChecking GKE cluster inventory first." ||
 		strings.Contains(first, "secret123") || strings.Contains(first, "my-proj") {
 		t.Fatalf("first thinking part = %q", first)
 	}

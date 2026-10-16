@@ -1074,7 +1074,21 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 				TaskID:    multiStepTaskID,
 				ContextID: multiStepCtxID,
 				Append:    true,
-				Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Searching available tools.\nListing GKE clusters in the fleet."}}},
+				Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Searching available tools.\tLooking up GKE and kubectl tools first.\nListing GKE clusters in the fleet.\tQuerying fleet cluster inventory."}}},
+			}),
+		})
+		publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+			Protocol:   lib.Protocol,
+			EnvelopeID: "ms-out-2b",
+			TS:         now.Add(60 * time.Millisecond),
+			TaskID:     multiStepTaskID,
+			ContextID:  multiStepCtxID,
+			Kind:       lib.KindArtifactUpdate,
+			From:       lib.Party{Session: "platform-agent"},
+			Payload: mustJSON(lib.ArtifactUpdate{
+				TaskID:    multiStepTaskID,
+				ContextID: multiStepCtxID,
+				Artifact:  lib.Artifact{Name: lib.ArtifactActivity, Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"tool_search","input":{"query":"\u003cstring, 11 chars\u003e"},"callId":"c-ts-1","status":"completed","durationMs":45}`)}, {Kind: "data", Data: json.RawMessage(`{"tool":"mcp__gke__list_clusters","input":{"project":"\u003cstring, 14 chars\u003e"},"callId":"c-gke-1","status":"completed","durationMs":210}`)}}},
 			}),
 		})
 
@@ -1092,7 +1106,22 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 					TaskID:    multiStepTaskID,
 					ContextID: multiStepCtxID,
 					Append:    true,
-					Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Running cluster and workspace diagnostics."}}},
+					Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Checking Kubernetes node status and readiness.\tAll 5 node pools RUNNING, now checking pods and nodes."}}},
+				}),
+			})
+			publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+				Protocol:   lib.Protocol,
+				EnvelopeID: "ms-out-3b",
+				TS:         time.Now().UTC(),
+				TaskID:     multiStepTaskID,
+				ContextID:  multiStepCtxID,
+				Kind:       lib.KindArtifactUpdate,
+				From:       lib.Party{Session: "platform-agent"},
+				Payload: mustJSON(lib.ArtifactUpdate{
+					TaskID:    multiStepTaskID,
+					ContextID: multiStepCtxID,
+					Append:    true,
+					Artifact:  lib.Artifact{Name: lib.ArtifactActivity, Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"terminal","input":{"command":"\u003cstring, 48 chars\u003e"},"callId":"c-term-1","status":"completed","durationMs":620}`)}}},
 				}),
 			})
 			publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
@@ -1143,7 +1172,7 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	})
 	_ = mcpSrv.CallTool(ctx, toolConnectDeployment, connectArgs)
 
-	// 1. Call send_message over JSON-RPC with Jetski _meta: should return Step 1 ONLY (not a cumulative list!)
+	// 1. Call send_message over JSON-RPC with Jetski _meta: should return Step 1 ONLY with rich Agent + Thought + Tool Activity!
 	req1 := `{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check all pods in kubeagents-system"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
 	resp1Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req1))
 	var resp1 struct {
@@ -1167,7 +1196,17 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	if !strings.Contains(env1.Title, "Searching available tools") {
 		t.Errorf("unexpected step 1 title: %q", env1.Title)
 	}
-	if !strings.Contains(env1.MD, "✅ **Searching available tools.**") || strings.Contains(env1.MD, "Listing GKE clusters") {
+	for _, wantInMD1 := range []string{
+		"**Agent**: `platform`",
+		"**Thought**: *Looking up GKE and kubectl tools first.*",
+		"**`tool_search`**",
+		"45ms",
+	} {
+		if !strings.Contains(env1.MD, wantInMD1) {
+			t.Errorf("step 1 expanded markdown missing %q:\n%s", wantInMD1, env1.MD)
+		}
+	}
+	if strings.Contains(env1.MD, "Listing GKE clusters") {
 		t.Errorf("expected step 1 markdown to contain ONLY step 1:\n%s", env1.MD)
 	}
 	if !strings.Contains(env1.Result, "STREAMING_STEP_CONTINUE") || !strings.Contains(env1.Result, multiStepTaskID) {
@@ -1175,7 +1214,7 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	}
 
 	// 2. Call task_control(action: "get") #1: advances by 1 step to Step 2 ("Listing GKE clusters in the fleet")
-	// and does NOT repeat Step 1 in its markdown!
+	// and shows Step 2's Thought + Tool Activity!
 	req2 := `{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"task_control","arguments":{"action":"get","task_id":"` + multiStepTaskID + `"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
 	resp2Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req2))
 	var resp2 struct {
@@ -1196,12 +1235,21 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	if !strings.Contains(env2.Title, "Listing GKE clusters in the fleet") {
 		t.Errorf("unexpected step 2 title: %q", env2.Title)
 	}
-	if !strings.Contains(env2.MD, "✅ **Listing GKE clusters in the fleet.**") || strings.Contains(env2.MD, "Searching available tools") {
+	for _, wantInMD2 := range []string{
+		"**Thought**: *Querying fleet cluster inventory.*",
+		"**`mcp__gke__list_clusters`**",
+		"210ms",
+	} {
+		if !strings.Contains(env2.MD, wantInMD2) {
+			t.Errorf("step 2 expanded markdown missing %q:\n%s", wantInMD2, env2.MD)
+		}
+	}
+	if strings.Contains(env2.MD, "Searching available tools") {
 		t.Errorf("expected step 2 markdown to contain ONLY step 2 (not repeating step 1):\n%s", env2.MD)
 	}
 
-	// 3. Call task_control(action: "get") #2: waits for step 3 & completion and returns ONLY step 3 in the step row
-	// (no duplicate cumulative list!), while the LLM result has the full <details><summary>Thought...(3 steps)</summary> + answer.
+	// 3. Call task_control(action: "get") #2: waits for step 3 & completion and returns ONLY step 3 in the step row,
+	// while the LLM result has ONLY the final answer (NO duplicate <details><summary>Thought...</summary> block!).
 	req3 := `{"jsonrpc":"2.0","id":203,"method":"tools/call","params":{"name":"task_control","arguments":{"action":"get","task_id":"` + multiStepTaskID + `"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
 	resp3Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req3))
 	var resp3 struct {
@@ -1219,23 +1267,176 @@ func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp3.Result.Content[0].Text), &env3); err != nil {
 		t.Fatalf("unmarshal env3: %v", err)
 	}
-	if !strings.Contains(env3.Title, "Running cluster and workspace diagnostics") {
+	if !strings.Contains(env3.Title, "Checking Kubernetes node status and readiness") {
 		t.Errorf("unexpected completion step title: %q", env3.Title)
 	}
-	if !strings.Contains(env3.MD, "✅ **Running cluster and workspace diagnostics.**") || strings.Contains(env3.MD, "Searching available tools") {
-		t.Errorf("expected completion step markdown to contain ONLY step 3 (not repeating steps 1-2):\n%s", env3.MD)
-	}
-	for _, want := range []string{
-		"<details>\n<summary>Thought",
-		"(3 steps)</summary>",
-		"- ✅ Searching available tools.",
-		"- ✅ Listing GKE clusters in the fleet.",
-		"- ✅ Running cluster and workspace diagnostics.",
-		"All 9 pods in kubeagents-system are Running and Ready.",
+	for _, wantInMD3 := range []string{
+		"**Thought**: *All 5 node pools RUNNING, now checking pods and nodes.*",
+		"**`terminal`**",
+		"`command` (48 chars)",
+		"620ms",
 	} {
-		if !strings.Contains(env3.Result, want) {
-			t.Errorf("final LLM result missing %q:\n%s", want, env3.Result)
+		if !strings.Contains(env3.MD, wantInMD3) {
+			t.Errorf("step 3 expanded markdown missing %q:\n%s", wantInMD3, env3.MD)
 		}
+	}
+	if !strings.Contains(env3.Result, "All 9 pods in kubeagents-system are Running and Ready.") {
+		t.Errorf("final LLM result missing answer:\n%s", env3.Result)
+	}
+	if strings.Contains(env3.Result, "<details>\n<summary>Thought") {
+		t.Errorf("final LLM result in Jetski custom envelope should NOT contain duplicate <details><summary>Thought block:\n%s", env3.Result)
+	}
+}
+
+func TestViaAuthorityDelegationAndConversationalStepNormalization(t *testing.T) {
+	s := &BusSession{
+		tasks:         make(map[string]*TaskRecord),
+		seenEnvelopes: make(map[string]bool),
+	}
+	now := time.Now().UTC()
+
+	// 1. Ingest parent /session task that emits ArtifactDelegate to platform.
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-parent-via.in", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-1",
+		TS:         now,
+		TaskID:     "task-parent-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindMessage,
+		Authority:  mustJSON(map[string]any{"audience": map[string]any{"conversation": "console:tok"}}),
+		Payload:    mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "check all clusters"}}}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-parent-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-2",
+		TS:         now.Add(1 * time.Second),
+		TaskID:     "task-parent-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID:   "task-parent-via",
+			Artifact: lib.Artifact{Name: lib.ArtifactDelegate, Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"addressee":"platform","text":"Run fleet health check across 16 clusters"}`)}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-parent-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-3",
+		TS:         now.Add(2 * time.Second),
+		TaskID:     "task-parent-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindStatusUpdate,
+		Payload:    mustJSON(lib.StatusUpdate{TaskID: "task-parent-via", Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+	}), true)
+
+	// 2. Ingest delegated child task on platform using gateway's real `authority.via.taskId` wire format,
+	// with conversational thinking lines and an intermediate "Synthesizing findings into final response." before Kanban steps.
+	s.ingestTaskEnvelope("a2a.tasks.platform.task-child-via.in", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-4",
+		TS:         now.Add(3 * time.Second),
+		TaskID:     "task-child-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindMessage,
+		Authority: mustJSON(map[string]any{
+			"audience": map[string]any{"conversation": "console:tok"},
+			"via":      map[string]any{"taskId": "task-parent-via", "session": "chat-puffin-1"},
+		}),
+		Payload: mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "Run fleet health check across 16 clusters"}}}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.platform.task-child-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-5",
+		TS:         now.Add(10 * time.Second),
+		TaskID:     "task-child-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: "task-child-via",
+			Append: true,
+			Artifact: lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: strings.Join([]string{
+				"Listing GKE cluster profiles in the fleet.",
+				"Synthesizing findings into final response.",
+				"Preflight ok. Now let's run diagnostics",
+				"12/16 done, 4 still running. Wait 25s and re-check.",
+				"Synthesizing findings into final response.",
+			}, "\n")}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.platform.task-child-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-6",
+		TS:         now.Add(20 * time.Second),
+		TaskID:     "task-child-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindStatusUpdate,
+		Payload:    mustJSON(lib.StatusUpdate{TaskID: "task-child-via", Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+	}), true)
+
+	// 3. Ingest gateway's real wake synthesis prompt ("The task you delegated to platform (task task-child-via) returned:...").
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-wake-via.in", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-7",
+		TS:         now.Add(21 * time.Second),
+		TaskID:     "task-wake-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindMessage,
+		Authority:  mustJSON(map[string]any{"audience": map[string]any{"conversation": "console:tok"}}),
+		Payload:    mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "You were asked:\n```\ncheck all clusters\n```\n\nYou delegated to platform (task task-child-via), which returned:\n\n16/16 clusters healthy."}}}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-wake-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-8",
+		TS:         now.Add(25 * time.Second),
+		TaskID:     "task-wake-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID:   "task-wake-via",
+			Artifact: lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "All 16 clusters are healthy."}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.chat-puffin-1.task-wake-via.out", mustJSON(lib.Envelope{
+		Protocol:   lib.Protocol,
+		EnvelopeID: "via-9",
+		TS:         now.Add(26 * time.Second),
+		TaskID:     "task-wake-via",
+		ContextID:  "ctx-via",
+		Kind:       lib.KindStatusUpdate,
+		Payload:    mustJSON(lib.StatusUpdate{TaskID: "task-wake-via", Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+	}), true)
+
+	if !s.IsTaskTreeSettled("task-parent-via") {
+		t.Fatal("expected task tree to be settled once parent, via-child, and wake tasks complete")
+	}
+	outcome := s.BuildTaskOutcome("task-parent-via", "fleet-health", "tok", "check all clusters", false)
+	if len(outcome.ChildTasks) != 1 || outcome.ChildTasks[0].TaskID != "task-child-via" {
+		t.Fatalf("expected child task linked via authority.via.taskId, got %+v", outcome.ChildTasks)
+	}
+	if outcome.WakeTask == nil || outcome.WakeTask.TaskID != "task-wake-via" {
+		t.Fatalf("expected wake task linked via gateway wake prompt, got %+v", outcome.WakeTask)
+	}
+
+	details := CollectOutcomeStepDetails(outcome)
+	wantTitles := []string{
+		"Delegating task to platform.",
+		"Listing GKE cluster profiles in the fleet.",
+		"Completing preflight checks and starting cluster diagnostics.",
+		"Waiting for specialist agent tasks (12/16 completed).",
+		"Synthesizing findings into final response.",
+	}
+	if len(details) != len(wantTitles) {
+		t.Fatalf("got %d step details (%+v), want %d (%v)", len(details), details, len(wantTitles), wantTitles)
+	}
+	for i, want := range wantTitles {
+		if details[i].Title != want {
+			t.Errorf("step[%d].Title = %q, want %q", i, details[i].Title, want)
+		}
+	}
+	if details[2].Thought != "Preflight ok. Now let's run diagnostics" {
+		t.Errorf("step[2].Thought = %q, want conversational line preserved in Thought", details[2].Thought)
+	}
+	if details[3].Thought != "12/16 done, 4 still running. Wait 25s and re-check." {
+		t.Errorf("step[3].Thought = %q, want progress detail preserved in Thought", details[3].Thought)
 	}
 }
 
