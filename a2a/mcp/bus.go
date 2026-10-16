@@ -66,6 +66,10 @@ const (
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
 	defaultTurnWaitTimeout       = 150 * time.Second
+	defaultStepStreamWindow      = 6 * time.Second
+	initialStepStreamWindow      = 4 * time.Second
+	minStepBatchWait             = 1200 * time.Millisecond
+	stepDebounceWait             = 450 * time.Millisecond
 	pollTickInterval             = 100 * time.Millisecond
 	progressHeartbeatInterval    = 2 * time.Second
 	natsConnectTimeout           = 10 * time.Second
@@ -282,14 +286,15 @@ type BusSession struct {
 	onPushEvent  func(PushEvent)
 	bootstrapped bool
 
-	mu             sync.RWMutex
-	tasks          map[string]*TaskRecord
-	seenEnvelopes  map[string]bool
-	topics         map[string]TopicSnapshot
-	agentCards     map[string]map[string]any
-	consoleNotices []ConsoleOutFrame
-	watchedConvs   map[string]int
-	watchedTasks   map[string]int
+	mu                sync.RWMutex
+	tasks             map[string]*TaskRecord
+	seenEnvelopes     map[string]bool
+	topics            map[string]TopicSnapshot
+	agentCards        map[string]map[string]any
+	consoleNotices    []ConsoleOutFrame
+	watchedConvs      map[string]int
+	watchedTasks      map[string]int
+	lastReportedSteps map[string]int
 }
 
 // ConnectBusSession dials a deployment's NATS JetStream bus (starting a local port-forward
@@ -357,8 +362,9 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 		seenEnvelopes: make(map[string]bool),
 		topics:        make(map[string]TopicSnapshot),
 		agentCards:    make(map[string]map[string]any),
-		watchedConvs:  make(map[string]int),
-		watchedTasks:  make(map[string]int),
+		watchedConvs:      make(map[string]int),
+		watchedTasks:      make(map[string]int),
+		lastReportedSteps: make(map[string]int),
 	}
 
 	if err := s.startSubscriptions(); err != nil {
@@ -899,6 +905,13 @@ func (s *BusSession) handlePassiveNotify(msg *nats.Msg) {
 // and streams back all thinking, tool activities, progress, delegation children,
 // wake turns, and results.
 func (s *BusSession) SendTurn(ctx context.Context, store *ConfigStore, conv ConversationEntry, rawText string, mode string, waitTimeout time.Duration) (*TurnOutcome, error) {
+	return s.SendTurnWithOptions(ctx, store, conv, rawText, mode, waitTimeout, false)
+}
+
+// SendTurnWithOptions publishes a message or control command to chat.console.<token>.in.
+// When streamSteps is true, it waits for the first step batch (or completion if fast) and
+// returns immediately so Jetski can render incremental collapsed step updates as the task runs.
+func (s *BusSession) SendTurnWithOptions(ctx context.Context, store *ConfigStore, conv ConversationEntry, rawText string, mode string, waitTimeout time.Duration, streamSteps bool) (*TurnOutcome, error) {
 	if waitTimeout <= 0 {
 		waitTimeout = defaultTurnWaitTimeout
 	}
@@ -985,14 +998,35 @@ func (s *BusSession) SendTurn(ctx context.Context, store *ConfigStore, conv Conv
 		return outcome, err
 	}
 
-	s.watchTask(primaryID, 1)
-	defer s.watchTask(primaryID, -1)
+	s.setReportedStepCount(primaryID, 0)
+	timedOut := s.WaitForTaskStepOrSettlement(turnCtx, primaryID, streamSteps)
+	built := s.BuildTaskOutcome(primaryID, conv.Alias, conv.Token, text, timedOut)
+	built.ConsoleNotices = append(preNotices, s.consoleNoticesSince(conv.Token, noticeCursor)...)
 
-	timedOut := s.waitForTaskAndDelegations(turnCtx, primaryID)
-	outcome.TimedOut = timedOut
-	outcome.ConsoleNotices = append(preNotices, s.consoleNoticesSince(conv.Token, noticeCursor)...)
-	outcome.PrimaryTask = s.GetTask(primaryID)
+	if cb := progressCallbackFromContext(ctx); cb != nil && built.PrimaryTask != nil {
+		cb(999, FormatLiveTaskProgress(built.PrimaryTask, built.ChildTasks, built.WakeTask, time.Since(built.PrimaryTask.CreatedAt)))
+	}
 
+	return built, nil
+}
+
+// BuildTaskOutcome constructs a TurnOutcome for a primary task ID, including any delegated child
+// tasks and session wake synthesis task.
+func (s *BusSession) BuildTaskOutcome(primaryID string, convAlias string, convToken string, sentText string, timedOut bool) *TurnOutcome {
+	primary := s.GetTask(primaryID)
+	outcome := &TurnOutcome{
+		ConversationAlias: convAlias,
+		ConversationToken: convToken,
+		SentText:          sentText,
+		PrimaryTask:       primary,
+		TimedOut:          timedOut,
+	}
+	if primary == nil {
+		return outcome
+	}
+	if outcome.ConversationToken == "" && strings.HasPrefix(primary.Conversation, consoleConvPrefix) {
+		outcome.ConversationToken = strings.TrimPrefix(primary.Conversation, consoleConvPrefix)
+	}
 	children := s.findChildTasks(primaryID)
 	outcome.ChildTasks = children
 	for _, child := range children {
@@ -1000,12 +1034,130 @@ func (s *BusSession) SendTurn(ctx context.Context, store *ConfigStore, conv Conv
 			outcome.WakeTask = wake
 		}
 	}
+	return outcome
+}
 
-	if cb := progressCallbackFromContext(ctx); cb != nil && outcome.PrimaryTask != nil {
-		cb(999, FormatLiveTaskProgress(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask, time.Since(outcome.PrimaryTask.CreatedAt)))
+// IsTaskTreeSettled returns true if the primary task and any expected delegated child / wake tasks
+// have reached a terminal or input-required state.
+func (s *BusSession) IsTaskTreeSettled(primaryID string) bool {
+	primary := s.GetTask(primaryID)
+	if primary == nil {
+		return false
+	}
+	if !primary.Terminal && primary.State != lib.StateInputRequired {
+		return false
+	}
+	children := s.findChildTasks(primaryID)
+	if len(primary.Delegates) > 0 && len(children) == 0 {
+		if time.Since(primary.UpdatedAt) < delegationChildWait {
+			return false
+		}
+		return true
+	}
+	if len(children) == 0 {
+		return true
+	}
+	var wake *TaskRecord
+	for _, child := range children {
+		if !child.Terminal && child.State != lib.StateInputRequired {
+			return false
+		}
+		if w := s.findWakeTask(child.TaskID); w != nil {
+			wake = w
+		}
+	}
+	if wake == nil && (len(primary.Delegates) > 0 || strings.HasPrefix(primary.Addressee, "s-")) {
+		lastChild := children[len(children)-1]
+		if time.Since(lastChild.UpdatedAt) < delegationWakeWait {
+			return false
+		}
+		return true
+	}
+	if wake != nil && !wake.Terminal && wake.State != lib.StateInputRequired {
+		return false
+	}
+	return true
+}
+
+// WaitForTaskStepOrSettlement waits for a task tree. When streamSteps is false, it waits until
+// full settlement or ctx expiration. When streamSteps is true, it waits until either the task tree
+// settles OR at least one new human-readable step arrives (batched over minStepBatchWait + stepDebounceWait)
+// OR the per-step streaming window elapses, returning true if the task is still in flight (timedOut).
+func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID string, streamSteps bool) bool {
+	s.watchTask(primaryID, 1)
+	defer s.watchTask(primaryID, -1)
+
+	if !streamSteps {
+		timedOut := s.waitForTaskAndDelegations(ctx, primaryID)
+		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", timedOut))
+		s.setReportedStepCount(primaryID, len(steps))
+		return timedOut
 	}
 
-	return outcome, nil
+	baseline := s.getReportedStepCount(primaryID)
+	window := defaultStepStreamWindow
+	if baseline == 0 {
+		window = initialStepStreamWindow
+	}
+	stepCtx, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+
+	ticker := time.NewTicker(pollTickInterval)
+	defer ticker.Stop()
+
+	startedAt := time.Now()
+	lastStepCount := baseline
+	lastChangeAt := time.Time{}
+
+	for {
+		settled := s.IsTaskTreeSettled(primaryID)
+		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !settled))
+		curCount := len(steps)
+
+		if settled {
+			s.setReportedStepCount(primaryID, curCount)
+			return false
+		}
+
+		now := time.Now()
+		if curCount > baseline {
+			if curCount != lastStepCount {
+				lastStepCount = curCount
+				lastChangeAt = now
+			}
+			if now.Sub(startedAt) >= minStepBatchWait && !lastChangeAt.IsZero() && now.Sub(lastChangeAt) >= stepDebounceWait {
+				s.setReportedStepCount(primaryID, curCount)
+				return true
+			}
+		}
+
+		select {
+		case <-stepCtx.Done():
+			finalSettled := s.IsTaskTreeSettled(primaryID)
+			finalSteps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !finalSettled))
+			s.setReportedStepCount(primaryID, len(finalSteps))
+			return !finalSettled
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *BusSession) getReportedStepCount(taskID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastReportedSteps == nil {
+		return 0
+	}
+	return s.lastReportedSteps[taskID]
+}
+
+func (s *BusSession) setReportedStepCount(taskID string, count int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastReportedSteps == nil {
+		s.lastReportedSteps = make(map[string]int)
+	}
+	s.lastReportedSteps[taskID] = count
 }
 
 func (s *BusSession) sendControlCommand(ctx context.Context, token string, cmdText string) ([]ConsoleOutFrame, error) {

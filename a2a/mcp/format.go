@@ -254,6 +254,155 @@ func FormatTurnOutcomeMarkdownWithOptions(outcome *TurnOutcome, debug bool) stri
 	return sb.String()
 }
 
+// CollectOutcomeSteps extracts a clean, deduplicated chronological list of human-readable
+// steps taken across the primary task, delegated child tasks, and wake synthesis task.
+func CollectOutcomeSteps(outcome *TurnOutcome) []string {
+	if outcome == nil {
+		return nil
+	}
+	var steps []string
+	appendStep := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		for _, existing := range steps {
+			if existing == s {
+				return
+			}
+		}
+		steps = append(steps, s)
+	}
+	collectFromRec := func(rec *TaskRecord) {
+		if rec == nil {
+			return
+		}
+		if raw := strings.TrimSpace(rec.Thinking); raw != "" {
+			for _, line := range cleanAndDedupeThinking(raw) {
+				appendStep(line)
+			}
+		}
+		if synth := strings.TrimSpace(SynthesizeThinkingFromActivities(rec)); synth != "" {
+			for _, line := range cleanAndDedupeThinking(synth) {
+				appendStep(line)
+			}
+		}
+	}
+	collectFromRec(outcome.PrimaryTask)
+	for _, d := range outcome.PrimaryTaskDelegates() {
+		if d.Addressee != "" {
+			appendStep(fmt.Sprintf("Delegating task to %s.", d.Addressee))
+		}
+	}
+	for _, child := range outcome.ChildTasks {
+		collectFromRec(child)
+	}
+	collectFromRec(outcome.WakeTask)
+	return steps
+}
+
+// PrimaryTaskDelegates returns the delegates slice on PrimaryTask if non-nil.
+func (o *TurnOutcome) PrimaryTaskDelegates() []DelegateItem {
+	if o == nil || o.PrimaryTask == nil {
+		return nil
+	}
+	return o.PrimaryTask.Delegates
+}
+
+// FormatTurnCustomToolEnvelope builds the Jetski _custom_tool_result fields (title, markdown, result)
+// for a turn outcome so that:
+//  1. Each MCP tool step row in Jetski shows a clean human-readable step title (collapsed by default!),
+//     and when expanded shows ONLY the clean checklist of steps taken so far (never raw Arguments JSON).
+//  2. While a task is still running (outcome.TimedOut == true), the LLM receives a compact
+//     STREAMING_STEP_CONTINUE instruction to immediately poll the next step via task_control(action: "get")
+//     without emitting intermediate chat prose, so Jetski streams live steps inside its collapsible
+//     "Exploring" / "Explored" group!
+//  3. When the task finishes, the LLM receives the final response with a collapsed-by-default
+//     <details><summary>Thought for Xs (N steps)</summary>...</details> section + the final answer.
+func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title string, markdown string, result string) {
+	if outcome == nil {
+		return "", "", ""
+	}
+	fullMD := FormatTurnOutcomeMarkdownWithOptions(outcome, debug)
+	if outcome.PrimaryTask == nil {
+		return "Executed control command", fullMD, fullMD
+	}
+
+	steps := CollectOutcomeSteps(outcome)
+	sec := computeOutcomeElapsedSeconds(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask)
+	if sec < 1 {
+		sec = 1
+	}
+
+	if outcome.TimedOut {
+		latestStep := fmt.Sprintf("Starting task on %s", firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"))
+		if len(steps) > 0 {
+			latestStep = strings.TrimSuffix(steps[len(steps)-1], ".")
+		}
+		if len(steps) > 0 {
+			title = fmt.Sprintf("%s (%d %s • %ds)", latestStep, len(steps), pluralizeStep(len(steps)), sec)
+		} else {
+			title = fmt.Sprintf("%s (%ds)", latestStep, sec)
+		}
+
+		var md strings.Builder
+		fmt.Fprintf(&md, "**Progress (`%d %s • %ds elapsed`)**\n\n", len(steps), pluralizeStep(len(steps)), sec)
+		if len(steps) == 0 {
+			fmt.Fprintf(&md, "- 🔄 **%s...**\n", latestStep)
+		} else {
+			for i, s := range steps {
+				if i == len(steps)-1 {
+					fmt.Fprintf(&md, "- 🔄 **%s**\n", s)
+				} else {
+					fmt.Fprintf(&md, "- ✅ %s\n", s)
+				}
+			}
+		}
+
+		var llm strings.Builder
+		fmt.Fprintf(&llm, "STREAMING_STEP_CONTINUE: Task `%s` is actively running on `%s` (%ds elapsed, %d %s recorded).\n",
+			outcome.PrimaryTask.TaskID, firstNonEmptyStr(outcome.PrimaryTask.Addressee, "platform-agent"), sec, len(steps), pluralizeStep(len(steps)))
+		if len(steps) > 0 {
+			llm.WriteString("Steps taken so far:\n")
+			for _, s := range steps {
+				fmt.Fprintf(&llm, "- %s\n", s)
+			}
+		}
+		fmt.Fprintf(&llm, "\nNEXT ACTION REQUIRED: Immediately call `mcp_kube-agents_task_control` with `action: \"get\"`, `task_id: %q`, and `toolSummary: %q` to stream the next step. Do NOT output any assistant text before calling `task_control` so that all progress steps stay cleanly grouped and collapsible in the UI.\n",
+			outcome.PrimaryTask.TaskID, truncateText(latestStep, 48))
+
+		return title, strings.TrimSpace(md.String()), strings.TrimSpace(llm.String())
+	}
+
+	// Settled / completed task:
+	if len(steps) > 0 {
+		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(steps), pluralizeStep(len(steps)))
+	} else {
+		title = fmt.Sprintf("Completed in %ds", sec)
+	}
+
+	if debug {
+		return title, fullMD, fullMD
+	}
+
+	var stepMD strings.Builder
+	fmt.Fprintf(&stepMD, "**Completed in %ds (`%d %s`)**\n\n", sec, len(steps), pluralizeStep(len(steps)))
+	for _, s := range steps {
+		fmt.Fprintf(&stepMD, "- ✅ %s\n", s)
+	}
+	if len(steps) == 0 {
+		stepMD.WriteString("- ✅ Task completed.\n")
+	}
+	return title, strings.TrimSpace(stepMD.String()), fullMD
+}
+
+func pluralizeStep(n int) string {
+	if n == 1 {
+		return "step"
+	}
+	return "steps"
+}
+
 func formatCleanTurnOutcomeMarkdown(outcome *TurnOutcome) string {
 	var sb strings.Builder
 
@@ -267,34 +416,13 @@ func formatCleanTurnOutcomeMarkdown(outcome *TurnOutcome) string {
 		return strings.TrimSpace(sb.String())
 	}
 
-	// Collect clean, deduplicated thinking steps across primary, child, and wake tasks.
-	var thoughts []string
-	addThoughts := func(rec *TaskRecord) {
-		if rec == nil {
-			return
-		}
-		raw := strings.TrimSpace(rec.Thinking)
-		if raw == "" {
-			raw = SynthesizeThinkingFromActivities(rec)
-		}
-		for _, line := range cleanAndDedupeThinking(raw) {
-			if len(thoughts) == 0 || thoughts[len(thoughts)-1] != line {
-				thoughts = append(thoughts, line)
-			}
-		}
-	}
-	addThoughts(outcome.PrimaryTask)
-	for _, child := range outcome.ChildTasks {
-		addThoughts(child)
-	}
-	addThoughts(outcome.WakeTask)
-
-	summaryLabel := formatThoughtSummaryLabel(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask)
+	thoughts := CollectOutcomeSteps(outcome)
+	summaryLabel := formatThoughtSummaryLabel(outcome.PrimaryTask, outcome.ChildTasks, outcome.WakeTask, len(thoughts))
 	if len(thoughts) > 0 {
 		sb.WriteString("<details>\n")
 		fmt.Fprintf(&sb, "<summary>%s</summary>\n\n", summaryLabel)
 		for _, line := range thoughts {
-			fmt.Fprintf(&sb, "- %s\n", line)
+			fmt.Fprintf(&sb, "- ✅ %s\n", line)
 		}
 		sb.WriteString("\n</details>\n\n")
 	}
@@ -383,9 +511,9 @@ func renderTaskAnswerBody(rec *TaskRecord) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func formatThoughtSummaryLabel(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord) string {
+func computeOutcomeElapsedSeconds(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord) int {
 	if primary == nil {
-		return "Thought"
+		return 0
 	}
 	start := primary.CreatedAt
 	end := primary.UpdatedAt
@@ -397,10 +525,16 @@ func formatThoughtSummaryLabel(primary *TaskRecord, children []*TaskRecord, wake
 	if wake != nil && wake.UpdatedAt.After(end) {
 		end = wake.UpdatedAt
 	}
+	if !primary.Terminal {
+		now := time.Now().UTC()
+		if now.After(end) {
+			end = now
+		}
+	}
 	if !start.IsZero() && end.After(start) {
 		sec := int(end.Sub(start).Round(time.Second).Seconds())
 		if sec >= 1 {
-			return fmt.Sprintf("Thought for %ds", sec)
+			return sec
 		}
 	}
 	var totalMs int64
@@ -415,7 +549,21 @@ func formatThoughtSummaryLabel(primary *TaskRecord, children []*TaskRecord, wake
 		}
 	}
 	if totalMs >= 1000 {
-		return fmt.Sprintf("Thought for %ds", int((time.Duration(totalMs)*time.Millisecond).Round(time.Second).Seconds()))
+		return int((time.Duration(totalMs) * time.Millisecond).Round(time.Second).Seconds())
+	}
+	return 0
+}
+
+func formatThoughtSummaryLabel(primary *TaskRecord, children []*TaskRecord, wake *TaskRecord, stepCount int) string {
+	sec := computeOutcomeElapsedSeconds(primary, children, wake)
+	if sec >= 1 && stepCount > 0 {
+		return fmt.Sprintf("Thought for %ds (%d %s)", sec, stepCount, pluralizeStep(stepCount))
+	}
+	if sec >= 1 {
+		return fmt.Sprintf("Thought for %ds", sec)
+	}
+	if stepCount > 0 {
+		return fmt.Sprintf("Thought (%d %s)", stepCount, pluralizeStep(stepCount))
 	}
 	return "Thought"
 }
@@ -502,17 +650,13 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		sb.WriteString("\n\n")
 	}
 
-	thinkingText := strings.TrimSpace(rec.Thinking)
-	if thinkingText == "" {
-		thinkingText = SynthesizeThinkingFromActivities(rec)
-	}
-	thoughts := cleanAndDedupeThinking(thinkingText)
+	thoughts := CollectOutcomeSteps(&TurnOutcome{PrimaryTask: rec})
 	if len(thoughts) > 0 {
-		label := formatThoughtSummaryLabel(rec, nil, nil)
+		label := formatThoughtSummaryLabel(rec, nil, nil, len(thoughts))
 		sb.WriteString("<details>\n")
 		fmt.Fprintf(&sb, "<summary>%s</summary>\n\n", label)
 		for _, line := range thoughts {
-			fmt.Fprintf(&sb, "- %s\n", line)
+			fmt.Fprintf(&sb, "- ✅ %s\n", line)
 		}
 		sb.WriteString("\n</details>\n\n")
 	}

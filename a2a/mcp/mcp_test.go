@@ -1007,6 +1007,205 @@ func TestProgressNotificationsAndAutoMetaBinding(t *testing.T) {
 	}
 }
 
+func TestIncrementalStepStreamingAndCustomEnvelope(t *testing.T) {
+	srv, nc, _ := startEmbeddedJetStream(t)
+	ctx := context.Background()
+
+	const (
+		multiStepTaskID = "task-multistep-501"
+		multiStepCtxID  = "ctx-multistep-501"
+	)
+
+	// Simulate a multi-step platform-agent task where:
+	// - Step 1 & 2 arrive within 200ms (so send_message returns after ~1.3s with STREAMING_STEP_CONTINUE).
+	// - Step 3 and final completion arrive ~2.0s after task start (captured by the follow-up task_control get call).
+	sub, err := nc.Subscribe("chat.console.*.in", func(msg *nats.Msg) {
+		var in ConsoleInFrame
+		_ = json.Unmarshal(msg.Data, &in)
+		token := strings.TrimPrefix(msg.Subject, subjectConsoleInPrefix)
+		token = strings.TrimSuffix(token, subjectConsoleInSuffix)
+		convName := consoleConvPrefix + token
+		authRaw := mustJSON(map[string]any{
+			"audience": map[string]any{"conversation": convName},
+		})
+		now := time.Now().UTC()
+
+		pReqSubj := fmt.Sprintf("a2a.tasks.platform.%s.in", multiStepTaskID)
+		pOutSubj := fmt.Sprintf("a2a.tasks.platform.%s.out", multiStepTaskID)
+
+		publishTaskEnv(t, nc, pReqSubj, lib.Envelope{
+			Protocol:   lib.Protocol,
+			EnvelopeID: "ms-req-1",
+			TS:         now,
+			TaskID:     multiStepTaskID,
+			ContextID:  multiStepCtxID,
+			Kind:       lib.KindMessage,
+			From:       lib.Party{Session: "gateway"},
+			Authority:  authRaw,
+			Payload:    mustJSON(lib.Message{Role: "user", MessageID: "m-ms-1", Parts: []lib.Part{{Kind: "text", Text: in.Text}}}),
+		})
+		publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+			Protocol:   lib.Protocol,
+			EnvelopeID: "ms-out-1",
+			TS:         now.Add(20 * time.Millisecond),
+			TaskID:     multiStepTaskID,
+			ContextID:  multiStepCtxID,
+			Kind:       lib.KindStatusUpdate,
+			From:       lib.Party{Session: "platform-agent"},
+			Payload:    mustJSON(lib.StatusUpdate{TaskID: multiStepTaskID, ContextID: multiStepCtxID, Status: lib.TaskStatus{State: lib.StateWorking}}),
+		})
+		publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+			Protocol:   lib.Protocol,
+			EnvelopeID: "ms-out-2",
+			TS:         now.Add(50 * time.Millisecond),
+			TaskID:     multiStepTaskID,
+			ContextID:  multiStepCtxID,
+			Kind:       lib.KindArtifactUpdate,
+			From:       lib.Party{Session: "platform-agent"},
+			Payload: mustJSON(lib.ArtifactUpdate{
+				TaskID:    multiStepTaskID,
+				ContextID: multiStepCtxID,
+				Append:    true,
+				Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Searching available tools.\nListing GKE clusters in the fleet."}}},
+			}),
+		})
+
+		go func() {
+			time.Sleep(1800 * time.Millisecond)
+			publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+				Protocol:   lib.Protocol,
+				EnvelopeID: "ms-out-3",
+				TS:         time.Now().UTC(),
+				TaskID:     multiStepTaskID,
+				ContextID:  multiStepCtxID,
+				Kind:       lib.KindArtifactUpdate,
+				From:       lib.Party{Session: "platform-agent"},
+				Payload: mustJSON(lib.ArtifactUpdate{
+					TaskID:    multiStepTaskID,
+					ContextID: multiStepCtxID,
+					Append:    true,
+					Artifact:  lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Running cluster and workspace diagnostics."}}},
+				}),
+			})
+			publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+				Protocol:   lib.Protocol,
+				EnvelopeID: "ms-out-4",
+				TS:         time.Now().UTC(),
+				TaskID:     multiStepTaskID,
+				ContextID:  multiStepCtxID,
+				Kind:       lib.KindArtifactUpdate,
+				From:       lib.Party{Session: "platform-agent"},
+				Payload: mustJSON(lib.ArtifactUpdate{
+					TaskID:    multiStepTaskID,
+					ContextID: multiStepCtxID,
+					Artifact:  lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "All 9 pods in kubeagents-system are Running and Ready."}}},
+				}),
+			})
+			publishTaskEnv(t, nc, pOutSubj, lib.Envelope{
+				Protocol:   lib.Protocol,
+				EnvelopeID: "ms-out-5",
+				TS:         time.Now().UTC(),
+				TaskID:     multiStepTaskID,
+				ContextID:  multiStepCtxID,
+				Kind:       lib.KindStatusUpdate,
+				From:       lib.Party{Session: "platform-agent"},
+				Payload:    mustJSON(lib.StatusUpdate{TaskID: multiStepTaskID, ContextID: multiStepCtxID, Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+			})
+		}()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcpSrv, err := NewServer(ServerOptions{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(mcpSrv.Close)
+
+	connectArgs, _ := json.Marshal(map[string]any{
+		"deployment":      testClusterName,
+		"namespace":       testNamespace,
+		"direct_nats_url": srv.ClientURL(),
+	})
+	_ = mcpSrv.CallTool(ctx, toolConnectDeployment, connectArgs)
+
+	// 1. Call send_message over JSON-RPC with Jetski _meta: should return after the first batch of steps (~1.25s)
+	// with STREAMING_STEP_CONTINUE, custom step title, and clean collapsed-by-default markdown (no raw JSON arguments!).
+	req1 := `{"jsonrpc":"2.0","id":201,"method":"tools/call","params":{"name":"send_message","arguments":{"message":"Check all pods in kubeagents-system"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
+	resp1Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req1))
+	var resp1 struct {
+		Result mcpCallToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(resp1Raw, &resp1); err != nil {
+		t.Fatalf("unmarshal resp1: %v", err)
+	}
+	var env1 struct {
+		Custom  bool   `json:"_custom_tool_result"`
+		Title   string `json:"title"`
+		MD      string `json:"markdown"`
+		Result  string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(resp1.Result.Content[0].Text), &env1); err != nil {
+		t.Fatalf("unmarshal env1: %v\nraw: %s", err, resp1.Result.Content[0].Text)
+	}
+	if !env1.Custom {
+		t.Fatalf("expected _custom_tool_result=true in env1")
+	}
+	if !strings.Contains(env1.Title, "Listing GKE clusters in the fleet") || !strings.Contains(env1.Title, "2 steps") {
+		t.Errorf("unexpected step 1 title: %q", env1.Title)
+	}
+	if !strings.Contains(env1.MD, "✅ Searching available tools.") || !strings.Contains(env1.MD, "🔄 **Listing GKE clusters in the fleet.**") {
+		t.Errorf("unexpected step 1 markdown:\n%s", env1.MD)
+	}
+	if !strings.Contains(env1.Result, "STREAMING_STEP_CONTINUE") || !strings.Contains(env1.Result, multiStepTaskID) {
+		t.Errorf("expected STREAMING_STEP_CONTINUE in LLM result:\n%s", env1.Result)
+	}
+
+	// 2. Call task_control(action: "get") over JSON-RPC: waits for step 3 & completion (~500ms more) and returns
+	// the completed envelope with collapsed <details><summary>Thought for ... (3 steps)</summary>...</details> + final answer.
+	req2 := `{"jsonrpc":"2.0","id":202,"method":"tools/call","params":{"name":"task_control","arguments":{"action":"get","task_id":"` + multiStepTaskID + `"},"_meta":{"antigravity.google/conversation_id":"conv-stream-test"}}}`
+	resp2Raw := mcpSrv.HandleJSONRPC(ctx, []byte(req2))
+	var resp2 struct {
+		Result mcpCallToolResult `json:"result"`
+	}
+	if err := json.Unmarshal(resp2Raw, &resp2); err != nil {
+		t.Fatalf("unmarshal resp2: %v", err)
+	}
+	var env2 struct {
+		Custom  bool   `json:"_custom_tool_result"`
+		Title   string `json:"title"`
+		MD      string `json:"markdown"`
+		Result  string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(resp2.Result.Content[0].Text), &env2); err != nil {
+		t.Fatalf("unmarshal env2: %v", err)
+	}
+	if !strings.Contains(env2.Title, "Completed in") || !strings.Contains(env2.Title, "3 steps") {
+		t.Errorf("unexpected completion title: %q", env2.Title)
+	}
+	if !strings.Contains(env2.MD, "✅ Running cluster and workspace diagnostics.") {
+		t.Errorf("unexpected completion step markdown:\n%s", env2.MD)
+	}
+	for _, want := range []string{
+		"<details>\n<summary>Thought",
+		"(3 steps)</summary>",
+		"- ✅ Searching available tools.",
+		"- ✅ Listing GKE clusters in the fleet.",
+		"- ✅ Running cluster and workspace diagnostics.",
+		"All 9 pods in kubeagents-system are Running and Ready.",
+	} {
+		if !strings.Contains(env2.Result, want) {
+			t.Errorf("final LLM result missing %q:\n%s", want, env2.Result)
+		}
+	}
+}
+
 func publishTaskEnv(t *testing.T, nc *nats.Conn, subject string, env lib.Envelope) {
 	t.Helper()
 	raw, err := json.Marshal(env)

@@ -106,8 +106,10 @@ type mcpTextContent struct {
 }
 
 type mcpCallToolResult struct {
-	Content []mcpTextContent `json:"content"`
-	IsError bool             `json:"isError,omitempty"`
+	Content        []mcpTextContent `json:"content"`
+	IsError        bool             `json:"isError,omitempty"`
+	CustomTitle    string           `json:"-"`
+	CustomMarkdown string           `json:"-"`
 }
 
 type mcpResource struct {
@@ -325,12 +327,20 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		res := s.CallTool(callCtx, callParams.Name, callParams.Arguments)
 		if !res.IsError && len(res.Content) > 0 && (callParams.Meta.ConversationID != "" || callParams.Meta.ProgressToken != nil) {
 			txt := res.Content[0].Text
-			if wrapped, err := json.Marshal(map[string]any{
+			md := txt
+			if res.CustomMarkdown != "" {
+				md = res.CustomMarkdown
+			}
+			envelope := map[string]any{
 				"_custom_tool_result": true,
 				"_version":            1,
 				"result":              txt,
-				"markdown":            txt,
-			}); err == nil {
+				"markdown":            md,
+			}
+			if res.CustomTitle != "" {
+				envelope["title"] = res.CustomTitle
+			}
+			if wrapped, err := json.Marshal(envelope); err == nil {
 				res.Content[0].Text = string(wrapped)
 			}
 		}
@@ -370,7 +380,7 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 
 // CallTool invokes a named MCP tool with JSON arguments and appends any pending push events.
 func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMessage) mcpCallToolResult {
-	var text string
+	var text, customTitle, customMarkdown string
 	var err error
 
 	switch name {
@@ -381,11 +391,11 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 	case toolConnectionStatus:
 		text, err = s.handleConnectionStatus(ctx)
 	case toolSendMessage:
-		text, err = s.handleSendMessage(ctx, rawArgs)
+		text, customTitle, customMarkdown, err = s.handleSendMessage(ctx, rawArgs)
 	case toolManageSession:
 		text, err = s.handleManageSession(ctx, rawArgs)
 	case toolTaskControl:
-		text, err = s.handleTaskControl(ctx, rawArgs)
+		text, customTitle, customMarkdown, err = s.handleTaskControl(ctx, rawArgs)
 	case toolReadTopics:
 		text, err = s.handleReadTopics(ctx, rawArgs)
 	case toolInspectPR:
@@ -402,6 +412,9 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 	if name != toolPollEvents && s.dispatcher != nil {
 		if piggyback := s.dispatcher.DrainAndFormatPiggyback(); piggyback != "" {
 			text += piggyback
+			if customMarkdown != "" {
+				customMarkdown += piggyback
+			}
 		}
 	}
 
@@ -416,7 +429,9 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 	}
 	return mcpCallToolResult{
-		Content: []mcpTextContent{{Type: contentTypeText, Text: text}},
+		Content:        []mcpTextContent{{Type: contentTypeText, Text: text}},
+		CustomTitle:    customTitle,
+		CustomMarkdown: customMarkdown,
 	}
 }
 
@@ -543,7 +558,7 @@ func (s *Server) handleConnectionStatus(ctx context.Context) (string, error) {
 	return FormatBusStatusMarkdown(rep, conv, snap.Push, s.store.ResolveJetskiConversationID()), nil
 }
 
-func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage) (string, string, string, error) {
 	var args struct {
 		Message              string `json:"message"`
 		Prompt               string `json:"prompt"`
@@ -553,9 +568,10 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		TimeoutSeconds       int    `json:"timeout_seconds"`
 		JetskiConversationID string `json:"jetski_conversation_id"`
 		Debug                bool   `json:"debug"`
+		StreamSteps          *bool  `json:"stream_steps"`
 	}
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+		return "", "", "", fmt.Errorf("invalid arguments: %w", err)
 	}
 	if args.JetskiConversationID != "" {
 		enabled := true
@@ -563,13 +579,13 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	}
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
 	var conv ConversationEntry
 	if strings.TrimSpace(args.Conversation) != "" {
 		conv, err = s.store.EnsureConversation(args.Conversation, false, "")
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 	} else {
 		conv = s.store.ActiveConversation()
@@ -588,10 +604,20 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		turnCtx = WithoutProgressCallback(ctx)
 	}
 
+	meta := callMetaFromContext(ctx)
+	isJetskiCall := meta.ConversationID != "" || meta.ProgressToken != nil
+	streamSteps := isJetskiCall
+	if args.StreamSteps != nil {
+		streamSteps = *args.StreamSteps
+	}
+
 	msgText := firstNonEmptyStr(args.Message, args.Prompt)
-	outcome, err := sess.SendTurn(turnCtx, s.store, conv, msgText, args.Mode, waitTimeout)
-	md := FormatTurnOutcomeMarkdownWithOptions(outcome, debug)
-	return md, err
+	outcome, err := sess.SendTurnWithOptions(turnCtx, s.store, conv, msgText, args.Mode, waitTimeout, streamSteps)
+	title, customMD, llmResult := FormatTurnCustomToolEnvelope(outcome, debug)
+	if !streamSteps && !isJetskiCall {
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
+	}
+	return llmResult, title, customMD, err
 }
 
 func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessage) (string, error) {
@@ -731,7 +757,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 	}
 }
 
-func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage) (string, string, string, error) {
 	var args struct {
 		Action             string `json:"action"`
 		TaskID             string `json:"task_id"`
@@ -741,13 +767,14 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		Limit              int    `json:"limit"`
 		WaitTimeoutSeconds int    `json:"wait_timeout_seconds"`
 		Debug              bool   `json:"debug"`
+		StreamSteps        *bool  `json:"stream_steps"`
 	}
 	if len(rawArgs) > 0 {
 		_ = json.Unmarshal(rawArgs, &args)
 	}
 	sess, err := s.ensureConnected(ctx)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
 	action := strings.ToLower(strings.TrimSpace(args.Action))
 	if action == "" {
@@ -762,36 +789,60 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 	if !debug {
 		turnCtx = WithoutProgressCallback(ctx)
 	}
+	meta := callMetaFromContext(ctx)
+	isJetskiCall := meta.ConversationID != "" || meta.ProgressToken != nil
+	streamSteps := isJetskiCall
+	if args.StreamSteps != nil {
+		streamSteps = *args.StreamSteps
+	}
 
 	switch action {
 	case actionGet:
 		if strings.TrimSpace(args.TaskID) == "" {
-			return "", errors.New("task_control action 'get' requires task_id")
+			return "", "", "", errors.New("task_control action 'get' requires task_id")
 		}
 		taskID := strings.TrimSpace(args.TaskID)
-		if args.WaitTimeoutSeconds > 0 {
-			waitCtx, cancel := context.WithTimeout(turnCtx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
-			sess.watchTask(taskID, 1)
-			_ = sess.waitForTaskAndDelegations(waitCtx, taskID)
-			sess.watchTask(taskID, -1)
-			cancel()
+		if !sess.IsTaskTreeSettled(taskID) {
+			if streamSteps {
+				stepWait := defaultStepStreamWindow
+				if args.WaitTimeoutSeconds > 0 {
+					reqWait := time.Duration(args.WaitTimeoutSeconds) * time.Second
+					if reqWait < stepWait {
+						stepWait = reqWait
+					}
+				}
+				waitCtx, cancel := context.WithTimeout(turnCtx, stepWait)
+				_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, true)
+				cancel()
+			} else if args.WaitTimeoutSeconds > 0 {
+				waitCtx, cancel := context.WithTimeout(turnCtx, time.Duration(args.WaitTimeoutSeconds)*time.Second)
+				_ = sess.WaitForTaskStepOrSettlement(waitCtx, taskID, false)
+				cancel()
+			}
 		}
 		rec := sess.GetTask(taskID)
 		if rec == nil {
-			return "", fmt.Errorf("task %q not found on TASKS stream", args.TaskID)
+			return "", "", "", fmt.Errorf("task %q not found on TASKS stream", args.TaskID)
 		}
-		var sb strings.Builder
-		sb.WriteString(FormatTaskRecordMarkdownWithOptions(rec, "Task Detail", debug))
-		children := sess.findChildTasks(rec.TaskID)
-		for i, c := range children {
-			sb.WriteString("\n---\n")
-			sb.WriteString(FormatTaskRecordMarkdownWithOptions(c, fmt.Sprintf("Delegated Child Task #%d", i+1), debug))
-			if wake := sess.findWakeTask(c.TaskID); wake != nil {
+		settled := sess.IsTaskTreeSettled(taskID)
+		conv := s.resolveConvArg(args.Conversation)
+		outcome := sess.BuildTaskOutcome(taskID, conv.Alias, conv.Token, rec.PromptText, !settled)
+		title, customMD, llmResult := FormatTurnCustomToolEnvelope(outcome, debug)
+		if !streamSteps && !isJetskiCall {
+			var sb strings.Builder
+			sb.WriteString(FormatTaskRecordMarkdownWithOptions(rec, "Task Detail", debug))
+			children := sess.findChildTasks(rec.TaskID)
+			for i, c := range children {
 				sb.WriteString("\n---\n")
-				sb.WriteString(FormatTaskRecordMarkdownWithOptions(wake, "Session Wake Synthesis Task", debug))
+				sb.WriteString(FormatTaskRecordMarkdownWithOptions(c, fmt.Sprintf("Delegated Child Task #%d", i+1), debug))
+				if wake := sess.findWakeTask(c.TaskID); wake != nil {
+					sb.WriteString("\n---\n")
+					sb.WriteString(FormatTaskRecordMarkdownWithOptions(wake, "Session Wake Synthesis Task", debug))
+				}
 			}
+			return sb.String(), title, customMD, nil
 		}
-		return sb.String(), nil
+		return llmResult, title, customMD, nil
 
 	case actionList:
 		limit := args.Limit
@@ -800,7 +851,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		}
 		tasks := sess.ListTasks(strings.TrimSpace(args.Conversation), args.OnlyActive, limit)
 		if len(tasks) == 0 {
-			return "No matching tasks found on `TASKS` stream.\n", nil
+			return "No matching tasks found on `TASKS` stream.\n", "", "", nil
 		}
 		var sb strings.Builder
 		sb.WriteString("## 📋 Kube-Agents Tasks (`TASKS`)\n\n")
@@ -821,32 +872,38 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 				escapeTableCell(truncateText(summary, taskSummaryPreviewChars)),
 			)
 		}
-		return sb.String(), nil
+		return sb.String(), "", "", nil
 
 	case actionStatus:
 		conv := s.resolveConvArg(args.Conversation)
 		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStatus, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
+		title, customMD, _ := FormatTurnCustomToolEnvelope(outcome, debug)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
 
 	case actionStop, actionCancelAlias:
 		conv := s.resolveConvArg(args.Conversation)
 		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStop, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
+		title, customMD, _ := FormatTurnCustomToolEnvelope(outcome, debug)
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
 
 	case actionSteer:
 		if strings.TrimSpace(args.Message) == "" {
-			return "", errors.New("task_control action 'steer' requires message")
+			return "", "", "", errors.New("task_control action 'steer' requires message")
 		}
 		conv := s.resolveConvArg(args.Conversation)
 		waitTimeout := defaultTurnWaitTimeout
 		if args.WaitTimeoutSeconds > 0 {
 			waitTimeout = time.Duration(args.WaitTimeoutSeconds) * time.Second
 		}
-		outcome, err := sess.SendTurn(turnCtx, s.store, conv, args.Message, modeAuto, waitTimeout)
-		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
+		outcome, err := sess.SendTurnWithOptions(turnCtx, s.store, conv, args.Message, modeAuto, waitTimeout, streamSteps)
+		title, customMD, llmResult := FormatTurnCustomToolEnvelope(outcome, debug)
+		if !streamSteps && !isJetskiCall {
+			return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
+		}
+		return llmResult, title, customMD, err
 
 	default:
-		return "", fmt.Errorf("unknown task_control action %q (expected get, list, status, steer, stop)", action)
+		return "", "", "", fmt.Errorf("unknown task_control action %q (expected get, list, status, steer, stop)", action)
 	}
 }
 
@@ -1030,7 +1087,8 @@ func (s *Server) readResource(ctx context.Context, uri string) (string, error) {
 	case resourceURITopics:
 		return s.handleReadTopics(ctx, nil)
 	case resourceURITasks:
-		return s.handleTaskControl(ctx, nil)
+		txt, _, _, err := s.handleTaskControl(ctx, nil)
+		return txt, err
 	case resourceURIEvents:
 		raw, _ := json.Marshal(map[string]any{"peek_only": true})
 		return s.handlePollEvents(ctx, raw)

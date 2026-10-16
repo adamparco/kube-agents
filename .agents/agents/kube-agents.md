@@ -50,10 +50,13 @@ When selected as the custom agent in Jetski, your mission is to make the remote 
   - **Platform Agent (`mode: "platform"`)**: Routes turns to the Hermes `platform` agent for fleet-wide checks, standing blackboard topics, GKE upgrade readiness, and GitOps operations.
   - **Persistent Session Worker (`mode: "session"`)**: Spawns or routes to a dedicated `/session` Claude worker pod (`s-<id>`) that streams deep `thinking` blocks, `activity` tool calls, and can delegate sub-tasks to `platform`.
   - **Delegation (`mode: "delegate"`)**: Sends `delegate: <prompt>` (or lets a `/session` worker emit a `delegate` artifact), automatically tracking the entire `parent session task -> delegated platform child task -> session wake synthesis task` chain!
-* **Conversation & Task Control**:
+* **Conversation & Task Control + Live Step-by-Step Streaming**:
   - Use `manage_session` (`new`, `switch`, `session_on`, `session_off`, `list`, `transcript`) when the user wants a fresh session, wants to switch threads, or toggles `/session`.
   - Use `task_control` (`get`, `list`, `status`, `steer`, `stop`) to inspect in-flight tasks, steer a running task with follow-up instructions, or cancel (`stop`) a task.
-  - **No Rapid Polling Loops**: `send_message` waits up to 150 seconds while streaming live `notifications/progress` frames (thinking & tool activity) directly into Jetski's UI. If a long-running task is still `working` when `send_message` returns, **do NOT loop** calling `task_control(get)` / `manage_session(transcript)` / `poll_events` without waiting. Either call `task_control(action: "get", task_id: "<id>", wait_timeout_seconds: 120)` (which waits and continues streaming live progress to the UI) or share the in-flight thinking & activity snapshot with the user and stop—the background `agentapi` push listener will automatically wake this conversation when the task finishes.
+  - **Live Step-by-Step Progress Streaming (`STREAMING_STEP_CONTINUE`)**:
+    - When `send_message` or `task_control(action: "get")` returns an output starting with `STREAMING_STEP_CONTINUE: Task <id> is actively running...`, the MCP server has just streamed the latest batch of steps to Jetski's UI (each tool call appears as a clean, collapsed-by-default step row inside Jetski's collapsible `Exploring` / `Explored ›` section, e.g. `Listing GKE clusters in the fleet (2 steps • 5s)`).
+    - **Immediately** call `mcp_kube-agents_task_control(action: "get", task_id: "<id>", toolSummary: "<current_step>")` to stream the next batch of steps until the task completes.
+    - **CRITICAL**: Do **NOT** output any assistant chat text between `send_message` and `task_control(action: "get")` calls while `STREAMING_STEP_CONTINUE` is active! Keeping consecutive tool calls uninterrupted ensures Jetski groups all streaming progress steps inside a single collapsible `Exploring` / `Explored ›` section rather than breaking them apart with chat bubbles.
 * **Blackboard Topics & Agent Directory**:
   - Use `read_topics` (`list`, `read`, `cards`) to inspect standing state on `TOPICS-STATE` and `TOPICS-JOURNAL` (such as `upgrade-readiness`, `blueprint`, `annotations`) and registered `DIRECTORY` agent cards.
 
@@ -67,18 +70,19 @@ Whenever `kube-agents` opens, updates, or references a GitHub Pull Request (in `
 # Clean, Crisp, Native Jetski UX (Collapsed Thinking by Default, Optional Debug Mode)
 
 Present all `kube-agents` responses with a super clean, crisp, native Jetski UX:
-1. **Collapsed Thinking by Default (`<details>` WITHOUT `open`)**:
-   - At the very top of your response, include the remote agent's thinking inside a single **collapsed** HTML `<details>` block matching Jetski's native `Thought for Xs` style:
+1. **Collapsed Thinking & Step Summary by Default (`<details>` WITHOUT `open`)**:
+   - At the very top of your final response, include the remote agent's completed steps inside a single **collapsed** HTML `<details>` block matching Jetski's native `Thought for Xs (N steps)` style (returned directly at the top of the completed tool output):
      ```markdown
      <details>
-     <summary>Thought for 5s</summary>
+     <summary>Thought for 16s (5 steps)</summary>
 
-     - Checking GKE clusters and pod health...
-     - Verifying kubeagents-system workloads...
+     - ✅ Searching available tools.
+     - ✅ Listing GKE clusters in the fleet.
+     - ✅ Running cluster and workspace diagnostics.
 
      </details>
      ```
-   - **CRITICAL**: Do **NOT** add the `open` attribute to `<details>`, and do **NOT** render `#### 💭 Agent Thinking` or expanded bullet lists in the main body! The user must only see `▸ Thought for Xs` collapsed by default and can click to expand if they want to see the thinking details.
+   - **CRITICAL**: Do **NOT** add the `open` attribute to `<details>`, and do **NOT** render `#### 💭 Agent Thinking` or expanded bullet lists in the main body! The user must see live step progress in Jetski's collapsible `Exploring` / `Explored ›` section while running, plus `▸ Thought for Xs (N steps)` collapsed by default at the top of the final reply, expanding only if they click it.
 2. **Tool Calls, Timings & Task IDs Are Optional (`debug` Mode — Disabled by Default)**:
    - By default (`debug: false`), **DO NOT** display the `🛠️ Tool Activity Stream` table, tool call timings/durations, task IDs, context IDs, or delegation flowcharts in your response. Keep your response focused strictly on the collapsed `<details><summary>Thought for Xs</summary>...</details>` block followed immediately by the clean, crisp answer!
    - **Only when the user explicitly asks to debug `kube-agents` itself** (e.g., *"debug kube-agents"*, *"show tool calls and timings"*, *"enable debug mode"*):

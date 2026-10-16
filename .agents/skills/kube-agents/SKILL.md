@@ -32,15 +32,18 @@ Use **`send_message`** to execute turns on the remote `kube-agents` bus and stre
 - **`mode: "session"`**: Automatically spawns a dedicated interactive session worker pod (`session-<tok>`) via `/session` on `chat.console.<tok>.in` if none is active, then routes the prompt through `chat.console.<tok>.in`.
 - **`mode: "delegate"`**: Ensures a `/session` worker is active and prefixes the prompt with `delegate: ` so the session worker delegates heavy multi-step work to `platform`, tracks child task progress, and synthesizes the result via a `wake` turn.
 
-### Clean, Native UX (Collapsed Thinking by Default & Optional `debug` Mode)
-Every `send_message` call folds the remote turn into a clean, crisp native Jetski response:
-1. **Collapsed Thinking by Default (`lib.ArtifactThinking`)**:
-   - Thinking is formatted inside a **collapsed** `<details>\n<summary>Thought for Xs</summary>\n\n- ...\n\n</details>` block (never `<details open>`).
-   - Always preserve this collapsed `<details><summary>Thought for Xs</summary>...</details>` block at the top of your reply so it looks native to Jetski (`▸ Thought for Xs`) and expands only if the user clicks it.
-2. **Optional Debug Mode (`debug: false` by Default)**:
-   - By default (`debug: false`), tool call tables (`🛠️ Tool Activity Stream`), timings/durations, task/context IDs, and MCP `notifications/progress` tool-card expansion are **hidden** so the UI remains super clean and crisp.
+### Live Step-by-Step Streaming & Clean, Native UX (Collapsed by Default, Optional `debug` Mode)
+Every `send_message` and `task_control(action: "get")` call streams live steps into Jetski's UI while keeping all details hidden by default in expandable sections:
+1. **Live Step-by-Step Progress (`STREAMING_STEP_CONTINUE`)**:
+   - While a remote task is executing steps, `send_message` (and follow-up `task_control(action: "get")` calls) return each batch of newly recorded steps via `_custom_tool_result` with a human-readable step `title` (e.g. `Listing GKE clusters in the fleet (2 steps • 5s)`) and a clean step checklist in `markdown` (hidden by default inside the collapsed tool step row; expanding it shows `- ✅ ...` / `- 🔄 ...` without raw JSON arguments).
+   - Whenever `send_message` or `task_control(action: "get")` returns `STREAMING_STEP_CONTINUE: Task <id> is actively running...`, **immediately** call `task_control(action: "get", task_id: "<id>", toolSummary: "<current_step>")` **without outputting any intermediate assistant text**. This keeps all streaming steps grouped inside Jetski's collapsible `Exploring` / `Explored ›` section.
+2. **Collapsed Thinking Summary by Default (`<details>` without `open`)**:
+   - Once the task settles, the tool output begins with a **collapsed** `<details>\n<summary>Thought for Xs (N steps)</summary>\n\n- ✅ ...\n\n</details>` block (never `<details open>`).
+   - Always preserve this collapsed `<details><summary>Thought for Xs (N steps)</summary>...</details>` block at the top of your reply so it looks native to Jetski (`▸ Thought for Xs (N steps)`) and expands only if the user clicks it.
+3. **Optional Debug Mode (`debug: false` by Default)**:
+   - By default (`debug: false`), tool call tables (`🛠️ Tool Activity Stream`), timings/durations, and task/context IDs are **hidden** so the UI remains super clean and crisp.
    - If the user asks to debug `kube-agents` itself (e.g., to see tool calls, durations, task IDs, or delegation flowcharts), pass `debug: true` on `send_message` / `task_control` or toggle persistent debug mode via `manage_session(action: "debug_on")` (and `action: "debug_off"` to turn it back off).
-3. **`result` (`lib.ArtifactResult`)**: Structured `kube-agents.chat/v1` report (`headline`, `tone`, `rows`, `plan`, `fold`, `choices`, `links`).
+4. **`result` (`lib.ArtifactResult`)**: Structured `kube-agents.chat/v1` report (`headline`, `tone`, `rows`, `plan`, `fold`, `choices`, `links`).
 
 ---
 
@@ -54,8 +57,8 @@ Every `send_message` call folds the remote turn into a clean, crisp native Jetsk
 - **`task_control`**:
   - `action: "steer"`: Inject a mid-flight steering instruction into a running task (`steer <message>`).
   - `action: "stop"`: Cancel the active task on the gateway or `a2a.ctrl.<agent>.<task>`.
-  - `action: "get"` / `"list"` / `"status"`: Inspect full folded task state (`get` supports `wait_timeout_seconds` to wait and stream live `notifications/progress` frames until the task settles), list recent tasks on `TASKS`, or trigger a gateway `status` replay.
-  - **Important**: Never spin in a rapid polling loop calling `task_control(get)` without `wait_timeout_seconds`. If a task is still running after `send_message`, pass `wait_timeout_seconds: 120` to `task_control(action: "get")` or rely on reactive `agentapi` push wakeups.
+  - `action: "get"` / `"list"` / `"status"`: Inspect full folded task state (`get` automatically waits up to 6s for the next streaming step when called on an active task, returning `STREAMING_STEP_CONTINUE` until the task settles), list recent tasks on `TASKS`, or trigger a gateway `status` replay.
+  - **Important**: When `STREAMING_STEP_CONTINUE` is returned, immediately call `task_control(action: "get", task_id: "<id>")` with no intermediate prose until the task settles.
 
 ---
 
