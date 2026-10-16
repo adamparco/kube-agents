@@ -184,7 +184,7 @@ var (
 	kanbanStillRunningRe   = regexp.MustCompile(`(?i)\b(still running|wait \d+\s*s|re-check|heartbeating)\b`)
 	preflightDiagRe        = regexp.MustCompile(`(?i)\bpreflight\b.*\bdiagnostics\b`)
 	nodePoolInspectRe      = regexp.MustCompile(`(?i)\bnode\s*pools?\b.*\b(pods?|nodes?|events?)\b`)
-	conversationalStartRe  = regexp.MustCompile(`(?i)^(let's |now let's |i will |i'll |first[, ]|next[, ]|okay[, ]|ok[, .]|all \d+ )`)
+	conversationalStartRe     = regexp.MustCompile(`(?i)^(let's |let me |now |i will |i'll |i've |i have |first[, ]|next[, ]|okay[, ]|ok[, .]|all \d+ |both |delegating )`)
 	shapedStringPlaceholderRe = regexp.MustCompile(`^<string,\s*(\d+)\s*chars>$`)
 )
 
@@ -324,6 +324,15 @@ func CollectOutcomeStepDetails(outcome *TurnOutcome) []StepDetail {
 				}
 				if rawDetails[i].TaskID == "" && sd.TaskID != "" {
 					rawDetails[i].TaskID = sd.TaskID
+				}
+				if rawDetails[i].DelegatedTo == "" && sd.DelegatedTo != "" {
+					rawDetails[i].DelegatedTo = sd.DelegatedTo
+				}
+				if rawDetails[i].ChildTaskID == "" && sd.ChildTaskID != "" {
+					rawDetails[i].ChildTaskID = sd.ChildTaskID
+				}
+				if rawDetails[i].DelegatePrompt == "" && sd.DelegatePrompt != "" {
+					rawDetails[i].DelegatePrompt = sd.DelegatePrompt
 				}
 				rawDetails[i].Activities = mergeActivityItems(rawDetails[i].Activities, sd.Activities)
 				return
@@ -572,6 +581,12 @@ func toolNameToStepTitle(toolName string) string {
 		return "Running analysis script."
 	case toolName == "skill_view":
 		return "Loading skill instructions."
+	case toolName == "mcp__a2a__delegate":
+		return "Delegating task to platform."
+	case strings.HasPrefix(toolName, "mcp__a2a__"):
+		return "Communicating over the A2A bus."
+	case strings.HasPrefix(toolName, "mcp__developer_knowledge__"):
+		return "Searching documentation in Developer Knowledge."
 	default:
 		return fmt.Sprintf("Running %s.", toolName)
 	}
@@ -758,12 +773,13 @@ func FormatStepDetailMarkdown(detail StepDetail, elapsedSec int, completed bool)
 		}
 	}
 
+	if detail.Thought != "" {
+		thoughtSingle := strings.Join(strings.Fields(detail.Thought), " ")
+		fmt.Fprintf(&sb, "- **Thought**: *%s*\n", thoughtSingle)
+	}
 	if detail.DelegatePrompt != "" {
 		promptSingle := strings.Join(strings.Fields(detail.DelegatePrompt), " ")
 		fmt.Fprintf(&sb, "- **Delegation Request**: *%s*\n", truncateText(promptSingle, 280))
-	} else if detail.Thought != "" {
-		thoughtSingle := strings.Join(strings.Fields(detail.Thought), " ")
-		fmt.Fprintf(&sb, "- **Thought**: *%s*\n", thoughtSingle)
 	}
 
 	if len(detail.Activities) > 0 {
@@ -1226,19 +1242,38 @@ func normalizeStepTitleAndThought(rawLine string) (title string, thought string)
 	if nodePoolInspectRe.MatchString(cleaned) {
 		return "Inspecting Kubernetes pods, nodes, and cluster events.", cleaned
 	}
-	if conversationalStartRe.MatchString(cleaned) || strings.Contains(cleaned, ". ") || strings.Contains(cleaned, "! ") {
+	if conversationalStartRe.MatchString(cleaned) || strings.Contains(cleaned, ". ") || strings.Contains(cleaned, "! ") || strings.Contains(cleaned, " — ") {
 		lower := strings.ToLower(cleaned)
+		var normTitle string
 		switch {
+		case strings.Contains(lower, "let me finalize") || strings.Contains(lower, "let's finalize") || strings.Contains(lower, "both actions are done") || strings.Contains(lower, "all done"):
+			normTitle = synthFinalStepTitle
+		case strings.HasPrefix(lower, "delegating ") && strings.Contains(lower, "platform"):
+			normTitle = "Delegating task to platform."
+		case strings.Contains(lower, "remove") && strings.Contains(lower, "manifest") && strings.Contains(lower, "commit"):
+			normTitle = "Removing stale manifest and committing changes."
+		case strings.Contains(lower, "commit") || strings.Contains(lower, "push"):
+			normTitle = "Committing and pushing manifest changes."
 		case strings.Contains(lower, "pod") && strings.Contains(lower, "node"):
-			return "Inspecting Kubernetes pods, nodes, and cluster events.", cleaned
+			normTitle = "Inspecting Kubernetes pods, nodes, and cluster events."
 		case strings.Contains(lower, "pod") || strings.Contains(lower, "workload"):
-			return "Inspecting Kubernetes pods and workload health.", cleaned
+			normTitle = "Inspecting Kubernetes pods and workload health."
 		case strings.Contains(lower, "node"):
-			return "Checking Kubernetes node status and readiness.", cleaned
+			normTitle = "Checking Kubernetes node status and readiness."
 		case strings.Contains(lower, "diagnostic"):
-			return "Running cluster and workspace diagnostics.", cleaned
+			normTitle = "Running cluster and workspace diagnostics."
 		case strings.Contains(lower, "kanban") || strings.Contains(lower, "specialist"):
-			return "Coordinating specialist agent tasks.", cleaned
+			normTitle = "Coordinating specialist agent tasks."
+		case strings.Contains(lower, "manifest") || strings.Contains(lower, "yaml"):
+			normTitle = "Inspecting and updating workload manifests."
+		case strings.Contains(lower, "pr #") || strings.Contains(lower, "pull request"):
+			normTitle = "Creating or updating GitHub pull request."
+		}
+		if normTitle != "" {
+			if strings.EqualFold(strings.TrimSuffix(normTitle, "."), strings.TrimSuffix(cleaned, ".")) {
+				return normTitle, ""
+			}
+			return normTitle, cleaned
 		}
 	}
 
@@ -1283,6 +1318,12 @@ func cleanSingleThinkingLine(line string) string {
 		line = "Listing GKE cluster profiles in the fleet."
 	case strings.HasPrefix(line, "Running mcp__platform_control__"):
 		line = "Querying platform control state."
+	case line == "Running mcp__a2a__delegate.":
+		line = "Delegating task to platform."
+	case strings.HasPrefix(line, "Running mcp__a2a__"):
+		line = "Communicating over the A2A bus."
+	case strings.HasPrefix(line, "Running mcp__developer_knowledge__"):
+		line = "Searching documentation in Developer Knowledge."
 	case line == "Running tool_search.":
 		line = "Searching available tools."
 	case line == "Running tool_describe.":
@@ -1419,37 +1460,26 @@ func SynthesizeThinkingFromActivities(rec *TaskRecord) string {
 		}
 	}
 	for _, act := range rec.Activities {
-		switch {
-		case act.Tool == "mcp__gke__list_clusters":
-			addLine("Listing GKE clusters in the fleet.")
-		case act.Tool == "mcp__gke__get_cluster":
-			addLine("Inspecting GKE cluster configuration.")
-		case strings.HasPrefix(act.Tool, "mcp__gke__"):
-			addLine("Querying GKE cluster state.")
-		case act.Tool == "mcp__platform_control__list_cluster_profiles":
-			addLine("Listing GKE cluster profiles in the fleet.")
-		case strings.HasPrefix(act.Tool, "mcp__platform_control__"):
-			addLine("Querying platform control state.")
-		case act.Tool == "read_file":
-			addLine("Reading file in the workspace.")
-		case act.Tool == "search_files" || act.Tool == "find_by_name" || act.Tool == "list_dir" || act.Tool == "glob":
-			addLine("Inspecting files in the workspace.")
-		case act.Tool == "patch" || act.Tool == "edit_file" || act.Tool == "replace_in_file":
-			addLine("Applying patch to manifest in the workspace.")
-		case act.Tool == "write_file" || act.Tool == "create_file":
-			addLine("Writing manifest file in the workspace.")
-		case act.Tool == "terminal" || act.Tool == "kubectl" || act.Tool == "run_kubectl" || act.Tool == "bash":
-			addLine("Running cluster and workspace diagnostics.")
-		case act.Tool == "kanban_create":
-			addLine("Delegating task to specialist agent.")
-		case strings.HasPrefix(act.Tool, "kanban_"):
-			addLine("Updating task status on the Kanban board.")
-		default:
-			addLine(fmt.Sprintf("Running %s.", act.Tool))
+		for _, toolName := range expandActivityToolNames(act) {
+			addLine(toolNameToStepTitle(toolName))
 		}
 	}
-	if prog := strings.TrimSpace(rec.ProgressText); prog != "" {
-		addLine(prog)
+	prog := strings.TrimSpace(rec.ProgressText)
+	res := strings.TrimSpace(rec.ResultText)
+	if prog != "" {
+		if res != "" && (prog == res || strings.Contains(res, prog)) {
+			if len(lines) == 0 {
+				if rec.WakeFromChildTaskID != "" {
+					addLine(synthFinalStepTitle + "\tSynthesizing delegated task results into final response.")
+				} else {
+					addLine(synthFinalStepTitle)
+				}
+			}
+		} else {
+			addLine(prog)
+		}
+	} else if len(lines) == 0 && res != "" && rec.WakeFromChildTaskID != "" {
+		addLine(synthFinalStepTitle + "\tSynthesizing delegated task results into final response.")
 	}
 	return strings.Join(lines, "\n")
 }
