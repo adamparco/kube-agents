@@ -150,8 +150,10 @@ func FormatBusStatusMarkdown(rep BusStatusReport, conv ConversationEntry, push P
 		sb.WriteString("\n")
 	}
 
-	if len(rep.AgentCards) > 0 {
-		sb.WriteString("### 🤖 Registered Agent Cards (`DIRECTORY`)\n\n")
+	sb.WriteString("### 🤖 Registered Agent Cards (`DIRECTORY`)\n\n")
+	if len(rep.AgentCards) == 0 {
+		sb.WriteString("_No agent cards currently cached on the `DIRECTORY` stream (`a2a.agents.>`)._\n")
+	} else {
 		names := make([]string, 0, len(rep.AgentCards))
 		for k := range rep.AgentCards {
 			names = append(names, k)
@@ -1441,12 +1443,49 @@ func formatCompactDebugLLMResult(outcome *TurnOutcome, answerOnlyMD string) stri
 	rec := outcome.PrimaryTask
 	sec := computeOutcomeElapsedSeconds(rec, outcome.ChildTasks, outcome.WakeTask)
 	cards, doneCards, runningCards, totalCards, _ := extractKanbanCardsFromTask(rec)
+	if totalCards == 0 {
+		for _, child := range outcome.ChildTasks {
+			cCards, cDone, cRunning, cTotal, _ := extractKanbanCardsFromTask(child)
+			if cTotal > 0 {
+				cards = append(cards, cCards...)
+				doneCards += cDone
+				runningCards += cRunning
+				totalCards += cTotal
+			}
+		}
+	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "### Debug Telemetry Summary (`%s`)\n", rec.TaskID)
 	fmt.Fprintf(&sb, "- **Task / Context**: `%s` / `%s` (`%s`, `%s`, `%ds` elapsed)\n",
 		rec.TaskID, firstNonEmptyStr(rec.ContextID, "—"), firstNonEmptyStr(rec.Addressee, "platform"), rec.State, sec)
 	fmt.Fprintf(&sb, "- **Envelopes & Tool Calls**: `%d` envelopes (%s), `%d` tool calls\n",
 		rec.EnvelopeCount, firstNonEmptyStr(formatEnvelopeKindBreakdown(rec.EnvelopeCountsByKind), "—"), len(rec.Activities))
+	if len(outcome.ChildTasks) > 0 || len(rec.Delegates) > 0 {
+		var hops []string
+		hops = append(hops, fmt.Sprintf("`%s` (`%s`)", firstNonEmptyStr(rec.Addressee, "session"), rec.TaskID))
+		if len(outcome.ChildTasks) > 0 {
+			for _, child := range outcome.ChildTasks {
+				if child == nil {
+					continue
+				}
+				hops = append(hops, fmt.Sprintf("`%s` (`%s`, `%d` envelopes, `%d` tool calls)",
+					firstNonEmptyStr(child.Addressee, "platform"), child.TaskID, child.EnvelopeCount, len(child.Activities)))
+			}
+		} else {
+			for _, d := range rec.Delegates {
+				if d.ChildTaskID != "" {
+					hops = append(hops, fmt.Sprintf("`%s` (`%s`)", d.Addressee, d.ChildTaskID))
+				} else {
+					hops = append(hops, fmt.Sprintf("`%s`", d.Addressee))
+				}
+			}
+		}
+		if outcome.WakeTask != nil {
+			hops = append(hops, fmt.Sprintf("`%s` wake (`%s`, `%d` envelopes)",
+				firstNonEmptyStr(outcome.WakeTask.Addressee, rec.Addressee, "session"), outcome.WakeTask.TaskID, outcome.WakeTask.EnvelopeCount))
+		}
+		fmt.Fprintf(&sb, "- **Delegation Chain**: %s\n", strings.Join(hops, " → "))
+	}
 	if len(rec.SteerTimestamps) > 0 {
 		var steerTimes []string
 		for _, ts := range rec.SteerTimestamps {
