@@ -48,10 +48,11 @@ const (
 	rpcErrMethodNotFound       = -32601
 	rpcErrInvalidParams        = -32602
 	rpcErrInternal             = -32603
-	scannerInitialBufSize      = 64 * 1024
-	scannerMaxBufSize          = 16 * 1024 * 1024
-	defaultTaskListLimit       = 20
-	taskSummaryPreviewChars    = 90
+	scannerInitialBufSize        = 64 * 1024
+	scannerMaxBufSize            = 16 * 1024 * 1024
+	defaultTaskListLimit         = 12
+	defaultTranscriptLookupLimit = 50
+	taskSummaryPreviewChars      = 80
 	actionList                 = "list"
 	actionNew                  = "new"
 	actionSwitch               = "switch"
@@ -772,7 +773,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		if strings.TrimSpace(targetAlias) != "" {
 			conv, _ = s.store.EnsureConversation(targetAlias, false, "")
 		}
-		rawTasks := sess.ListTasks(conv.Token, false, defaultTaskListLimit)
+		rawTasks := sess.ListTasks(conv.Token, false, defaultTranscriptLookupLimit)
 		var tasks []*TaskRecord
 		for _, t := range rawTasks {
 			if t != nil && t.CardParentTaskID == "" && t.DelegatedFromTaskID == "" && t.WakeFromChildTaskID == "" {
@@ -785,9 +786,9 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		var sb strings.Builder
 		header := fmt.Sprintf("## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
 		sb.WriteString(header)
-		const maxTranscriptBytes = 3500
+		const maxTranscriptBytes = 3550
 		// Render newest-last, ensuring newest turns are preserved and older turns are compactly
-		// summarized before ever omitting a turn so multi-turn transcripts stay inline (<3.5 KB).
+		// summarized before ever omitting a turn so multi-turn transcripts stay inline (<3.55 KB).
 		var sections []string
 		totalBytes := sb.Len()
 		omittedOlder := 0
@@ -797,9 +798,11 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			sStr := FormatTranscriptTurnMarkdown(outcome, 0, debug)
 			if i == 0 && totalBytes+len(sStr) > maxTranscriptBytes {
 				sStr = FormatTranscriptTurnMarkdown(outcome, 1800, debug)
+			} else if i == 0 && len(tasks) > 1 && debug && len(sStr) > 1800 {
+				sStr = FormatTranscriptTurnMarkdown(outcome, 900, debug)
 			} else if len(sections) > 0 && totalBytes+len(sStr) > maxTranscriptBytes {
-				// Try compacting older turn answer bodies (800 runes, then 450 runes) before omitting the turn.
-				for _, capRunes := range []int{800, 450} {
+				// Try compacting older turn answer bodies (800, 450, then 200 runes) before omitting the turn.
+				for _, capRunes := range []int{800, 450, 200} {
 					candidate := FormatTranscriptTurnMarkdown(outcome, capRunes, debug)
 					if totalBytes+len(candidate) <= maxTranscriptBytes {
 						sStr = candidate
