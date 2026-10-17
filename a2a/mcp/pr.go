@@ -43,6 +43,7 @@ const (
 	ghJSONFields             = "number,title,state,url,headRefName,baseRefName,additions,deletions,changedFiles,body,author,files"
 	prFetchTimeout           = 15 * time.Second
 	maxInlineDiffBytes       = 3200
+	maxPRDiffReadBytes       = 10 << 20
 	prUrlRegexPattern        = `https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)`
 	prShortRefRegexPattern   = `\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b`
 	prNumberOnlyRegexPattern = `^#?(\d+)$`
@@ -259,7 +260,7 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("GitHub API %s returned HTTP %d: %s", prEndpoint, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
@@ -345,7 +346,7 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		}
 		if diffResp, dErr := http.DefaultClient.Do(diffReq); dErr == nil {
 			if diffResp.StatusCode == http.StatusOK {
-				rawDiff, _ := io.ReadAll(diffResp.Body)
+				rawDiff, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes))
 				insp.UnifiedDiff = string(rawDiff)
 			}
 			_ = diffResp.Body.Close()

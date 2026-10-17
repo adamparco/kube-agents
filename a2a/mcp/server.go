@@ -5,75 +5,79 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
-	jsonRPCVersion             = "2.0"
-	defaultMCPProtocolVersion  = "2024-11-05"
-	mcpServerName              = "kube-agents"
-	mcpServerVersion           = "0.4.0"
-	methodInitialize           = "initialize"
-	methodInitialized          = "notifications/initialized"
-	methodProgressNotification = "notifications/progress"
-	methodPing                 = "ping"
-	methodToolsList            = "tools/list"
-	methodToolsCall            = "tools/call"
-	methodResourcesList        = "resources/list"
-	methodResourcesRead        = "resources/read"
-	methodPromptsList          = "prompts/list"
-	toolDiscoverDeployments    = "discover_deployments"
-	toolConnectDeployment      = "connect_deployment"
-	toolConnectionStatus       = "connection_status"
-	toolSendMessage            = "send_message"
-	toolManageSession          = "manage_session"
-	toolTaskControl            = "task_control"
-	toolReadTopics             = "read_topics"
-	toolInspectPR              = "inspect_pr"
-	toolPollEvents             = "poll_events"
-	resourceURIStatus          = "kube-agents://status"
-	resourceURIDeployments     = "kube-agents://deployments"
-	resourceURITopics          = "kube-agents://topics"
-	resourceURITasks           = "kube-agents://tasks"
-	resourceURIEvents          = "kube-agents://events"
-	mimeTypeMarkdown           = "text/markdown"
-	contentTypeText            = "text"
-	rpcErrParseError           = -32700
-	rpcErrInvalidRequest       = -32600
-	rpcErrMethodNotFound       = -32601
-	rpcErrInvalidParams        = -32602
-	rpcErrInternal             = -32603
+	jsonRPCVersion               = "2.0"
+	defaultMCPProtocolVersion    = "2024-11-05"
+	mcpServerName                = "kube-agents"
+	mcpServerVersion             = "0.4.0"
+	methodInitialize             = "initialize"
+	methodInitialized            = "notifications/initialized"
+	methodProgressNotification   = "notifications/progress"
+	methodPing                   = "ping"
+	methodToolsList              = "tools/list"
+	methodToolsCall              = "tools/call"
+	methodResourcesList          = "resources/list"
+	methodResourcesRead          = "resources/read"
+	methodPromptsList            = "prompts/list"
+	toolDiscoverDeployments      = "discover_deployments"
+	toolConnectDeployment        = "connect_deployment"
+	toolConnectionStatus         = "connection_status"
+	toolSendMessage              = "send_message"
+	toolManageSession            = "manage_session"
+	toolTaskControl              = "task_control"
+	toolReadTopics               = "read_topics"
+	toolInspectPR                = "inspect_pr"
+	toolPollEvents               = "poll_events"
+	resourceURIStatus            = "kube-agents://status"
+	resourceURIDeployments       = "kube-agents://deployments"
+	resourceURITopics            = "kube-agents://topics"
+	resourceURITasks             = "kube-agents://tasks"
+	resourceURIEvents            = "kube-agents://events"
+	mimeTypeMarkdown             = "text/markdown"
+	contentTypeText              = "text"
+	rpcErrParseError             = -32700
+	rpcErrInvalidRequest         = -32600
+	rpcErrMethodNotFound         = -32601
+	rpcErrInvalidParams          = -32602
+	rpcErrInternal               = -32603
 	scannerInitialBufSize        = 64 * 1024
 	scannerMaxBufSize            = 16 * 1024 * 1024
 	defaultTaskListLimit         = 12
 	defaultTranscriptLookupLimit = 50
 	taskSummaryPreviewChars      = 80
-	actionList                 = "list"
-	actionNew                  = "new"
-	actionSwitch               = "switch"
-	actionSessionOn            = "session_on"
-	actionSessionStartAlias    = "start"
-	actionSessionOff           = "session_off"
-	actionSessionEndAlias      = "end"
-	actionHelp                 = "help"
-	actionTranscript           = "transcript"
-	actionDebugOn              = "debug_on"
-	actionDebugOff             = "debug_off"
-	actionGet                  = "get"
-	actionStatus               = "status"
-	actionSteer                = "steer"
-	actionStop                 = "stop"
-	actionCancelAlias          = "cancel"
-	actionRead                 = "read"
-	actionCards                = "cards"
-	directProfileDefaultName   = "direct-nats"
-	directProfileDefaultNS     = "kubeagents-system"
-	directProfileDefaultPAName = "platform-agent"
+	actionList                   = "list"
+	actionNew                    = "new"
+	actionSwitch                 = "switch"
+	actionSessionOn              = "session_on"
+	actionSessionStartAlias      = "start"
+	actionSessionOff             = "session_off"
+	actionSessionEndAlias        = "end"
+	actionHelp                   = "help"
+	actionTranscript             = "transcript"
+	actionDebugOn                = "debug_on"
+	actionDebugOff               = "debug_off"
+	actionGet                    = "get"
+	actionStatus                 = "status"
+	actionSteer                  = "steer"
+	actionStop                   = "stop"
+	actionCancelAlias            = "cancel"
+	actionRead                   = "read"
+	actionCards                  = "cards"
+	directProfileDefaultName     = "direct-nats"
+	directProfileDefaultNS       = "kubeagents-system"
+	directProfileDefaultPAName   = "platform-agent"
 )
 
 type rpcRequest struct {
@@ -234,6 +238,42 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 		}
 	}
 	return scanner.Err()
+}
+
+// RunCLI parses CLI flags (--config, --hook) and runs either the Jetski lifecycle
+// hook handler or the stdio MCP server with clean signal handling.
+func RunCLI(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to persistent MCP configuration file (default: ~/.config/kube-agents/mcp-config.json)")
+	hookMode := fs.Bool("hook", false, "run as a Jetski SessionStart/PreInvocation lifecycle hook")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := NewConfigStore(*configPath)
+	if err != nil {
+		return err
+	}
+	if *hookMode {
+		return HandleJetskiHook(store, os.Stdin, os.Stdout)
+	}
+	rpcOut := os.Stdout
+	os.Stdout = os.Stderr
+
+	srv, err := NewServer(ServerOptions{Store: store})
+	if err != nil {
+		return err
+	}
+	defer srv.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+		os.Exit(1)
+	}()
+
+	return srv.ServeStdio(ctx, os.Stdin, rpcOut)
 }
 
 // emitProgress writes an MCP notifications/progress JSON-RPC frame to the active stdio writer

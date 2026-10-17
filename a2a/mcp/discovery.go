@@ -469,9 +469,6 @@ func (t *PortForwardTunnel) supervise(ctx context.Context) {
 			for scanner.Scan() {
 				line := scanner.Text()
 				if matches := portForwardPortRe.FindStringSubmatch(line); len(matches) > 1 {
-					if p, err := strconv.Atoi(matches[1]); err == nil && p > 0 {
-						t.localPort = p
-					}
 					if waitTCPReady(ctx, t.localPort) {
 						readyOnce.Do(func() { close(t.readyCh) })
 					}

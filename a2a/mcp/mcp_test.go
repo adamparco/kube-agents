@@ -1426,8 +1426,8 @@ func TestViaAuthorityDelegationAndConversationalStepNormalization(t *testing.T) 
 	wantTitles := []string{
 		"Delegating task to platform.",
 		"Listing GKE cluster profiles in the fleet.",
-		"Completing preflight checks and starting cluster diagnostics.",
-		"Waiting for specialist agent tasks (12/16 completed).",
+		"Preflight ok.",
+		"12/16 done, 4 still running.",
 		"Synthesizing findings into final response.",
 	}
 	if len(details) != len(wantTitles) {
@@ -1689,15 +1689,15 @@ func TestStepCursorSurvivesSessionRestart(t *testing.T) {
 func TestNormalAndDebugModeStreamingAndPanels(t *testing.T) {
 	now := time.Now().UTC()
 	rec := &TaskRecord{
-		TaskID:         "task-debug-panel-1",
-		ContextID:      "ctx-debug-panel-1",
-		Addressee:      "platform",
-		Conversation:   "console:tok-dbg",
-		State:          lib.StateWorking,
-		Terminal:       false,
-		CreatedAt:      now.Add(-45 * time.Second),
-		UpdatedAt:      now,
-		EnvelopeCount:  24,
+		TaskID:          "task-debug-panel-1",
+		ContextID:       "ctx-debug-panel-1",
+		Addressee:       "platform",
+		Conversation:    "console:tok-dbg",
+		State:           lib.StateWorking,
+		Terminal:        false,
+		CreatedAt:       now.Add(-45 * time.Second),
+		UpdatedAt:       now,
+		EnvelopeCount:   24,
 		SteerTimestamps: []time.Time{now.Add(-15 * time.Second)},
 		EnvelopeCountsByKind: map[string]int{
 			"message":         1,
@@ -1987,3 +1987,57 @@ func TestDedupeNonAdjacentStepsAndBoundDebugOutput(t *testing.T) {
 		t.Fatalf("expected 16-cluster debug markdown <= 18.5 KB to prevent output.txt spill, got %d bytes", len(debugMD))
 	}
 }
+
+func TestBoundedSessionMapEvictionAndGenericStepFallback(t *testing.T) {
+	s := &BusSession{
+		tasks:             make(map[string]*TaskRecord),
+		seenEnvelopes:     make(map[string]bool),
+		foregroundTasks:   make(map[string]time.Time),
+		watchedTasks:      make(map[string]int),
+		watchedConvs:      make(map[string]int),
+		lastReportedSteps: make(map[string]int),
+	}
+	now := time.Now().UTC()
+
+	// 1. Populate seenEnvelopes past maxSeenEnvelopes and verify eviction.
+	for i := 0; i < maxSeenEnvelopes+100; i++ {
+		s.seenEnvelopes[fmt.Sprintf("env-%d", i)] = true
+	}
+	// Populate tasks past maxRetainedTasks: 1 active task, 1 watched terminal task, and maxRetainedTasks+50 terminal tasks.
+	s.tasks["task-active"] = &TaskRecord{TaskID: "task-active", Terminal: false, UpdatedAt: now.Add(-2 * time.Hour)}
+	s.tasks["task-watched"] = &TaskRecord{TaskID: "task-watched", Terminal: true, UpdatedAt: now.Add(-2 * time.Hour)}
+	s.watchedTasks["task-watched"] = 1
+	for i := 0; i < maxRetainedTasks+50; i++ {
+		id := fmt.Sprintf("task-term-%04d", i)
+		s.tasks[id] = &TaskRecord{TaskID: id, Terminal: true, UpdatedAt: now.Add(time.Duration(i) * time.Second)}
+	}
+	s.pruneSessionMapsLocked()
+
+	if len(s.seenEnvelopes) > maxSeenEnvelopes {
+		t.Fatalf("seenEnvelopes not pruned: got %d > %d", len(s.seenEnvelopes), maxSeenEnvelopes)
+	}
+	if len(s.tasks) > maxRetainedTasks {
+		t.Fatalf("tasks not pruned: got %d > %d", len(s.tasks), maxRetainedTasks)
+	}
+	if s.tasks["task-active"] == nil {
+		t.Fatal("non-terminal task-active must not be evicted")
+	}
+	if s.tasks["task-watched"] == nil {
+		t.Fatal("watched task-watched must not be evicted")
+	}
+	if s.tasks["task-term-0000"] != nil {
+		t.Fatal("oldest terminal task-term-0000 should have been evicted")
+	}
+
+	// 2. Verify structural fallback step synthesis from tool activities.
+	synth := SynthesizeThinkingFromActivities(&TaskRecord{
+		Activities: []ActivityItem{
+			{Tool: "terminal", Input: `{"command":"KUBECONFIG=/tmp/k kubectl get nodes -o wide"}`},
+			{Tool: "mcp__gke__list_clusters", Input: `{"project":"my-proj"}`},
+		},
+	})
+	if !strings.Contains(synth, "Running cluster and workspace diagnostics.") || !strings.Contains(synth, "Listing GKE clusters in the fleet.") {
+		t.Fatalf("unexpected fallback steps: %q", synth)
+	}
+}
+
