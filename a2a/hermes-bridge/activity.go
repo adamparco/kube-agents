@@ -1082,9 +1082,9 @@ func describePlannedTool(toolName string, parsedArgs map[string]any) string {
 	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
 		return "Inspecting files in the workspace."
 	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
-		return "Applying patch to manifest in the workspace."
+		return "Editing a file in the agent workspace."
 	case toolName == "write_file" || toolName == "create_file":
-		return "Writing manifest file in the workspace."
+		return "Writing a file in the agent workspace."
 	case toolName == "tool_search":
 		return "Searching available tools."
 	case toolName == "tool_describe":

@@ -676,9 +676,9 @@ func toolNameToStepTitle(toolName string) string {
 	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
 		return "Inspecting files in the workspace."
 	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
-		return "Applying patch to manifest in the workspace."
+		return "Editing a file in the agent workspace."
 	case toolName == "write_file" || toolName == "create_file":
-		return "Writing manifest file in the workspace."
+		return "Writing a file in the agent workspace."
 	case toolName == "terminal" || toolName == "kubectl" || toolName == "run_kubectl" || toolName == "bash":
 		return "Running cluster and workspace diagnostics."
 	case toolName == "kanban_create":
@@ -1445,9 +1445,9 @@ func cleanSingleThinkingLine(line string) string {
 	case line == "Running search_files." || line == "Running find_by_name." || line == "Running list_dir." || line == "Running glob.":
 		line = "Inspecting files in the workspace."
 	case line == "Running patch." || line == "Running edit_file." || line == "Running replace_in_file.":
-		line = "Applying patch to manifest in the workspace."
+		line = "Editing a file in the agent workspace."
 	case line == "Running write_file." || line == "Running create_file.":
-		line = "Writing manifest file in the workspace."
+		line = "Writing a file in the agent workspace."
 	case line == "Running mcp__platform_control__list_cluster_profiles.":
 		line = "Listing GKE cluster profiles in the fleet."
 	case strings.HasPrefix(line, "Running mcp__platform_control__"):
