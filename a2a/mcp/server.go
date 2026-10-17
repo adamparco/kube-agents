@@ -594,7 +594,7 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		waitTimeout = time.Duration(args.TimeoutSeconds) * time.Second
 	}
 
-	debug := args.Debug || s.store.DebugMode()
+	debug := args.Debug || s.store.DebugModeFor(conv.Alias)
 	turnCtx := ctx
 	if !debug {
 		turnCtx = WithoutProgressCallback(ctx)
@@ -632,7 +632,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 	if action == "" {
 		action = actionList
 	}
-	debug := args.Debug || s.store.DebugMode()
+	debug := args.Debug || s.store.DebugModeFor(s.conversationFor(ctx, args.Conversation, "").Alias)
 
 	switch action {
 	case actionList:
@@ -663,16 +663,19 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		return sb.String(), nil
 
 	case actionDebugOn:
-		if err := s.store.SetDebugMode(true); err != nil {
+		conv := s.conversationFor(ctx, targetAlias, "")
+		if err := s.store.SetConversationDebugMode(conv.Alias, true); err != nil {
 			return "", err
 		}
-		return "✅ Enabled `kube-agents` **Debug Mode** (`debugMode=true`). Tool call tables, timings, and task metadata will be shown.", nil
+		return fmt.Sprintf("✅ Enabled `kube-agents` **Debug Mode** for conversation **`%s`** (`console:%s`). Tool call tables, timings, and task metadata will be shown on this conversation only.", conv.Alias, conv.Token), nil
 
 	case actionDebugOff:
-		if err := s.store.SetDebugMode(false); err != nil {
+		conv := s.conversationFor(ctx, targetAlias, "")
+		if err := s.store.SetConversationDebugMode(conv.Alias, false); err != nil {
 			return "", err
 		}
-		return "✅ Disabled `kube-agents` **Debug Mode** (`debugMode=false`). Thinking is collapsed by default and tool call tables/timings are hidden.", nil
+		_ = s.store.SetDebugMode(false) // also clear any legacy global flag
+		return fmt.Sprintf("✅ Disabled `kube-agents` **Debug Mode** for conversation **`%s`**. Thinking is collapsed by default and tool call tables/timings are hidden.", conv.Alias), nil
 
 	case actionNew:
 		alias := strings.TrimSpace(targetAlias)
@@ -786,7 +789,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			action = actionList
 		}
 	}
-	debug := args.Debug || s.store.DebugMode()
+	debug := args.Debug || s.store.DebugModeFor(s.conversationFor(ctx, args.Conversation, "").Alias)
 	turnCtx := ctx
 	if !debug {
 		turnCtx = WithoutProgressCallback(ctx)

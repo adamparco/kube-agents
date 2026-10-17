@@ -75,13 +75,16 @@ type DeploymentProfile struct {
 
 // ConversationEntry tracks a named console conversation token and its mode.
 type ConversationEntry struct {
-	Alias                string    `json:"alias"`
-	Token                string    `json:"token"`
-	SessionMode          bool      `json:"sessionMode"`
-	Description          string    `json:"description,omitempty"`
-	JetskiConversationID string    `json:"jetskiConversationId,omitempty"`
-	CreatedAt            time.Time `json:"createdAt"`
-	LastUsedAt           time.Time `json:"lastUsedAt"`
+	Alias                string `json:"alias"`
+	Token                string `json:"token"`
+	SessionMode          bool   `json:"sessionMode"`
+	Description          string `json:"description,omitempty"`
+	JetskiConversationID string `json:"jetskiConversationId,omitempty"`
+	// DebugMode scopes kube-agents debug output (tool tables, timings, ids) to this conversation,
+	// so one user turning it on does not change what every other concurrent conversation sees.
+	DebugMode  bool      `json:"debugMode,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	LastUsedAt time.Time `json:"lastUsedAt"`
 }
 
 // PushConfig configures bi-directional event push into Jetski.
@@ -479,6 +482,38 @@ func (s *ConfigStore) SetDebugMode(enabled bool) error {
 	defer s.mu.Unlock()
 	s.cfg.DebugMode = enabled
 	return s.saveLocked()
+}
+
+// DebugModeFor reports whether debug output is on for a conversation: its own flag, or the global
+// default (kept for non-Jetski callers and backwards compatibility).
+func (s *ConfigStore) DebugModeFor(aliasOrToken string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	for alias, entry := range s.cfg.Conversations {
+		if alias == target || entry.Token == target {
+			return entry.DebugMode || s.cfg.DebugMode
+		}
+	}
+	return s.cfg.DebugMode
+}
+
+// SetConversationDebugMode sets the per-conversation debug flag.
+func (s *ConfigStore) SetConversationDebugMode(aliasOrToken string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	for alias, entry := range s.cfg.Conversations {
+		if alias == target || entry.Token == target {
+			entry.DebugMode = enabled
+			s.cfg.Conversations[alias] = entry
+			return s.saveLocked()
+		}
+	}
+	return fmt.Errorf("conversation %q not found", target)
 }
 
 // UpdatePushConfig updates the bi-directional Jetski push configuration.

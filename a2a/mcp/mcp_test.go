@@ -351,11 +351,17 @@ func TestBusSessionAndMCPServerEndToEnd(t *testing.T) {
 	}
 	// Also test manage_session debug_on and debug_off toggles.
 	msDebugOn := mcpSrv.CallTool(ctx, toolManageSession, json.RawMessage(`{"action":"debug_on"}`))
-	if msDebugOn.IsError || !store.DebugMode() {
+	// Debug mode is scoped to the conversation (soak round 6: a global flag flipped every
+	// concurrent conversation into debug output).
+	if msDebugOn.IsError || !store.DebugModeFor(store.ActiveConversation().Alias) || store.DebugMode() {
 		t.Fatalf("manage_session debug_on failed: %+v", msDebugOn)
 	}
+	if other, _ := store.EnsureConversation("unrelated-conv", true, ""); store.DebugModeFor(other.Alias) {
+		t.Fatalf("debug_on must not leak to other conversations")
+	}
+	_, _ = store.EnsureConversation("default", false, "")
 	msDebugOff := mcpSrv.CallTool(ctx, toolManageSession, json.RawMessage(`{"action":"debug_off"}`))
-	if msDebugOff.IsError || store.DebugMode() {
+	if msDebugOff.IsError || store.DebugModeFor("default") {
 		t.Fatalf("manage_session debug_off failed: %+v", msDebugOff)
 	}
 
@@ -1642,7 +1648,6 @@ func TestConcurrentJetskiConversationsGetIsolatedConsoleConversations(t *testing
 		t.Fatalf("old binding on %q should have been released, still %q", a1.Alias, got)
 	}
 }
-
 
 // TestStepCursorSurvivesSessionRestart reproduces soak round 4 (T13): Jetski relaunches the MCP
 // server after a crash/upgrade and the fresh process re-streamed all 17 already-shown steps as
