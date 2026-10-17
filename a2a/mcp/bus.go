@@ -68,6 +68,8 @@ const (
 	orderedFetchBatchSize        = 256
 	orderedFetchMaxWait          = 750 * time.Millisecond
 	bootstrapTimeout             = 8 * time.Second
+	bootstrapBackgroundTimeout   = 2 * time.Minute
+	bootstrapTasksLookback       = 24 * time.Hour
 	controlNoticeWait            = 2500 * time.Millisecond
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
@@ -495,11 +497,37 @@ func (s *BusSession) startSubscriptions() error {
 }
 
 func (s *BusSession) bootstrapFromStreams(ctx context.Context) {
-	for _, streamName := range allKnownStreams {
-		cons, err := s.js.OrderedConsumer(ctx, streamName, jetstream.OrderedConsumerConfig{
+	// Foreground budget first; whatever is left is finished in the background so a busy TASKS
+	// stream (it grows by thousands of envelopes per hour of fan-outs) never leaves a reconnected
+	// session with a truncated view of a task that is still being polled.
+	remaining := s.bootstrapStreams(ctx, allKnownStreams)
+	if len(remaining) > 0 {
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), bootstrapBackgroundTimeout)
+			defer cancel()
+			s.bootstrapStreams(bgCtx, remaining)
+		}()
+	}
+}
+
+// bootstrapStreams replays streams into the session and returns the ones it did not finish
+// before ctx expired. TASKS is replayed from bootstrapTasksLookback ago rather than from the
+// start of the stream: older tasks are not pollable from a live Jetski conversation anyway.
+func (s *BusSession) bootstrapStreams(ctx context.Context, streams []string) (unfinished []string) {
+	for i, streamName := range streams {
+		if ctx.Err() != nil {
+			return streams[i:]
+		}
+		cfg := jetstream.OrderedConsumerConfig{
 			DeliverPolicy:     jetstream.DeliverAllPolicy,
 			InactiveThreshold: orderedConsumerIdleThreshold,
-		})
+		}
+		if streamName == streamTasks {
+			start := time.Now().Add(-bootstrapTasksLookback)
+			cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
+			cfg.OptStartTime = &start
+		}
+		cons, err := s.js.OrderedConsumer(ctx, streamName, cfg)
 		if err != nil {
 			continue
 		}
@@ -512,6 +540,7 @@ func (s *BusSession) bootstrapFromStreams(ctx context.Context) {
 			continue
 		}
 		fetched := 0
+		finished := false
 		for fetched < pending && ctx.Err() == nil {
 			batchSize := pending - fetched
 			if batchSize > orderedFetchBatchSize {
@@ -531,7 +560,12 @@ func (s *BusSession) bootstrapFromStreams(ctx context.Context) {
 				break
 			}
 		}
+		finished = fetched >= pending || ctx.Err() == nil
+		if !finished {
+			return streams[i:]
+		}
 	}
+	return nil
 }
 
 func (s *BusSession) ingestA2AMessage(subject string, data []byte, isLive bool) {
