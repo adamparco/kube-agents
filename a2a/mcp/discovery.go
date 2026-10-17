@@ -126,7 +126,7 @@ type CommandRunner func(ctx context.Context, name string, args ...string) ([]byt
 // DefaultCommandRunner executes a command with process-group termination on context cancellation.
 func DefaultCommandRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = childProcAttr()
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -446,7 +446,7 @@ func (t *PortForwardTunnel) supervise(ctx context.Context) {
 			portMapping,
 		}
 		cmd := exec.CommandContext(ctx, kubectlBin, args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.SysProcAttr = childProcAttr()
 		cmd.Cancel = func() error {
 			if cmd.Process != nil {
 				return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)

@@ -177,9 +177,20 @@ func InspectPullRequest(
 	token := resolveGitHubToken()
 	insp, err := fetchPRViaHTTP(fetchCtx, apiBaseURL, repo, num, token)
 	if err != nil {
-		insp, err = fetchPRViaGHCLI(fetchCtx, runner, repo, num)
+		httpErr := err
+		// The model often hears "PR #220 on adamparco-infra" and guesses an owner. If the guessed
+		// repo is not the deployment's but shares its name, retry against the deployment's repo
+		// before falling back to the gh CLI (which may not be installed on this host).
+		if alt := sameNameRepo(repo, defaultRepo); alt != "" {
+			if insp2, err2 := fetchPRViaHTTP(fetchCtx, apiBaseURL, alt, num, token); err2 == nil {
+				insp, err, repo = insp2, nil, alt
+			}
+		}
 		if err != nil {
-			return nil, err
+			insp, err = fetchPRViaGHCLI(fetchCtx, runner, repo, num)
+			if err != nil {
+				return nil, fmt.Errorf("%w (GitHub API: %v)", err, httpErr)
+			}
 		}
 	}
 
@@ -440,4 +451,23 @@ func splitUnifiedDiffByFile(diff string) map[string]string {
 		}
 	}
 	return out
+}
+
+// sameNameRepo returns defaultRepo when guessed is a different owner/repo with the same repository
+// name (e.g. guessed "adamparco/adamparco-infra", default "gke-agentic/adamparco-infra"), else "".
+func sameNameRepo(guessed, defaultRepo string) string {
+	g := strings.TrimSpace(guessed)
+	d := strings.TrimSpace(defaultRepo)
+	if g == "" || d == "" || strings.EqualFold(g, d) {
+		return ""
+	}
+	gi := strings.LastIndex(g, "/")
+	di := strings.LastIndex(d, "/")
+	if gi < 0 || di < 0 {
+		return ""
+	}
+	if strings.EqualFold(g[gi+1:], d[di+1:]) {
+		return d
+	}
+	return ""
 }
