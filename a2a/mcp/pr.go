@@ -42,7 +42,7 @@ const (
 	ghFlagJSON               = "--json"
 	ghJSONFields             = "number,title,state,url,headRefName,baseRefName,additions,deletions,changedFiles,body,author,files"
 	prFetchTimeout           = 15 * time.Second
-	maxInlineDiffBytes       = 24000
+	maxInlineDiffBytes       = 3200
 	prUrlRegexPattern        = `https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)`
 	prShortRefRegexPattern   = `\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b`
 	prNumberOnlyRegexPattern = `^#?(\d+)$`

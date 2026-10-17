@@ -325,7 +325,7 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 			})
 		}
 		res := s.CallTool(callCtx, callParams.Name, callParams.Arguments)
-		if !res.IsError && len(res.Content) > 0 && (callParams.Meta.ConversationID != "" || callParams.Meta.ProgressToken != nil) {
+		if !res.IsError && len(res.Content) > 0 && (res.CustomTitle != "" || res.CustomMarkdown != "") && (callParams.Meta.ConversationID != "" || callParams.Meta.ProgressToken != nil) {
 			txt := res.Content[0].Text
 			md := txt
 			if res.CustomMarkdown != "" {
@@ -393,7 +393,7 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 	case toolSendMessage:
 		text, customTitle, customMarkdown, err = s.handleSendMessage(ctx, rawArgs)
 	case toolManageSession:
-		text, err = s.handleManageSession(ctx, rawArgs)
+		text, customTitle, customMarkdown, err = s.handleManageSession(ctx, rawArgs)
 	case toolTaskControl:
 		text, customTitle, customMarkdown, err = s.handleTaskControl(ctx, rawArgs)
 	case toolReadTopics:
@@ -616,7 +616,7 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 	return llmResult, title, customMD, err
 }
 
-func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessage) (string, string, string, error) {
 	var args struct {
 		Action       string `json:"action"`
 		Alias        string `json:"alias"`
@@ -645,25 +645,31 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		fmt.Fprintf(&sb, "- **Debug Mode (Active Conversation)**: `%v`\n\n", s.store.DebugModeFor(activeAlias))
 		sb.WriteString("| Active | Alias | Console Token | Mode | Last Used | Description |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
-		var namedAliases, autoAliases []string
-		for k, c := range snap.Conversations {
-			if strings.HasPrefix(k, "jetski-") && k != activeAlias && !c.SessionMode && !c.DebugMode {
-				autoAliases = append(autoAliases, k)
-			} else {
-				namedAliases = append(namedAliases, k)
+		allAliases := make([]string, 0, len(snap.Conversations))
+		for k := range snap.Conversations {
+			allAliases = append(allAliases, k)
+		}
+		sort.Slice(allAliases, func(i, j int) bool {
+			ai, aj := allAliases[i], allAliases[j]
+			if (ai == activeAlias) != (aj == activeAlias) {
+				return ai == activeAlias
 			}
-		}
-		sort.Strings(namedAliases)
-		sort.Slice(autoAliases, func(i, j int) bool {
-			return snap.Conversations[autoAliases[i]].LastUsedAt.After(snap.Conversations[autoAliases[j]].LastUsedAt)
+			ci, cj := snap.Conversations[ai], snap.Conversations[aj]
+			if (ci.SessionMode || ci.DebugMode) != (cj.SessionMode || cj.DebugMode) {
+				return ci.SessionMode || ci.DebugMode
+			}
+			if !ci.LastUsedAt.Equal(cj.LastUsedAt) {
+				return ci.LastUsedAt.After(cj.LastUsedAt)
+			}
+			return ai < aj
 		})
-		const maxAutoShown = 8
-		omittedAuto := 0
-		if len(autoAliases) > maxAutoShown {
-			omittedAuto = len(autoAliases) - maxAutoShown
-			autoAliases = autoAliases[:maxAutoShown]
+		const maxConversationsShown = 12
+		omittedCount := 0
+		allShown := allAliases
+		if len(allShown) > maxConversationsShown {
+			omittedCount = len(allShown) - maxConversationsShown
+			allShown = allShown[:maxConversationsShown]
 		}
-		allShown := append(namedAliases, autoAliases...)
 		for _, a := range allShown {
 			c := snap.Conversations[a]
 			act := badgeStandby
@@ -680,25 +686,25 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			fmt.Fprintf(&sb, "| %s | **`%s`** | `console:%s` | %s | `%s` | %s |\n",
 				act, c.Alias, c.Token, mLabel, c.LastUsedAt.Format(time.RFC3339), firstNonEmptyStr(c.Description, "—"))
 		}
-		if omittedAuto > 0 {
-			fmt.Fprintf(&sb, "\n*(+ %d older idle auto-bound `jetski-*` conversations omitted)*\n", omittedAuto)
+		if omittedCount > 0 {
+			fmt.Fprintf(&sb, "\n*(+ %d older idle conversations omitted)*\n", omittedCount)
 		}
-		return sb.String(), nil
+		return sb.String(), "", "", nil
 
 	case actionDebugOn:
 		conv := s.conversationFor(ctx, targetAlias, "")
 		if err := s.store.SetConversationDebugMode(conv.Alias, true); err != nil {
-			return "", err
+			return "", "", "", err
 		}
-		return fmt.Sprintf("✅ Enabled `kube-agents` **Debug Mode** for conversation **`%s`** (`console:%s`). Tool call tables, timings, and task metadata will be shown on this conversation only.", conv.Alias, conv.Token), nil
+		return fmt.Sprintf("✅ Enabled `kube-agents` **Debug Mode** for conversation **`%s`** (`console:%s`). Tool call tables, timings, and task metadata will be shown on this conversation only.", conv.Alias, conv.Token), "", "", nil
 
 	case actionDebugOff:
 		conv := s.conversationFor(ctx, targetAlias, "")
 		if err := s.store.SetConversationDebugMode(conv.Alias, false); err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		_ = s.store.SetDebugMode(false) // also clear any legacy global flag
-		return fmt.Sprintf("✅ Disabled `kube-agents` **Debug Mode** for conversation **`%s`**. Thinking is collapsed by default and tool call tables/timings are hidden.", conv.Alias), nil
+		return fmt.Sprintf("✅ Disabled `kube-agents` **Debug Mode** for conversation **`%s`**. Thinking is collapsed by default and tool call tables/timings are hidden.", conv.Alias), "", "", nil
 
 	case actionNew:
 		alias := strings.TrimSpace(targetAlias)
@@ -707,36 +713,36 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		}
 		entry, err := s.store.EnsureConversation(alias, true, args.Description)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
 			s.store.BindConversationJetskiID(entry.Alias, jetskiID)
 		}
-		return fmt.Sprintf("✅ Created and switched to new conversation **`%s`** (token `console:%s`).", entry.Alias, entry.Token), nil
+		return fmt.Sprintf("✅ Created and switched to new conversation **`%s`** (token `console:%s`).", entry.Alias, entry.Token), "", "", nil
 
 	case actionSwitch:
 		if strings.TrimSpace(targetAlias) == "" {
-			return "", errors.New("switch requires alias")
+			return "", "", "", errors.New("switch requires alias")
 		}
 		entry, err := s.store.EnsureConversation(targetAlias, false, args.Description)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
 			s.store.BindConversationJetskiID(entry.Alias, jetskiID)
 		}
-		return fmt.Sprintf("✅ Switched active conversation to **`%s`** (token `console:%s`, sessionMode=`%v`).", entry.Alias, entry.Token, entry.SessionMode), nil
+		return fmt.Sprintf("✅ Switched active conversation to **`%s`** (token `console:%s`, sessionMode=`%v`).", entry.Alias, entry.Token, entry.SessionMode), "", "", nil
 
 	case actionSessionOn, actionSessionStartAlias, actionSessionOff, actionSessionEndAlias, actionStatus, actionHelp:
 		sess, err := s.ensureConnected(ctx)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		var conv ConversationEntry
 		if strings.TrimSpace(targetAlias) != "" {
 			conv, err = s.store.EnsureConversation(targetAlias, false, args.Description)
 			if err != nil {
-				return "", err
+				return "", "", "", err
 			}
 		} else {
 			conv = s.conversationFor(ctx, "", "")
@@ -755,12 +761,12 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			turnCtx = WithoutProgressCallback(ctx)
 		}
 		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmd, modeAuto, controlNoticeWait)
-		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), err
+		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), "", "", err
 
 	case actionTranscript:
 		sess, err := s.ensureConnected(ctx)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		conv := s.conversationFor(ctx, "", "")
 		if strings.TrimSpace(targetAlias) != "" {
@@ -774,39 +780,63 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			}
 		}
 		if len(tasks) == 0 {
-			return fmt.Sprintf("No tasks recorded yet on conversation **`%s`** (`console:%s`).", conv.Alias, conv.Token), nil
+			return fmt.Sprintf("No tasks recorded yet on conversation **`%s`** (`console:%s`).", conv.Alias, conv.Token), "", "", nil
 		}
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
-		const maxTranscriptBytes = 24 * 1024
+		var sb, llmSB strings.Builder
+		header := fmt.Sprintf("## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
+		sb.WriteString(header)
+		llmSB.WriteString(header)
+		const maxTranscriptBytes = 14 * 1024
+		const maxLLMTranscriptBytes = 3600
 		// Render newest-last, but ensure the newest turns are never dropped if the transcript is long:
-		var sections []string
+		var sections, llmSections []string
 		totalBytes := sb.Len()
+		totalLLMBytes := llmSB.Len()
 		omittedOlder := 0
 		for i := 0; i < len(tasks); i++ {
 			t := tasks[i]
-			var sec strings.Builder
-			fmt.Fprintf(&sec, "### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
+			var sec, llmSec strings.Builder
+			promptHdr := fmt.Sprintf("### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
+			sec.WriteString(promptHdr)
 			sec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
 			sec.WriteString("\n---\n")
+			llmSec.WriteString(promptHdr)
+			if debug {
+				outcome := sess.BuildTaskOutcome(t.TaskID, conv.Alias, conv.Token, t.PromptText, false)
+				llmSec.WriteString(formatCompactDebugLLMResult(outcome, FormatTurnOutcomeMarkdownWithOptions(outcome, false)))
+			} else {
+				llmSec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", false))
+			}
+			llmSec.WriteString("\n---\n")
 			sStr := sec.String()
-			if len(sections) > 0 && totalBytes+len(sStr) > maxTranscriptBytes {
+			lStr := llmSec.String()
+			if len(sections) > 0 && (totalBytes+len(sStr) > maxTranscriptBytes || totalLLMBytes+len(lStr) > maxLLMTranscriptBytes) {
 				omittedOlder = len(tasks) - i
 				break
 			}
 			sections = append(sections, sStr)
+			llmSections = append(llmSections, lStr)
 			totalBytes += len(sStr)
+			totalLLMBytes += len(lStr)
 		}
 		if omittedOlder > 0 {
-			fmt.Fprintf(&sb, "*(%d older task(s) omitted to keep transcript concise; use `task_control` `action: \"list\"` to inspect earlier task IDs)*\n\n---\n", omittedOlder)
+			note := fmt.Sprintf("*(%d older task(s) omitted to keep transcript concise; use `task_control` `action: \"list\"` to inspect earlier task IDs)*\n\n---\n", omittedOlder)
+			sb.WriteString(note)
+			llmSB.WriteString(note)
 		}
 		for i := len(sections) - 1; i >= 0; i-- {
 			sb.WriteString(sections[i])
+			llmSB.WriteString(llmSections[i])
 		}
-		return sb.String(), nil
+		fullMD := sb.String()
+		meta := callMetaFromContext(ctx)
+		if debug && (meta.ConversationID != "" || meta.ProgressToken != nil) {
+			return llmSB.String(), fmt.Sprintf("Transcript for %s (%d task(s))", conv.Alias, len(sections)), fullMD, nil
+		}
+		return fullMD, "", "", nil
 
 	default:
-		return "", fmt.Errorf("unknown manage_session action %q (expected list, new, switch, session_on, session_off, debug_on, debug_off, status, help, transcript)", action)
+		return "", "", "", fmt.Errorf("unknown manage_session action %q (expected list, new, switch, session_on, session_off, debug_on, debug_off, status, help, transcript)", action)
 	}
 }
 
