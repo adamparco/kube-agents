@@ -46,6 +46,7 @@ const (
 	pushSummaryMaxChars          = 600
 	cardTaskIDPrefix             = "task-card-"
 	cardParentSkew               = 5 * time.Second
+	cardParentGrace              = 20 * time.Minute
 	ellipsisSuffix               = "..."
 	consoleConvPrefix            = "console:"
 	consoleFrameKindText         = "text"
@@ -1707,7 +1708,12 @@ func (s *BusSession) findWakeTask(childID string) *TaskRecord {
 func (s *BusSession) findCardParentLocked(card *TaskRecord) string {
 	var best *TaskRecord
 	for _, other := range s.tasks {
-		if other == card || other.Terminal || strings.HasPrefix(other.TaskID, cardTaskIDPrefix) {
+		if other == card || strings.HasPrefix(other.TaskID, cardTaskIDPrefix) {
+			continue
+		}
+		// Cards published out of turn (after the parent was canceled, timed out, or already
+		// answered) still belong to that parent for a grace window.
+		if other.Terminal && time.Since(other.UpdatedAt) > cardParentGrace {
 			continue
 		}
 		sameConv := card.Conversation != "" && other.Conversation == card.Conversation

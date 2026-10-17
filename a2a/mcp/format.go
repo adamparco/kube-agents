@@ -1776,9 +1776,9 @@ func FormatChatMessageMarkdown(m *chatmsg.Message) string {
 		sb.WriteString(strings.Join(parts, " • ") + "\n\n")
 	}
 
-	if m.Mark != nil && m.Mark.Ask != "" {
-		fmt.Fprintf(&sb, "> ❓ **Waiting for input**: %s\n\n", m.Mark.Ask)
-	}
+	// Mark is reaction state (the kind of ask, e.g. "fleet", and how it settled), not a question
+	// for the user: it must not render as "Waiting for input". Input-required is conveyed by the
+	// task state badge and the status message instead.
 
 	return sb.String()
 }
