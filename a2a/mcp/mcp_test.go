@@ -1916,3 +1916,74 @@ func TestOutOfOrderBootstrapReplayDoesNotCorruptCompletedTask(t *testing.T) {
 			totalCount, doneCount, runningCount, cards)
 	}
 }
+
+func TestDedupeNonAdjacentStepsAndBoundDebugOutput(t *testing.T) {
+	// 1. Alternating steps A, B, A, B across >8 raw lines must collapse to A, B with merged thoughts.
+	altRaw := strings.Join([]string{
+		"Checking Kubernetes node status and readiness.\tChecking drift-peer-ap-1 nodes.",
+		"Inspecting Kubernetes pods and workload health.\tChecking drift-peer-ap-1 pods.",
+		"Checking Kubernetes node status and readiness.\tChecking drift-peer-ap-2 nodes.",
+		"Inspecting Kubernetes pods and workload health.\tChecking drift-peer-ap-2 pods.",
+		"Checking Kubernetes node status and readiness.\tRe-checking drift-peer-ap-1 nodepools.",
+		"Inspecting Kubernetes pods and workload health.\tRe-checking drift-peer-ap-1 events.",
+		"Checking Kubernetes node status and readiness.\tRe-checking drift-peer-ap-2 nodepools.",
+		"Inspecting Kubernetes pods and workload health.\tRe-checking drift-peer-ap-2 events.",
+		"Checking Kubernetes node status and readiness (Fleet-wide live status and node count check (16).",
+	}, "\n")
+	steps := parseAndCleanThinkingSteps(altRaw)
+	if len(steps) != 2 {
+		t.Fatalf("expected 2 deduplicated steps from alternating lines, got %d: %+v", len(steps), steps)
+	}
+	if !strings.Contains(steps[0].Thought, "drift-peer-ap-1") || !strings.Contains(steps[0].Thought, "drift-peer-ap-2") {
+		t.Errorf("expected merged thoughts on step[0], got %q", steps[0].Thought)
+	}
+
+	// 2. Large 16-cluster fan-out (>40 raw thinking lines + 235 tool calls) must consolidate
+	// generic cluster diagnostic lines while preserving all 16 Specialist check completed lines,
+	// and FormatTaskRecordMarkdownWithOptions(..., true) must stay < 18 KB.
+	var bigLines []string
+	for i := 1; i <= 16; i++ {
+		c := fmt.Sprintf("drift-peer-std-%d", i)
+		bigLines = append(bigLines,
+			fmt.Sprintf("Checking Kubernetes node status and readiness (%s).\tNodes check on %s.", c, c),
+			fmt.Sprintf("Inspecting Kubernetes pods, nodes, and cluster events (%s).\tPods check on %s.", c, c),
+			fmt.Sprintf("Inspecting files in the workspace (%s).\tWorkspace check on %s.", c, c),
+			fmt.Sprintf("Specialist check completed: %s (done — %d/16 cards done).\tCluster %s is healthy.", c, i, c),
+		)
+	}
+	var acts []ActivityItem
+	for i := 1; i <= 235; i++ {
+		acts = append(acts, ActivityItem{
+			Index:         i,
+			Tool:          "kubectl",
+			Input:         fmt.Sprintf(`{"command":"kubectl get nodes -o wide --context=cluster-%d"}`, i),
+			Status:        "completed",
+			Worker:        fmt.Sprintf("card:t_%02d (drift-peer-std-%d)", (i%16)+1, (i%16)+1),
+			SessionID:     fmt.Sprintf("20261017_sess_%02d", (i%16)+1),
+			DurationMs:    340,
+			At:            "2026-10-17T15:10:00Z",
+			ResultPreview: "NAME STATUS ROLES AGE VERSION gke-node-1 Ready <none> 4d v1.33.5-gke.1100",
+		})
+	}
+	rec := &TaskRecord{
+		TaskID:            "task-big-fanout",
+		ContextID:         "ctx-big",
+		Conversation:      "console:soak",
+		Addressee:         "platform",
+		State:             lib.StateCompleted,
+		Terminal:          true,
+		Thinking:          strings.Join(bigLines, "\n"),
+		Activities:        acts,
+		IntermediateTurns: []string{strings.Repeat("Raw card report line. ", 600)},
+		ResultText:        "All 16 clusters are checked.",
+		EnvelopeCount:     310,
+	}
+	parsedBig := parseAndCleanThinkingSteps(rec.Thinking)
+	if len(parsedBig) != 19 { // 3 consolidated diagnostic steps + 16 specialist completion steps
+		t.Fatalf("expected 19 consolidated steps (3 diagnostic + 16 specialist completions), got %d", len(parsedBig))
+	}
+	debugMD := FormatTaskRecordMarkdownWithOptions(rec, "Primary Task", true)
+	if len(debugMD) > 18500 {
+		t.Fatalf("expected 16-cluster debug markdown <= 18.5 KB to prevent output.txt spill, got %d bytes", len(debugMD))
+	}
+}

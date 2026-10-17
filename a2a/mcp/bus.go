@@ -384,6 +384,7 @@ type BusSession struct {
 	lastReportedSteps map[string]int
 	prevReportedActs  map[string]int
 	lastReportedActs  map[string]int
+	lastWaitStepTitle map[string]string
 	streamBootSeq     map[string]uint64
 	backfilledTasks   map[string]bool
 	backfillMu        sync.Mutex
@@ -572,12 +573,56 @@ func (s *BusSession) bootstrapFromStreams(ctx context.Context) {
 	// stream (it grows by thousands of envelopes per hour of fan-outs) never leaves a reconnected
 	// session with a truncated view of a task that is still being polled.
 	remaining := s.bootstrapStreams(ctx, allKnownStreams)
-	if len(remaining) > 0 {
-		go func() {
-			bgCtx, cancel := context.WithTimeout(context.Background(), bootstrapBackgroundTimeout)
-			defer cancel()
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), bootstrapBackgroundTimeout)
+		defer cancel()
+		if len(remaining) > 0 {
 			s.bootstrapStreams(bgCtx, remaining)
-		}()
+		}
+		s.backfillDeepTasksHistory(bgCtx)
+	}()
+}
+
+// backfillDeepTasksHistory asynchronously replays TASKS from 24h ago so conversation transcripts
+// and task_control(list) include earlier turns without slowing down initial connection setup.
+func (s *BusSession) backfillDeepTasksHistory(ctx context.Context) {
+	if s == nil || s.js == nil || ctx.Err() != nil {
+		return
+	}
+	start := time.Now().Add(-24 * time.Hour)
+	cfg := jetstream.OrderedConsumerConfig{
+		DeliverPolicy:     jetstream.DeliverByStartTimePolicy,
+		OptStartTime:      &start,
+		InactiveThreshold: orderedConsumerIdleThreshold,
+	}
+	cons, err := s.js.OrderedConsumer(ctx, streamTasks, cfg)
+	if err != nil {
+		return
+	}
+	info, infoErr := cons.Info(ctx)
+	if infoErr != nil || info == nil || info.NumPending == 0 {
+		return
+	}
+	pending := int(info.NumPending)
+	fetched := 0
+	for fetched < pending && ctx.Err() == nil {
+		batchSize := pending - fetched
+		if batchSize > orderedFetchBatchSize {
+			batchSize = orderedFetchBatchSize
+		}
+		msgs, fetchErr := cons.Fetch(batchSize, jetstream.FetchMaxWait(orderedFetchMaxWait))
+		if fetchErr != nil {
+			break
+		}
+		gotAny := false
+		for msg := range msgs.Messages() {
+			gotAny = true
+			fetched++
+			s.ingestA2AMessage(msg.Subject(), msg.Data(), false)
+		}
+		if !gotAny || msgs.Error() != nil {
+			break
+		}
 	}
 }
 
@@ -1470,18 +1515,25 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 				s.markForegroundStepTask(primaryID, false)
 				s.recordStepProgress(primaryID, baseline, baseline+1)
 				s.recordActProgress(primaryID, baseActs, curActs)
+				if baseline < len(steps) {
+					s.setLastWaitStepTitle(primaryID, strings.TrimSuffix(steps[baseline], "."))
+				}
 				return true
 			}
 		} else if curActs > baseActs {
-			if curActs != lastActCount {
-				lastActCount = curActs
-				lastActChangeAt = now
-			}
-			if now.Sub(startedAt) >= activityStepBatchWait && !lastActChangeAt.IsZero() && now.Sub(lastActChangeAt) >= activityStepDebounceWait {
-				s.markForegroundStepTask(primaryID, false)
-				s.recordStepProgress(primaryID, baseline, baseline)
-				s.recordActProgress(primaryID, baseActs, curActs)
-				return true
+			candTitle := meaningfulDeltaActivityStepTitle(built, baseActs, curActs)
+			if candTitle != "" && !strings.EqualFold(candTitle, s.getLastWaitStepTitle(primaryID)) {
+				if curActs != lastActCount {
+					lastActCount = curActs
+					lastActChangeAt = now
+				}
+				if now.Sub(startedAt) >= activityStepBatchWait && !lastActChangeAt.IsZero() && now.Sub(lastActChangeAt) >= activityStepDebounceWait {
+					s.markForegroundStepTask(primaryID, false)
+					s.recordStepProgress(primaryID, baseline, baseline)
+					s.recordActProgress(primaryID, baseActs, curActs)
+					s.setLastWaitStepTitle(primaryID, candTitle)
+					return true
+				}
 			}
 		}
 
@@ -1558,6 +1610,66 @@ func (s *BusSession) recordActProgress(taskID string, prev int, reported int) {
 func (s *BusSession) resetStepProgress(taskID string) {
 	s.recordStepProgress(taskID, 0, 0)
 	s.recordActProgress(taskID, 0, 0)
+	s.setLastWaitStepTitle(taskID, "")
+}
+
+func (s *BusSession) getLastWaitStepTitle(taskID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastWaitStepTitle == nil {
+		return ""
+	}
+	return s.lastWaitStepTitle[taskID]
+}
+
+func (s *BusSession) setLastWaitStepTitle(taskID, title string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastWaitStepTitle == nil {
+		s.lastWaitStepTitle = make(map[string]string)
+	}
+	s.lastWaitStepTitle[taskID] = title
+}
+
+func meaningfulDeltaActivityStepTitle(outcome *TurnOutcome, baseActs, curActs int) string {
+	all := collectOutcomeActivities(outcome)
+	if len(all) == 0 || baseActs >= len(all) {
+		return ""
+	}
+	if baseActs < 0 {
+		baseActs = 0
+	}
+	if curActs > len(all) || curActs <= baseActs {
+		curActs = len(all)
+	}
+	delta := all[baseActs:curActs]
+	var lastDiagAct *ActivityItem
+	for i := len(delta) - 1; i >= 0; i-- {
+		t := delta[i].Tool
+		if t == "kanban_heartbeat" {
+			args := parseActivityArgMap(delta[i].Input)
+			if note := firstNonEmptyArgString(args, "note", "status", "message"); note != "" {
+				lastDiagAct = &delta[i]
+				break
+			}
+		}
+		if !strings.HasPrefix(t, "kanban_") && t != "tool_search" && t != "tool_describe" {
+			lastDiagAct = &delta[i]
+			break
+		}
+	}
+	if lastDiagAct == nil {
+		return ""
+	}
+	activeAgent := "platform"
+	if outcome != nil && outcome.PrimaryTask != nil && outcome.PrimaryTask.Addressee != "" {
+		activeAgent = outcome.PrimaryTask.Addressee
+	}
+	step := strings.TrimSuffix(describeActivityWaitStep(*lastDiagAct, activeAgent), ".")
+	if strings.HasPrefix(step, "Waiting for ") || strings.HasPrefix(step, "Polling specialist ") {
+		return ""
+	}
+	return step
 }
 
 func (s *BusSession) recordStepProgress(taskID string, prev int, reported int) {

@@ -839,12 +839,23 @@ func firstNonEmptyArgString(m map[string]any, keys ...string) string {
 	}
 	for _, k := range keys {
 		if v, ok := m[k]; ok {
-			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
-				return strings.TrimSpace(s)
+			if s, ok := v.(string); ok {
+				s = strings.TrimSpace(s)
+				if s != "" && !strings.HasPrefix(s, "<string,") && s != "[redacted]" {
+					return s
+				}
 			}
 		}
 	}
 	return ""
+}
+
+func summarizeKanbanMetadata(args map[string]any) string {
+	meta, ok := args["metadata"].(map[string]any)
+	if !ok || len(meta) == 0 {
+		return ""
+	}
+	return formatArgMapSummaryWithLimit(meta, 80)
 }
 
 func extractClusterFromText(text string) string {
@@ -956,16 +967,37 @@ func extractKanbanCardsFromTask(rec *TaskRecord) (cards []KanbanCardSummary, don
 			}
 		case "kanban_done", "kanban_complete":
 			cardID := firstNonEmptyArgString(args, "task_id", "card_id", "id")
-			if c := ensureCard(cardID); c != nil {
+			var c *KanbanCardSummary
+			if cardID != "" {
+				c = ensureCard(cardID)
+			} else {
+				for _, id := range order {
+					cand := byID[id]
+					if cand != nil && cand.Status != "done" && cand.Status != "failed" {
+						if act.SessionID != "" && cand.SessionID == act.SessionID {
+							c = cand
+							break
+						}
+						if c == nil {
+							c = cand
+						}
+					}
+				}
+			}
+			if c != nil {
 				c.Status = "done"
 				if act.SessionID != "" {
 					c.SessionID = act.SessionID
 				}
-				if v := firstNonEmptyArgString(args, "verdict", "status"); v != "" && !strings.HasPrefix(v, "<string,") {
+				if v := firstNonEmptyArgString(args, "verdict", "status"); v != "" {
 					c.Verdict = v
 				}
-				if s := firstNonEmptyArgString(args, "summary", "result", "note"); s != "" && !strings.HasPrefix(s, "<string,") {
+				if s := firstNonEmptyArgString(args, "summary", "result", "note"); s != "" {
 					c.Summary = s
+				} else if c.Summary == "" {
+					if mSum := summarizeKanbanMetadata(args); mSum != "" {
+						c.Summary = mSum
+					}
 				}
 			}
 		case "kanban_fail":
@@ -1077,6 +1109,9 @@ func extractKanbanCardsFromTask(rec *TaskRecord) (cards []KanbanCardSummary, don
 		c := byID[id]
 		if c == nil {
 			continue
+		}
+		if rec.Terminal && rec.State == lib.StateCompleted && c.Status != "done" && c.Status != "failed" {
+			c.Status = "done"
 		}
 		totalCount++
 		switch c.Status {
@@ -1295,7 +1330,7 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		var currentStep string
 		var stepMD string
 		deltaActs := collectDeltaActivities(outcome)
-		_, doneCards, runningCards, totalCards, latestNote := summarizeOutcomeKanbanState(outcome)
+		cards, doneCards, runningCards, totalCards, latestNote := summarizeOutcomeKanbanState(outcome)
 
 		switch {
 		case len(deltaDetails) >= 1:
@@ -1321,7 +1356,7 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 					break
 				}
 			}
-			if lastDiagAct == nil && len(deltaActs) > 0 {
+			if lastDiagAct == nil && len(deltaActs) > 0 && totalCards == 0 {
 				lastDiagAct = &deltaActs[len(deltaActs)-1]
 			}
 			switch {
@@ -1340,13 +1375,19 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 					thought = fmt.Sprintf("Executed %d new tool %s during active step.", len(deltaActs), pluralizeWord(len(deltaActs), "call", "calls"))
 				}
 			case totalCards > 0 && doneCards < totalCards:
-				currentStep = fmt.Sprintf("Specialist checks in progress (%d/%d completed, %d running)", doneCards, totalCards, runningCards)
-				if outcome.PrimaryTask != nil && len(outcome.PrimaryTask.Activities) > 0 {
-					lastAct := outcome.PrimaryTask.Activities[len(outcome.PrimaryTask.Activities)-1]
-					actStep := strings.TrimSuffix(describeActivityWaitStep(lastAct, activeAgent), ".")
-					if actStep != "" && !strings.HasPrefix(actStep, "Waiting for ") {
-						currentStep = fmt.Sprintf("%s (%d/%d cards done)", actStep, doneCards, totalCards)
+				var activeClusters []string
+				for _, c := range cards {
+					if c.Status == "running" || c.Status == "pending" {
+						name := firstNonEmptyStr(c.Cluster, c.Title, c.ID)
+						if name != "" && !strings.HasPrefix(strings.ToLower(name), "fleet-wide") && len(activeClusters) < 3 {
+							activeClusters = append(activeClusters, name)
+						}
 					}
+				}
+				if len(activeClusters) > 0 {
+					currentStep = fmt.Sprintf("Waiting for specialist check on %s (%d/%d cards done)", strings.Join(activeClusters, ", "), doneCards, totalCards)
+				} else {
+					currentStep = fmt.Sprintf("Specialist checks in progress (%d/%d completed, %d running)", doneCards, totalCards, runningCards)
 				}
 				if latestNote != "" {
 					thought = latestNote
@@ -1384,8 +1425,6 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		nextSummaryHint := currentStep
 		if len(allDetails) > reported {
 			nextSummaryHint = strings.TrimSuffix(allDetails[reported].Title, ".")
-		} else if totalCards > 0 && doneCards < totalCards {
-			nextSummaryHint = fmt.Sprintf("Streaming specialist progress (%d/%d cards done)", doneCards, totalCards)
 		}
 
 		var llm strings.Builder
@@ -1393,6 +1432,8 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 			streamingStepContinuePrefix, outcome.PrimaryTask.TaskID, activeAgent, sec, len(visibleDetails), pluralizeStep(len(visibleDetails)))
 		if len(deltaDetails) > 0 {
 			fmt.Fprintf(&llm, "Latest step: %s\n", deltaDetails[len(deltaDetails)-1].Title)
+		} else if len(deltaActs) > 0 {
+			fmt.Fprintf(&llm, "Latest step: %s (%d new tool %s recorded)\n", currentStep, len(deltaActs), pluralizeWord(len(deltaActs), "call", "calls"))
 		} else {
 			llm.WriteString("No new step since the last poll: the remote agent is still inside a long-running step (remote tool calls, specialist fan-outs, and web lookups routinely take several minutes). This is normal and is NOT a stall.\n")
 		}
@@ -2035,18 +2076,67 @@ func cleanAndDedupeThinking(raw string) []string {
 	return out
 }
 
+var (
+	fleetWideParenSuffixRe = regexp.MustCompile(`(?i)\s*\(fleet-wide [^)]*(?:\([^.)]*\))?[^.)]*\)?\.?$`)
+	trailingClusterParenRe = regexp.MustCompile(`\s*\(([a-z0-9][a-z0-9_-]{2,47})\)\.?$`)
+)
+
 func parseAndCleanThinkingSteps(raw string) []StepDetail {
+	rawLines := strings.Split(raw, "\n")
+	consolidateClusterDiagnostics := len(rawLines) > 40
+	dedupeNonAdjacent := len(rawLines) > 8
 	var out []StepDetail
-	for _, line := range strings.Split(raw, "\n") {
+	for _, line := range rawLines {
 		title, thought := normalizeStepTitleAndThought(line)
 		if title == "" {
 			continue
 		}
-		if len(out) > 0 && strings.EqualFold(strings.TrimSuffix(out[len(out)-1].Title, "."), strings.TrimSuffix(title, ".")) {
-			if out[len(out)-1].Thought == "" && thought != "" {
-				out[len(out)-1].Thought = thought
+		if consolidateClusterDiagnostics {
+			lowerTitle := strings.ToLower(title)
+			if !strings.HasPrefix(lowerTitle, "specialist check ") &&
+				!strings.HasPrefix(lowerTitle, "delegating specialist task") &&
+				!strings.HasPrefix(lowerTitle, "inspecting gke cluster ") {
+				if m := trailingClusterParenRe.FindStringSubmatch(title); len(m) == 2 {
+					clusterTag := m[1]
+					baseTitle := strings.TrimSpace(title[:len(title)-len(m[0])])
+					if baseTitle != "" {
+						title = strings.TrimSuffix(baseTitle, ".") + "."
+						if thought != "" && !strings.Contains(thought, clusterTag) {
+							thought = "[" + clusterTag + "] " + thought
+						}
+					}
+				}
+			}
+		}
+		normKey := strings.ToLower(strings.TrimSuffix(title, "."))
+		if len(out) > 0 && strings.EqualFold(strings.TrimSuffix(out[len(out)-1].Title, "."), normKey) {
+			if thought != "" {
+				out[len(out)-1].Thought = mergeThoughts(out[len(out)-1].Thought, thought)
 			}
 			continue
+		}
+		if dedupeNonAdjacent {
+			isSynth := strings.EqualFold(normKey, strings.TrimSuffix(synthFinalStepTitle, "."))
+			foundIdx := -1
+			for i := range out {
+				if strings.EqualFold(strings.TrimSuffix(out[i].Title, "."), normKey) {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx >= 0 {
+				if isSynth {
+					mergedThought := mergeThoughts(out[foundIdx].Thought, thought)
+					out = append(out[:foundIdx], out[foundIdx+1:]...)
+					out = append(out, StepDetail{
+						Title:   title,
+						Thought: mergedThought,
+					})
+				} else if thought != "" {
+					out[foundIdx].Thought = mergeThoughts(out[foundIdx].Thought, thought)
+				}
+				continue
+			}
 		}
 		out = append(out, StepDetail{
 			Title:   title,
@@ -2136,6 +2226,13 @@ func cleanSingleThinkingLine(line string) string {
 	line = legacyActionPrefixRe.ReplaceAllString(line, "")
 	line = legacyPlanPrefixRe.ReplaceAllString(line, "")
 	line = legacyKeyBracketSufRe.ReplaceAllString(line, "")
+	if fleetWideParenSuffixRe.MatchString(line) {
+		hasDot := strings.HasSuffix(strings.TrimSpace(line), ".")
+		line = strings.TrimSpace(fleetWideParenSuffixRe.ReplaceAllString(line, ""))
+		if hasDot && line != "" && !strings.HasSuffix(line, ".") {
+			line += "."
+		}
+	}
 	if legacySynthPrefixRe.MatchString(line) {
 		line = synthFinalStepTitle
 	}
@@ -2333,14 +2430,14 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		sb.WriteString("| ---: | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n")
 		maxInputChars := 240
 		maxPreviewChars := 180
-		if len(rec.Activities) > 50 {
-			maxInputChars = 120
-			maxPreviewChars = 100
+		if len(rec.Activities) > 35 {
+			maxInputChars = 80
+			maxPreviewChars = 70
 		}
 		const (
-			maxDebugTableRows = 80
-			headDebugRows     = 25
-			tailDebugRows     = 55
+			maxDebugTableRows = 35
+			headDebugRows     = 12
+			tailDebugRows     = 23
 		)
 		for i, act := range rec.Activities {
 			if len(rec.Activities) > maxDebugTableRows && i >= headDebugRows && i < len(rec.Activities)-tailDebugRows {
@@ -2404,14 +2501,30 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 	}
 	if debug && (len(thinkingLines) > 0 || len(rec.IntermediateTurns) > 0) {
 		fmt.Fprintf(&sb, "<details>\n<summary>🧠 <strong>Raw LLM API Turn Log</strong> — <code>%d thinking frames</code></summary>\n\n", len(thinkingLines))
+		const (
+			maxDebugThinkingLines = 25
+			headThinkingLines     = 10
+			tailThinkingLines     = 15
+		)
 		for i, raw := range thinkingLines {
-			clean := strings.ReplaceAll(raw, "\t", " — ")
+			if len(thinkingLines) > maxDebugThinkingLines && i >= headThinkingLines && i < len(thinkingLines)-tailThinkingLines {
+				if i == headThinkingLines {
+					omitted := len(thinkingLines) - headThinkingLines - tailThinkingLines
+					fmt.Fprintf(&sb, "- *… (%d intermediate thinking frames omitted — see consolidated steps above)*\n", omitted)
+				}
+				continue
+			}
+			clean := truncateText(strings.ReplaceAll(raw, "\t", " — "), 160)
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, clean)
 		}
 		if len(rec.IntermediateTurns) > 0 {
 			sb.WriteString("\n#### 🔄 Intermediate Turns\n")
-			for _, t := range rec.IntermediateTurns {
-				fmt.Fprintf(&sb, "> %s\n\n", truncateText(strings.TrimSpace(t), 1200))
+			for i, t := range rec.IntermediateTurns {
+				if i >= 3 {
+					fmt.Fprintf(&sb, "*… (%d additional intermediate turns omitted)*\n\n", len(rec.IntermediateTurns)-3)
+					break
+				}
+				fmt.Fprintf(&sb, "> %s\n\n", truncateText(strings.TrimSpace(t), 800))
 			}
 		}
 		sb.WriteString("\n</details>\n\n")

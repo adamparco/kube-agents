@@ -518,6 +518,7 @@ type activityState struct {
 	startedAt         time.Time
 	appended          map[string]bool   // artifact name -> a first part went out
 	sessionCards      map[string]string // worker sessionID -> cardID
+	sessionProfiles   map[string]string // worker sessionID -> hermes profile name
 	cardTitles        map[string]string // cardID -> short cluster/card title
 	cardAssignees     map[string]string // lower(assignee) -> cardID
 	cardClusters      map[string]string // lower(cluster/shortTitle) -> cardID
@@ -540,6 +541,7 @@ func newActivityState(withKey bool) *activityState {
 		startedAt:       time.Now(),
 		appended:        make(map[string]bool),
 		sessionCards:    make(map[string]string),
+		sessionProfiles: make(map[string]string),
 		cardTitles:      make(map[string]string),
 		cardAssignees:   make(map[string]string),
 		cardClusters:    make(map[string]string),
@@ -832,6 +834,9 @@ func (a *activityState) observeWorkerHookContextLocked(d hookDelivery) {
 	if sessID == "" || sessID == a.sessionID || strings.HasPrefix(sessID, apiSessionIDPrefix) {
 		return
 	}
+	if prof := strings.TrimSpace(d.Profile); prof != "" && prof != "platform" {
+		a.sessionProfiles[sessID] = prof
+	}
 	if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
 		a.sessionCards[sessID] = cid
 		a.claimedSessions[sessID] = true
@@ -854,12 +859,16 @@ func (a *activityState) observeWorkerHookContextLocked(d hookDelivery) {
 }
 
 func (a *activityState) qualifyWorkerThinkingLocked(sessionID, cand string) string {
-	if len(a.cardTitles) <= 1 {
+	if len(a.cardTitles) <= 1 || len(a.cardTitles) > 6 {
 		return cand
 	}
-	cid := a.sessionCards[strings.TrimSpace(sessionID)]
+	sessID := strings.TrimSpace(sessionID)
+	cid := a.sessionCards[sessID]
 	title := strings.TrimSpace(a.cardTitles[cid])
-	if title == "" {
+	if profCluster := extractClusterFromProfile(a.sessionProfiles[sessID]); profCluster != "" && (title == "" || strings.HasPrefix(strings.ToLower(title), "fleet-wide")) {
+		title = profCluster
+	}
+	if title == "" || strings.HasPrefix(strings.ToLower(title), "fleet-wide") {
 		return cand
 	}
 	lowerTitle := strings.ToLower(title)
@@ -901,27 +910,44 @@ func (a *activityState) hasCardID(cardID string) bool {
 func (a *activityState) observeCardBindingLocked(sessionID, toolName string, rawInput json.RawMessage, createdCardID string) {
 	sessionID = strings.TrimSpace(sessionID)
 	parsed := decodeToolArgsMap(rawInput)
-	if toolName == kanbanCreateTool {
-		title := extractArgStr(parsed, "title")
-		assignee := strings.ToLower(extractArgStr(parsed, "assignee"))
+	recordCreateMap := func(m map[string]any, cid string) {
+		title := extractArgStr(m, "title")
+		assignee := strings.ToLower(extractArgStr(m, "assignee"))
 		shortTitle := shortCardClusterOrTitle(title)
 		lowerCluster := strings.ToLower(shortTitle)
 		if assignee != "" && !slices.Contains(a.pendingAssignees, assignee) {
 			a.pendingAssignees = append(a.pendingAssignees, assignee)
 		}
-		if lowerCluster != "" && !slices.Contains(a.pendingClusters, lowerCluster) {
+		if lowerCluster != "" && !strings.HasPrefix(lowerCluster, "fleet-wide") && !slices.Contains(a.pendingClusters, lowerCluster) {
 			a.pendingClusters = append(a.pendingClusters, lowerCluster)
 		}
-		if createdCardID != "" {
+		if cid != "" {
 			if shortTitle != "" {
-				a.cardTitles[createdCardID] = shortTitle
-				a.cardClusters[lowerCluster] = createdCardID
+				a.cardTitles[cid] = shortTitle
+				if !strings.HasPrefix(lowerCluster, "fleet-wide") {
+					a.cardClusters[lowerCluster] = cid
+				}
 			}
 			if assignee != "" {
-				a.cardAssignees[assignee] = createdCardID
+				a.cardAssignees[assignee] = cid
 			}
 		}
+	}
+	if toolName == kanbanCreateTool {
+		recordCreateMap(parsed, createdCardID)
 		return
+	}
+	if toolName == hermesToolCallWrapper && parsed != nil {
+		if calls, ok := parsed[wrapperCallsKey].([]any); ok {
+			for _, item := range calls {
+				if cm, ok := item.(map[string]any); ok {
+					if sub, _ := cm[wrapperCallNameKey].(string); strings.TrimSpace(sub) == kanbanCreateTool {
+						subArgs, _ := cm[wrapperCallArgsKey].(map[string]any)
+						recordCreateMap(subArgs, "")
+					}
+				}
+			}
+		}
 	}
 	if strings.HasPrefix(toolName, "kanban_") {
 		cid := extractArgStr(parsed, "card_id", "task_id", "id")
@@ -958,8 +984,10 @@ func (a *activityState) matchCardFromTextLocked(raw string) string {
 		}
 	}
 	if len(a.cardTitles) == 1 {
-		for cid := range a.cardTitles {
-			return cid
+		for cid, title := range a.cardTitles {
+			if !strings.HasPrefix(strings.ToLower(title), "fleet-wide") {
+				return cid
+			}
 		}
 	}
 	return ""
@@ -1037,10 +1065,17 @@ func (a *activityState) workerLabelLocked(sessionID, toolName string, rawInput j
 		}
 	}
 	if cid != "" {
-		if title := a.cardTitles[cid]; title != "" {
+		title := a.cardTitles[cid]
+		if profCluster := extractClusterFromProfile(a.sessionProfiles[sessionID]); profCluster != "" && (title == "" || strings.HasPrefix(strings.ToLower(title), "fleet-wide")) {
+			title = profCluster
+		}
+		if title != "" {
 			return fmt.Sprintf("card:%s (%s)", cid, title)
 		}
 		return "card:" + cid
+	}
+	if profCluster := extractClusterFromProfile(a.sessionProfiles[sessionID]); profCluster != "" {
+		return fmt.Sprintf("worker:%s (%s)", capRunes(sessionID, 16), profCluster)
 	}
 	return "worker:" + capRunes(sessionID, 24)
 }
@@ -1529,12 +1564,47 @@ func shortFilePath(raw string) string {
 	return capRunes(strings.Join(parts, "/"), 56)
 }
 
+var (
+	bridgeClusterNameRe = regexp.MustCompile(`\b(drift-peer-[a-z0-9-]+|kube-agents-host|spot-capacity-test|gke-[a-z0-9_-]+)\b`)
+	profileRegionSufRe  = regexp.MustCompile(`-(?:us|europe|asia|australia|northamerica|southamerica|me|africa)-[a-z0-9-]+$`)
+)
+
+func extractClusterFromProfile(profile string) string {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if profile == "" || profile == "platform" || profile == "default" {
+		return ""
+	}
+	if m := bridgeClusterNameRe.FindStringSubmatch(profile); len(m) >= 2 {
+		return m[1]
+	}
+	if strings.HasPrefix(profile, "cluster-") {
+		rest := strings.TrimPrefix(profile, "cluster-")
+		rest = profileRegionSufRe.ReplaceAllString(rest, "")
+		return capRunes(rest, 48)
+	}
+	return ""
+}
+
+func trimUnclosedParen(s string) string {
+	if strings.Count(s, "(") > strings.Count(s, ")") {
+		if idx := strings.LastIndex(s, "("); idx > 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+	}
+	return s
+}
+
 func shortCardClusterOrTitle(title string) string {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return ""
 	}
 	lower := strings.ToLower(title)
+	if !strings.HasPrefix(lower, "fleet-wide") {
+		if m := bridgeClusterNameRe.FindStringSubmatch(lower); len(m) >= 2 {
+			return m[1]
+		}
+	}
 	for _, p := range []string{
 		"live health check for ",
 		"live health check: ",
@@ -1547,17 +1617,17 @@ func shortCardClusterOrTitle(title string) string {
 		if strings.HasPrefix(lower, p) {
 			trimmed := strings.TrimSpace(title[len(p):])
 			if trimmed != "" {
-				return capRunes(trimmed, 48)
+				return trimUnclosedParen(capRunes(trimmed, 48))
 			}
 		}
 	}
 	if idx := strings.LastIndex(title, ": "); idx >= 0 && idx+2 < len(title) {
 		trimmed := strings.TrimSpace(title[idx+2:])
 		if trimmed != "" {
-			return capRunes(trimmed, 48)
+			return trimUnclosedParen(capRunes(trimmed, 48))
 		}
 	}
-	return capRunes(title, 48)
+	return trimUnclosedParen(capRunes(title, 48))
 }
 
 func describePlannedToolDetailed(toolName string, parsedArgs map[string]any) string {
