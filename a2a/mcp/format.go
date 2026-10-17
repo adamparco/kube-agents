@@ -1105,10 +1105,105 @@ func summarizeOutcomeKanbanState(outcome *TurnOutcome) (cards []KanbanCardSummar
 	return cards, doneCount, runningCount, totalCount, latestNote
 }
 
+func extractWorkerCluster(act ActivityItem) string {
+	if strings.HasPrefix(act.Worker, "card:") {
+		if lIdx := strings.IndexByte(act.Worker, '('); lIdx >= 0 {
+			if rIdx := strings.LastIndexByte(act.Worker, ')'); rIdx > lIdx+1 {
+				return strings.TrimSpace(act.Worker[lIdx+1 : rIdx])
+			}
+		}
+	}
+	return extractClusterFromText(act.Input)
+}
+
+func shortActivityPath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if idx := strings.Index(raw, "/skills/"); idx >= 0 {
+		return "skill " + truncateText(strings.TrimPrefix(raw[idx+len("/skills/"):], "/"), 48)
+	}
+	parts := strings.Split(strings.Trim(raw, "/"), "/")
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	return truncateText(strings.Join(parts, "/"), 48)
+}
+
+func qualifyWithCluster(base, prep, cluster string) string {
+	if cluster == "" || strings.Contains(strings.ToLower(base), strings.ToLower(cluster)) {
+		return base
+	}
+	return fmt.Sprintf("%s %s %s", base, prep, cluster)
+}
+
 func describeActivityWaitStep(act ActivityItem, activeAgent string) string {
+	cluster := extractWorkerCluster(act)
+	args := parseActivityArgMap(act.Input)
+	toolName := act.Tool
+	if toolName == "tool_call" {
+		names := expandActivityToolNames(act)
+		if len(names) > 0 {
+			toolName = names[0]
+		}
+	}
+
+	switch {
+	case toolName == "terminal" || toolName == "kubectl" || toolName == "run_kubectl" || toolName == "bash":
+		cmd := firstNonEmptyArgString(args, "command", "cmd")
+		lowerCmd := strings.ToLower(cmd)
+		switch {
+		case strings.Contains(lowerCmd, "cluster_preflight"):
+			return qualifyWithCluster("Running cluster preflight check", "on", cluster)
+		case strings.Contains(lowerCmd, "/user.md"):
+			return qualifyWithCluster("Reading cluster profile USER.md", "for", cluster)
+		case strings.Contains(lowerCmd, "kubectl top"):
+			return qualifyWithCluster("Checking node and pod resource usage", "on", cluster)
+		case strings.Contains(lowerCmd, "kubectl describe node"):
+			return qualifyWithCluster("Inspecting Kubernetes node conditions", "on", cluster)
+		case strings.Contains(lowerCmd, "kubectl get node"):
+			return qualifyWithCluster("Checking Kubernetes node readiness", "on", cluster)
+		case strings.Contains(lowerCmd, "kubectl get pod") || strings.Contains(lowerCmd, "kubectl describe pod") || strings.Contains(lowerCmd, "kubectl logs"):
+			return qualifyWithCluster("Inspecting Kubernetes pod health", "on", cluster)
+		case strings.Contains(lowerCmd, "kubectl get event"):
+			return qualifyWithCluster("Checking Kubernetes cluster events", "on", cluster)
+		case strings.Contains(lowerCmd, "kubectl get deploy") || strings.Contains(lowerCmd, "kubectl get sts") || strings.Contains(lowerCmd, "kubectl get ds") || strings.Contains(lowerCmd, "kubectl get hpa"):
+			return qualifyWithCluster("Inspecting Kubernetes workloads and autoscalers", "on", cluster)
+		case strings.Contains(lowerCmd, "gcloud monitoring") || strings.Contains(lowerCmd, "gcloud logging"):
+			return qualifyWithCluster("Querying Cloud Monitoring and Logging", "for", cluster)
+		default:
+			return qualifyWithCluster("Running cluster and workspace diagnostics", "on", cluster)
+		}
+	case toolName == "read_file":
+		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
+		if strings.Contains(strings.ToLower(p), "/user.md") {
+			return qualifyWithCluster("Reading cluster profile USER.md", "for", cluster)
+		}
+		if sp := shortActivityPath(p); sp != "" {
+			return qualifyWithCluster("Reading "+sp, "on", cluster)
+		}
+		return qualifyWithCluster("Reading file in the workspace", "on", cluster)
+	case toolName == "mcp__gke__list_node_pools" || toolName == "mcp__gke__get_node_pool":
+		return qualifyWithCluster("Inspecting GKE node pools", "for", cluster)
+	case toolName == "mcp__gke__list_operations":
+		return qualifyWithCluster("Checking recent GKE operations", "for", cluster)
+	case toolName == "mcp__gke__get_cluster":
+		return qualifyWithCluster("Inspecting GKE cluster configuration", "for", cluster)
+	case strings.HasPrefix(toolName, "mcp__gke__"):
+		return qualifyWithCluster("Querying GKE cluster state", "for", cluster)
+	case toolName == "kanban_show":
+		return qualifyWithCluster("Starting specialist diagnostics", "on", cluster)
+	case toolName == "kanban_heartbeat":
+		if note := firstNonEmptyArgString(args, "note", "status", "message"); note != "" && !strings.HasPrefix(note, "<string,") {
+			return truncateText(note, 64)
+		}
+		return qualifyWithCluster("Updating specialist progress", "on", cluster)
+	}
+
 	titles := activityCandidateStepTitles(act)
 	if len(titles) > 0 && titles[0] != "" {
-		return strings.TrimSuffix(titles[0], ".")
+		return qualifyWithCluster(strings.TrimSuffix(titles[0], "."), "on", cluster)
 	}
 	return fmt.Sprintf("Waiting for %s to complete active step", activeAgent)
 }
@@ -1251,6 +1346,8 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		nextSummaryHint := currentStep
 		if len(allDetails) > reported {
 			nextSummaryHint = strings.TrimSuffix(allDetails[reported].Title, ".")
+		} else if totalCards > 0 && doneCards < totalCards {
+			nextSummaryHint = fmt.Sprintf("Streaming specialist progress (%d/%d cards done)", doneCards, totalCards)
 		}
 
 		var llm strings.Builder

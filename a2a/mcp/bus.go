@@ -74,10 +74,12 @@ const (
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
 	defaultTurnWaitTimeout       = 150 * time.Second
-	defaultStepStreamWindow      = 60 * time.Second
-	initialStepStreamWindow      = 30 * time.Second
+	defaultStepStreamWindow      = 10 * time.Second
+	initialStepStreamWindow      = 12 * time.Second
 	minStepBatchWait             = 350 * time.Millisecond
 	stepDebounceWait             = 200 * time.Millisecond
+	activityStepBatchWait        = 3500 * time.Millisecond
+	activityStepDebounceWait     = 600 * time.Millisecond
 	pollTickInterval             = 100 * time.Millisecond
 	progressHeartbeatInterval    = 2 * time.Second
 	natsConnectTimeout           = 10 * time.Second
@@ -1335,17 +1337,20 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 
 	startedAt := time.Now()
 	firstSeenAboveBaseline := time.Time{}
+	lastActCount := baseActs
+	lastActChangeAt := time.Time{}
 
 	for {
 		settled := s.IsTaskTreeSettled(primaryID)
 		built := s.BuildTaskOutcome(primaryID, "", "", "", !settled)
 		steps := CollectOutcomeSteps(built)
 		curCount := len(steps)
+		curActs := totalOutcomeActivityCount(built)
 
 		if settled {
 			s.markForegroundStepTask(primaryID, true)
 			s.recordStepProgress(primaryID, baseline, curCount)
-			s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(built))
+			s.recordActProgress(primaryID, baseActs, curActs)
 			return false
 		}
 
@@ -1357,7 +1362,18 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 			if now.Sub(startedAt) >= minStepBatchWait && now.Sub(firstSeenAboveBaseline) >= stepDebounceWait {
 				s.markForegroundStepTask(primaryID, false)
 				s.recordStepProgress(primaryID, baseline, baseline+1)
-				s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(built))
+				s.recordActProgress(primaryID, baseActs, curActs)
+				return true
+			}
+		} else if curActs > baseActs {
+			if curActs != lastActCount {
+				lastActCount = curActs
+				lastActChangeAt = now
+			}
+			if now.Sub(startedAt) >= activityStepBatchWait && !lastActChangeAt.IsZero() && now.Sub(lastActChangeAt) >= activityStepDebounceWait {
+				s.markForegroundStepTask(primaryID, false)
+				s.recordStepProgress(primaryID, baseline, baseline)
+				s.recordActProgress(primaryID, baseActs, curActs)
 				return true
 			}
 		}
