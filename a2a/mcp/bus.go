@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,8 @@ const (
 	cardTaskIDPrefix             = "task-card-"
 	cardParentSkew               = 5 * time.Second
 	cardParentGrace              = 20 * time.Minute
+	maxPersistedStepTasks        = 200
+	stepProgressMaxAge           = 24 * time.Hour
 	ellipsisSuffix               = "..."
 	consoleConvPrefix            = "console:"
 	consoleFrameKindText         = "text"
@@ -313,6 +316,8 @@ type BusSession struct {
 	foregroundTasks   map[string]time.Time
 	prevReportedSteps map[string]int
 	lastReportedSteps map[string]int
+	// stepProgressPath, when set, persists the per-task step cursor across process restarts.
+	stepProgressPath string
 }
 
 // ConnectBusSession dials a deployment's NATS JetStream bus (starting a local port-forward
@@ -423,6 +428,35 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 // Profile returns the DeploymentProfile for this session.
 func (s *BusSession) Profile() DeploymentProfile {
 	return s.profile
+}
+
+// EnableStepProgressPersistence loads any previously persisted per-task step cursors from path
+// and keeps the file updated, so a restarted MCP server resumes mid-stream tasks at the step the
+// user last saw instead of re-streaming them from step 1.
+func (s *BusSession) EnableStepProgressPersistence(path string) {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return
+	}
+	prev, last := loadStepProgress(path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stepProgressPath = path
+	if s.prevReportedSteps == nil {
+		s.prevReportedSteps = make(map[string]int)
+	}
+	if s.lastReportedSteps == nil {
+		s.lastReportedSteps = make(map[string]int)
+	}
+	for id, v := range prev {
+		if _, seen := s.prevReportedSteps[id]; !seen {
+			s.prevReportedSteps[id] = v
+		}
+	}
+	for id, v := range last {
+		if _, seen := s.lastReportedSteps[id]; !seen {
+			s.lastReportedSteps[id] = v
+		}
+	}
 }
 
 // Close disconnects NATS connections and tears down any port-forward tunnel.
@@ -551,6 +585,12 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 	}
 	if env.TS.After(rec.UpdatedAt) {
 		rec.UpdatedAt = env.TS
+	}
+	// Live delivery can race the stream bootstrap: a task first seen through a live envelope gets
+	// its true start once the earlier history arrives, so elapsed time is measured from the
+	// submission rather than from the moment this process (re)connected.
+	if !env.TS.IsZero() && (rec.CreatedAt.IsZero() || env.TS.Before(rec.CreatedAt)) {
+		rec.CreatedAt = env.TS
 	}
 	rec.EnvelopeCount++
 
@@ -1288,7 +1328,6 @@ func (s *BusSession) resetStepProgress(taskID string) {
 
 func (s *BusSession) recordStepProgress(taskID string, prev int, reported int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.prevReportedSteps == nil {
 		s.prevReportedSteps = make(map[string]int)
 	}
@@ -1297,6 +1336,72 @@ func (s *BusSession) recordStepProgress(taskID string, prev int, reported int) {
 	}
 	s.prevReportedSteps[taskID] = prev
 	s.lastReportedSteps[taskID] = reported
+	path := s.stepProgressPath
+	var snapshot map[string][2]int
+	if path != "" {
+		snapshot = make(map[string][2]int, len(s.lastReportedSteps))
+		for id, rep := range s.lastReportedSteps {
+			snapshot[id] = [2]int{s.prevReportedSteps[id], rep}
+		}
+	}
+	s.mu.Unlock()
+	if path != "" {
+		saveStepProgress(path, snapshot)
+	}
+}
+
+// stepProgressFile is the on-disk form of the per-task step cursor. It survives an MCP server
+// restart (Jetski relaunches the process on the next tool call after a crash or an upgrade) so a
+// task that was mid-stream resumes at its last reported step instead of re-streaming every step
+// as duplicate rows.
+type stepProgressFile struct {
+	UpdatedAt time.Time         `json:"updatedAt"`
+	Tasks     map[string][2]int `json:"tasks"` // taskID -> [prevReported, reported]
+}
+
+func saveStepProgress(path string, snapshot map[string][2]int) {
+	if len(snapshot) > maxPersistedStepTasks {
+		// Keep the file bounded; the oldest entries are the least likely to be polled again.
+		type kv struct {
+			id  string
+			rep int
+		}
+		var all []kv
+		for id, v := range snapshot {
+			all = append(all, kv{id, v[1]})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+		for len(snapshot) > maxPersistedStepTasks && len(all) > 0 {
+			delete(snapshot, all[0].id)
+			all = all[1:]
+		}
+	}
+	data, err := json.Marshal(stepProgressFile{UpdatedAt: time.Now().UTC(), Tasks: snapshot})
+	if err != nil {
+		return
+	}
+	_ = writeFileAtomic(path, data)
+}
+
+func loadStepProgress(path string) (prev map[string]int, last map[string]int) {
+	prev = make(map[string]int)
+	last = make(map[string]int)
+	if path == "" {
+		return prev, last
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return prev, last
+	}
+	var f stepProgressFile
+	if json.Unmarshal(raw, &f) != nil || time.Since(f.UpdatedAt) > stepProgressMaxAge {
+		return prev, last
+	}
+	for id, v := range f.Tasks {
+		prev[id] = v[0]
+		last[id] = v[1]
+	}
+	return prev, last
 }
 
 func (s *BusSession) sendControlCommand(ctx context.Context, token string, cmdText string) ([]ConsoleOutFrame, error) {

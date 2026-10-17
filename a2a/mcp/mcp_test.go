@@ -1642,3 +1642,41 @@ func TestConcurrentJetskiConversationsGetIsolatedConsoleConversations(t *testing
 		t.Fatalf("old binding on %q should have been released, still %q", a1.Alias, got)
 	}
 }
+
+
+// TestStepCursorSurvivesSessionRestart reproduces soak round 4 (T13): Jetski relaunches the MCP
+// server after a crash/upgrade and the fresh process re-streamed all 17 already-shown steps as
+// duplicate rows ("1 step recorded" right after "17 steps recorded") because the cursor lived
+// only in memory. It also pins CreatedAt back-dating when live delivery races the bootstrap.
+func TestStepCursorSurvivesSessionRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "step-progress.json")
+	s1 := &BusSession{tasks: make(map[string]*TaskRecord), seenEnvelopes: make(map[string]bool)}
+	s1.EnableStepProgressPersistence(path)
+	s1.recordStepProgress("task-x", 16, 17)
+	s1.recordStepProgress("task-y", 0, 3)
+
+	s2 := &BusSession{tasks: make(map[string]*TaskRecord), seenEnvelopes: make(map[string]bool)}
+	s2.EnableStepProgressPersistence(path)
+	if got := s2.getReportedStepCount("task-x"); got != 17 {
+		t.Fatalf("cursor for task-x not restored: got %d want 17", got)
+	}
+	if prev, rep := s2.getStepProgress("task-y"); prev != 0 || rep != 3 {
+		t.Fatalf("cursor for task-y not restored: got %d/%d", prev, rep)
+	}
+
+	// Live envelope first (TS now), then the earlier history arrives via bootstrap.
+	now := time.Now().UTC()
+	s2.ingestTaskEnvelope("a2a.tasks.platform.task-late.out", mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "late-2", TS: now, TaskID: "task-late", ContextID: "ctx",
+		Kind:    lib.KindStatusUpdate,
+		Payload: mustJSON(lib.StatusUpdate{TaskID: "task-late", Status: lib.TaskStatus{State: lib.StateWorking}}),
+	}), true)
+	s2.ingestTaskEnvelope("a2a.tasks.platform.task-late.in", mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "late-1", TS: now.Add(-3 * time.Minute), TaskID: "task-late", ContextID: "ctx",
+		Kind:    lib.KindMessage,
+		Payload: mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "hi"}}}),
+	}), false)
+	if got := s2.GetTask("task-late").CreatedAt; !got.Equal(now.Add(-3 * time.Minute)) {
+		t.Fatalf("CreatedAt should be back-dated to the submission, got %v", got)
+	}
+}

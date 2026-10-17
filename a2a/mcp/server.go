@@ -1084,6 +1084,9 @@ func (s *Server) connectSession(ctx context.Context, prof DeploymentProfile) (*B
 	if err != nil {
 		return nil, err
 	}
+	if s.store != nil {
+		newSess.EnableStepProgressPersistence(s.store.StepProgressPath())
+	}
 	s.mu.Lock()
 	oldSess := s.session
 	s.session = newSess

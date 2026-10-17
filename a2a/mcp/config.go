@@ -20,6 +20,7 @@ const (
 	configDirRelPath        = ".config/kube-agents"
 	configFileName          = "mcp-config.json"
 	pendingEventsFileName   = "pending-events.json"
+	stepProgressFileName    = "step-progress.json"
 	activeConvFileName      = "active_conversation.json"
 	prCacheDirRelPath       = ".cache/kube-agents/prs"
 	dirPermMode             = 0o700
@@ -251,6 +252,11 @@ func (s *ConfigStore) Path() string {
 // EventsPath returns the filesystem path of the pending push events file.
 func (s *ConfigStore) EventsPath() string {
 	return s.eventsPath
+}
+
+// StepProgressPath returns the filesystem path of the persisted per-task step cursor file.
+func (s *ConfigStore) StepProgressPath() string {
+	return filepath.Join(filepath.Dir(s.eventsPath), stepProgressFileName)
 }
 
 // Snapshot returns a deep copy of the current configuration.
