@@ -176,6 +176,7 @@ func (s *ConfigStore) loadLocked() error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading config %s: %w", s.path, err)
 	}
+	dirty := errors.Is(err, os.ErrNotExist) || len(raw) == 0
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &s.cfg); err != nil {
 			return fmt.Errorf("parsing config %s: %w", s.path, err)
@@ -198,10 +199,12 @@ func (s *ConfigStore) loadLocked() error {
 			LastUsedAt:  now,
 		}
 		s.cfg.ActiveConversation = defaultConvAlias
+		dirty = true
 	}
 	if s.cfg.ActiveConversation == "" {
 		for alias := range s.cfg.Conversations {
 			s.cfg.ActiveConversation = alias
+			dirty = true
 			break
 		}
 	}
@@ -211,10 +214,15 @@ func (s *ConfigStore) loadLocked() error {
 		} else {
 			s.cfg.Push.AgentAPIPath = defaultAgentAPIPath
 		}
+		dirty = true
 	}
 	if envConv := strings.TrimSpace(os.Getenv(envJetskiConversationID)); envConv != "" && s.cfg.Push.JetskiConversationID == "" {
 		s.cfg.Push.JetskiConversationID = envConv
 		s.cfg.Push.Enabled = true
+		dirty = true
+	}
+	if !dirty {
+		return nil
 	}
 	return s.saveLocked()
 }
@@ -232,11 +240,30 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(dir, dirPermMode); err != nil {
 		return err
 	}
-	tmp := path + tempFileSuffix
-	if err := os.WriteFile(tmp, data, filePermMode); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*"+tempFileSuffix)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(filePermMode); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func mintConversationToken() string {
