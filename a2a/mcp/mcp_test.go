@@ -1569,3 +1569,64 @@ func TestKanbanCardTasksLinkToForegroundTaskAndStreamAsSteps(t *testing.T) {
 		t.Errorf("bounded piggyback not bounded (len=%d, events=%d):\n%s", len(md), strings.Count(md, "task_completed"), md)
 	}
 }
+
+// TestConcurrentJetskiConversationsGetIsolatedConsoleConversations reproduces soak round 1:
+// Jetski conversation A ("connect", then "when was the last fleet-audit run?") and Jetski
+// conversation B (`conversation: "soak-r1b"`, long fleet health check) share one MCP server
+// process. B's explicit alias became the global active conversation, so A's next send_message
+// (no `conversation` arg) landed on B's console token, was absorbed as a steer by B's in-flight
+// task, and A streamed B's task for 12 minutes.
+func TestConcurrentJetskiConversationsGetIsolatedConsoleConversations(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{store: store}
+	ctxA := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "aaaaaaaa-1111-4111-8111-111111111111"})
+	ctxB := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "bbbbbbbb-2222-4222-8222-222222222222"})
+
+	// A connects: binds the default conversation.
+	a1 := s.conversationFor(ctxA, "", "")
+	if a1.Alias != defaultConvAlias {
+		t.Fatalf("A should bind the default conversation, got %q", a1.Alias)
+	}
+	// B explicitly uses its own alias (becomes the global active conversation).
+	b1 := s.conversationFor(ctxB, "soak-r1b", "")
+	if b1.Alias != "soak-r1b" || store.ActiveConversation().Alias != "soak-r1b" {
+		t.Fatalf("B should use soak-r1b and make it active, got %q / active %q", b1.Alias, store.ActiveConversation().Alias)
+	}
+	// A's next message with no conversation arg must stay on A's conversation, not B's.
+	a2 := s.conversationFor(ctxA, "", "")
+	if a2.Alias != a1.Alias || a2.Token != a1.Token {
+		t.Fatalf("A hijacked onto %q (token %s); want %q (token %s)", a2.Alias, a2.Token, a1.Alias, a1.Token)
+	}
+	// And B keeps its own.
+	b2 := s.conversationFor(ctxB, "", "")
+	if b2.Alias != "soak-r1b" {
+		t.Fatalf("B lost its conversation: %q", b2.Alias)
+	}
+	// A third Jetski conversation arriving while the active conversation is bound elsewhere gets a
+	// fresh auto alias rather than stealing.
+	ctxC := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "cccccccc-3333-4333-8333-333333333333"})
+	c1 := s.conversationFor(ctxC, "", "")
+	if c1.Alias != jetskiAliasPrefix+"cccccccc" || c1.Token == a1.Token || c1.Token == b1.Token {
+		t.Fatalf("C should get an isolated auto-bound conversation, got %q (token %s)", c1.Alias, c1.Token)
+	}
+	// Push routing for events on A's console token resolves back to Jetski conversation A.
+	if got := store.ResolveJetskiConversationIDForEvent("console:" + a1.Token); got != "aaaaaaaa-1111-4111-8111-111111111111" {
+		t.Fatalf("event routing for A's token resolved to %q", got)
+	}
+	// Non-Jetski callers (no _meta) still use the active conversation.
+	plain := s.conversationFor(context.Background(), "", "")
+	if plain.Alias != store.ActiveConversation().Alias {
+		t.Fatalf("plain caller should get the active conversation, got %q", plain.Alias)
+	}
+	// Switching A explicitly moves A's binding (one console conversation per Jetski conversation).
+	s.conversationFor(ctxA, "fleet-health", "")
+	if got := s.conversationFor(ctxA, "", "").Alias; got != "fleet-health" {
+		t.Fatalf("after explicit switch A should resolve to fleet-health, got %q", got)
+	}
+	if got := store.Snapshot().Conversations[defaultConvAlias].JetskiConversationID; got != "" {
+		t.Fatalf("old binding on %q should have been released, still %q", a1.Alias, got)
+	}
+}

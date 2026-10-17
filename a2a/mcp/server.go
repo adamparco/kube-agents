@@ -546,10 +546,7 @@ func (s *Server) handleConnectDeployment(ctx context.Context, rawArgs json.RawMe
 
 	rep := sess.StatusReport(ctx)
 	snap := s.store.Snapshot()
-	conv := s.store.ActiveConversation()
-	if jetskiID := firstNonEmptyStr(args.JetskiConversationID, callMetaFromContext(ctx).ConversationID); jetskiID != "" {
-		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
-	}
+	conv := s.conversationFor(ctx, "", args.JetskiConversationID)
 	return FormatBusStatusMarkdown(rep, conv, snap.Push, s.store.ResolveJetskiConversationID()), nil
 }
 
@@ -560,10 +557,7 @@ func (s *Server) handleConnectionStatus(ctx context.Context) (string, error) {
 	}
 	rep := sess.StatusReport(ctx)
 	snap := s.store.Snapshot()
-	conv := s.store.ActiveConversation()
-	if jetskiID := callMetaFromContext(ctx).ConversationID; jetskiID != "" {
-		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
-	}
+	conv := s.conversationFor(ctx, "", "")
 	return FormatBusStatusMarkdown(rep, conv, snap.Push, s.store.ResolveJetskiConversationID()), nil
 }
 
@@ -591,18 +585,7 @@ func (s *Server) handleSendMessage(ctx context.Context, rawArgs json.RawMessage)
 		return "", "", "", err
 	}
 	var conv ConversationEntry
-	if strings.TrimSpace(args.Conversation) != "" {
-		conv, err = s.store.EnsureConversation(args.Conversation, false, "")
-		if err != nil {
-			return "", "", "", err
-		}
-	} else {
-		conv = s.store.ActiveConversation()
-	}
-	if jetskiID := firstNonEmptyStr(args.JetskiConversationID, callMetaFromContext(ctx).ConversationID); jetskiID != "" {
-		s.store.BindConversationJetskiID(conv.Alias, jetskiID)
-		conv, _ = s.store.EnsureConversation(conv.Alias, false, "")
-	}
+	conv = s.conversationFor(ctx, args.Conversation, args.JetskiConversationID)
 
 	waitTimeout := defaultTurnWaitTimeout
 	if args.WaitTimeoutSeconds > 0 {
@@ -730,7 +713,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 				return "", err
 			}
 		} else {
-			conv = s.store.ActiveConversation()
+			conv = s.conversationFor(ctx, "", "")
 		}
 		cmd := cmdSessionOn
 		switch action {
@@ -753,7 +736,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		if err != nil {
 			return "", err
 		}
-		conv := s.store.ActiveConversation()
+		conv := s.conversationFor(ctx, "", "")
 		if strings.TrimSpace(targetAlias) != "" {
 			conv, _ = s.store.EnsureConversation(targetAlias, false, "")
 		}
@@ -842,7 +825,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 			return "", "", "", fmt.Errorf("task %q not found on TASKS stream", args.TaskID)
 		}
 		settled := sess.IsTaskTreeSettled(taskID)
-		conv := s.resolveConvArg(args.Conversation)
+		conv := s.conversationFor(ctx, args.Conversation, "")
 		outcome := sess.BuildTaskOutcome(taskID, conv.Alias, conv.Token, rec.PromptText, !settled)
 		title, customMD, llmResult := FormatTurnCustomToolEnvelope(outcome, debug)
 		if !streamSteps && !isJetskiCall {
@@ -892,13 +875,13 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		return sb.String(), "", "", nil
 
 	case actionStatus:
-		conv := s.resolveConvArg(args.Conversation)
+		conv := s.conversationFor(ctx, args.Conversation, "")
 		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStatus, modeAuto, controlNoticeWait)
 		title, customMD, _ := FormatTurnCustomToolEnvelope(outcome, debug)
 		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
 
 	case actionStop, actionCancelAlias:
-		conv := s.resolveConvArg(args.Conversation)
+		conv := s.conversationFor(ctx, args.Conversation, "")
 		outcome, err := sess.SendTurn(turnCtx, s.store, conv, cmdStop, modeAuto, controlNoticeWait)
 		title, customMD, _ := FormatTurnCustomToolEnvelope(outcome, debug)
 		return FormatTurnOutcomeMarkdownWithOptions(outcome, debug), title, customMD, err
@@ -907,7 +890,7 @@ func (s *Server) handleTaskControl(ctx context.Context, rawArgs json.RawMessage)
 		if strings.TrimSpace(args.Message) == "" {
 			return "", "", "", errors.New("task_control action 'steer' requires message")
 		}
-		conv := s.resolveConvArg(args.Conversation)
+		conv := s.conversationFor(ctx, args.Conversation, "")
 		waitTimeout := defaultTurnWaitTimeout
 		if args.WaitTimeoutSeconds > 0 {
 			waitTimeout = time.Duration(args.WaitTimeoutSeconds) * time.Second
@@ -960,7 +943,7 @@ func (s *Server) handleReadTopics(ctx context.Context, rawArgs json.RawMessage) 
 	case actionCards:
 		rep := sess.StatusReport(ctx)
 		snap := s.store.Snapshot()
-		return FormatBusStatusMarkdown(rep, s.store.ActiveConversation(), snap.Push, s.store.ResolveJetskiConversationID()), nil
+		return FormatBusStatusMarkdown(rep, s.conversationFor(ctx, "", ""), snap.Push, s.store.ResolveJetskiConversationID()), nil
 	default:
 		return "", fmt.Errorf("unknown read_topics action %q (expected list, read, cards)", action)
 	}
@@ -1041,10 +1024,26 @@ func (s *Server) handlePollEvents(ctx context.Context, rawArgs json.RawMessage) 
 }
 
 func (s *Server) resolveConvArg(convArg string) ConversationEntry {
+	return s.conversationFor(context.Background(), convArg, "")
+}
+
+// conversationFor resolves the console conversation a tool call should act on: an explicit
+// `conversation` argument wins (and is bound to the calling Jetski conversation); otherwise the
+// conversation bound to the calling Jetski conversation (from `_meta` or the explicit
+// jetski_conversation_id argument) is used, minting one if needed; otherwise the active one.
+func (s *Server) conversationFor(ctx context.Context, convArg string, explicitJetskiID string) ConversationEntry {
+	jetskiID := firstNonEmptyStr(explicitJetskiID, callMetaFromContext(ctx).ConversationID)
 	if strings.TrimSpace(convArg) != "" {
 		if c, err := s.store.EnsureConversation(convArg, false, ""); err == nil {
+			if jetskiID != "" {
+				s.store.BindConversationJetskiID(c.Alias, jetskiID)
+				c.JetskiConversationID = jetskiID
+			}
 			return c
 		}
+	}
+	if jetskiID != "" {
+		return s.store.ConversationForJetski(jetskiID)
 	}
 	return s.store.ActiveConversation()
 }

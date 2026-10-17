@@ -35,6 +35,8 @@ const (
 	maxConsoleTokenLen      = 64
 	tempFileSuffix          = ".tmp"
 	defaultConvDescription  = "Default Jetski conversation"
+	jetskiAliasPrefix       = "jetski-"
+	jetskiAliasIDChars      = 8
 )
 
 var (
@@ -540,10 +542,68 @@ func (s *ConfigStore) BindConversationJetskiID(aliasOrToken, jetskiConvID string
 		if alias == target || entry.Token == target {
 			entry.JetskiConversationID = trimmedID
 			s.cfg.Conversations[alias] = entry
-			break
+		} else if entry.JetskiConversationID == trimmedID {
+			// A Jetski conversation maps to exactly one console conversation at a time: switching
+			// (manage_session new/switch, or an explicit `conversation` arg) moves the binding.
+			entry.JetskiConversationID = ""
+			s.cfg.Conversations[alias] = entry
 		}
 	}
 	_ = s.saveLocked()
+}
+
+// ConversationForJetski returns the console conversation that belongs to a Jetski conversation,
+// so concurrent Jetski conversations (tabs, subagents) sharing this one MCP server process never
+// talk over each other on one console token:
+//  1. a conversation already bound to jetskiConvID is reused;
+//  2. otherwise the active conversation is bound to it if that conversation is unbound;
+//  3. otherwise (the active conversation belongs to another Jetski conversation) a fresh
+//     conversation aliased "jetski-<first 8 chars>" is minted and bound.
+//
+// The returned conversation also becomes the active one, which is what non-Jetski callers (plain
+// stdio clients without _meta) keep using.
+func (s *ConfigStore) ConversationForJetski(jetskiConvID string) ConversationEntry {
+	id := strings.TrimSpace(jetskiConvID)
+	if id == "" {
+		return s.ActiveConversation()
+	}
+	s.mu.Lock()
+	now := time.Now().UTC()
+	s.cfg.Push.JetskiConversationID = id
+	s.cfg.Push.Enabled = true
+	s.addKnownJetskiConvLocked(id)
+	for alias, entry := range s.cfg.Conversations {
+		if entry.JetskiConversationID == id {
+			entry.LastUsedAt = now
+			s.cfg.Conversations[alias] = entry
+			s.cfg.ActiveConversation = alias
+			_ = s.saveLocked()
+			s.mu.Unlock()
+			return entry
+		}
+	}
+	if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && active.JetskiConversationID == "" {
+		active.JetskiConversationID = id
+		active.LastUsedAt = now
+		s.cfg.Conversations[s.cfg.ActiveConversation] = active
+		_ = s.saveLocked()
+		s.mu.Unlock()
+		return active
+	}
+	s.mu.Unlock()
+
+	short := id
+	if len(short) > jetskiAliasIDChars {
+		short = short[:jetskiAliasIDChars]
+	}
+	alias := jetskiAliasPrefix + short
+	entry, err := s.EnsureConversation(alias, false, "Auto-bound to Jetski conversation "+id)
+	if err != nil {
+		return s.ActiveConversation()
+	}
+	s.BindConversationJetskiID(alias, id)
+	entry.JetskiConversationID = id
+	return entry
 }
 
 // IsKnownJetskiConversation returns true if jetskiConvID has been registered via an MCP tool call or conversation binding.
