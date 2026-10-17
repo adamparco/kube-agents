@@ -648,11 +648,12 @@ conn.row_factory = sqlite3.Row
 cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
 sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id"
 err_col = "last_failure_error" if "last_failure_error" in cols else "''"
+assignee_col = "assignee" if "assignee" in cols else "''"
 settled = ("done", "archived", "completed", "blocked", "failed", "gave_up", "canceled", "cancelled")
 settled_sql = ",".join(repr(s) for s in settled)
 if session_id == "*":
     rows = conn.execute(
-        f"SELECT id, title, status, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
+        f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
         f"FROM tasks WHERE {sess_col} LIKE 'a2a-%' AND (created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})) "
         f"ORDER BY created_at ASC, id ASC",
         (since_ts,),
@@ -664,7 +665,7 @@ else:
         conds.append(f"id IN ({','.join('?' for _ in tracked)})")
         params.extend(tracked)
     rows = conn.execute(
-        f"SELECT id, title, status, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
+        f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
         f"FROM tasks WHERE {sess_col} = ? AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC",
         params,
     ).fetchall()
@@ -672,8 +673,11 @@ out = []
 for r in rows:
     item = dict(r)
     try:
+        run_cols = {c[1] for c in conn.execute("PRAGMA table_info(task_runs)")}
+        ws_col = "session_id" if "session_id" in run_cols else ("worker_session_id" if "worker_session_id" in run_cols else "''")
+        verd_col = "verdict" if "verdict" in run_cols else "''"
         run_row = conn.execute(
-            "SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error "
+            f"SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error, COALESCE({ws_col}, '') AS worker_session_id, COALESCE({verd_col}, '') AS verdict "
             "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (r["id"],),
         ).fetchone()
@@ -682,6 +686,10 @@ for r in rows:
                 item["result"] = run_row["summary"]
             if not item["err"] and run_row["error"]:
                 item["err"] = run_row["error"]
+            if run_row["worker_session_id"]:
+                item["worker_session_id"] = run_row["worker_session_id"]
+            if run_row["verdict"]:
+                item["verdict"] = run_row["verdict"]
     except Exception:
         pass
     try:
@@ -698,13 +706,16 @@ print(json.dumps(out))
 `
 
 type kanbanCardRow struct {
-	ID           string `json:"id"`
-	Title        string `json:"title"`
-	Status       string `json:"status"`
-	SessionID    string `json:"session_id"`
-	Result       string `json:"result"`
-	Err          string `json:"err"`
-	BlockPayload string `json:"block_payload"`
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	Status          string `json:"status"`
+	Assignee        string `json:"assignee"`
+	SessionID       string `json:"session_id"`
+	WorkerSessionID string `json:"worker_session_id"`
+	Verdict         string `json:"verdict"`
+	Result          string `json:"result"`
+	Err             string `json:"err"`
+	BlockPayload    string `json:"block_payload"`
 }
 
 type consoleSessionMeta struct {
@@ -836,6 +847,30 @@ func isKanbanStatusSettled(status string) bool {
 	}
 }
 
+func inferKanbanCardVerdict(c kanbanCardRow) string {
+	if v := strings.TrimSpace(c.Verdict); v != "" {
+		return strings.ToLower(v)
+	}
+	st := strings.ToLower(strings.TrimSpace(c.Status))
+	switch st {
+	case "blocked", "failed", "gave_up", "canceled", "cancelled":
+		return st
+	}
+	lowerOut := strings.ToLower(formatKanbanCardOutput(c))
+	switch {
+	case strings.Contains(lowerOut, "unhealthy") || strings.Contains(lowerOut, "critical"):
+		return "unhealthy"
+	case strings.Contains(lowerOut, "degraded") || strings.Contains(lowerOut, "crashloopbackoff") || strings.Contains(lowerOut, "imagepullbackoff") || strings.Contains(lowerOut, "oomkilled"):
+		return "degraded"
+	case strings.Contains(lowerOut, "healthy") || strings.Contains(lowerOut, "all nodes ready"):
+		return "healthy"
+	}
+	if st != "" {
+		return st
+	}
+	return "completed"
+}
+
 func formatKanbanCardOutput(c kanbanCardRow) string {
 	if res := strings.TrimSpace(c.Result); res != "" {
 		return res
@@ -903,6 +938,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 
 	var trackedIDs []string
 	trackedSet := make(map[string]bool)
+	reportedSettled := make(map[string]bool)
 	emptyPolls := 0
 	ticker := time.NewTicker(kanbanPollInterval)
 	defer ticker.Stop()
@@ -930,13 +966,45 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					break
 				}
 			} else {
-				allSettled := true
+				settledCount := 0
 				for _, c := range relevant {
-					if !isKanbanStatusSettled(c.Status) {
-						allSettled = false
-						break
+					act.SyncKanbanCardDetails(c.ID, c.Title, c.Assignee, c.WorkerSessionID)
+					if isKanbanStatusSettled(c.Status) {
+						settledCount++
 					}
 				}
+				totalCount := len(relevant)
+				for _, c := range relevant {
+					if !isKanbanStatusSettled(c.Status) || reportedSettled[c.ID] {
+						continue
+					}
+					reportedSettled[c.ID] = true
+					shortTitle := shortCardClusterOrTitle(c.Title)
+					if shortTitle == "" {
+						shortTitle = c.ID
+					}
+					verdict := inferKanbanCardVerdict(c)
+					summary := oneLinePreview(scrubInlineSecrets(formatKanbanCardOutput(c)), 220)
+					stepTitle := fmt.Sprintf("Specialist check completed: %s (%s — %d/%d cards done).", shortTitle, verdict, settledCount, totalCount)
+					thinkingText := stepTitle
+					if summary != "" {
+						thinkingText = stepTitle + "\t" + summary
+					}
+					runningCount := totalCount - settledCount
+					progText := fmt.Sprintf("Kanban specialist checks: %d/%d completed (%d running) — latest: %s (%s)", settledCount, totalCount, runningCount, shortTitle, verdict)
+					run.mu.Lock()
+					if run.state == stateRunning {
+						if act.thinkingUnderBudget() {
+							b.publishArtifactPart(run, lib.ArtifactThinking, lib.Part{Kind: "text", Text: thinkingText})
+						}
+						if act.heartbeatUnderBudget() {
+							b.publishProgress(run, progText)
+						}
+					}
+					run.mu.Unlock()
+				}
+
+				allSettled := settledCount == totalCount
 				if allSettled {
 					var parts []string
 					for _, c := range relevant {
@@ -946,6 +1014,12 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 						}
 					}
 					if len(parts) > 0 {
+						synthStep := fmt.Sprintf("Synthesizing findings across %d specialist card(s).\tCombining specialist reports into unified fleet response.", len(relevant))
+						run.mu.Lock()
+						if run.state == stateRunning && act.thinkingUnderBudget() {
+							b.publishArtifactPart(run, lib.ArtifactThinking, lib.Part{Kind: "text", Text: synthStep})
+						}
+						run.mu.Unlock()
 						ackText = b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, ackText, relevant, parts)
 					}
 					break

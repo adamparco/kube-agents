@@ -166,13 +166,18 @@ type ConsoleOutFrame struct {
 
 // ActivityItem represents a single tool invocation streamed via an activity artifact.
 type ActivityItem struct {
-	Tool       string `json:"tool"`
-	Input      string `json:"input,omitempty"`
-	CallID     string `json:"call_id,omitempty"`
-	Status     string `json:"status,omitempty"`
-	ErrorType  string `json:"error_type,omitempty"`
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	At         string `json:"at,omitempty"`
+	Index         int    `json:"index,omitempty"`
+	Tool          string `json:"tool"`
+	Input         string `json:"input,omitempty"`
+	CallID        string `json:"call_id,omitempty"`
+	Status        string `json:"status,omitempty"`
+	ErrorType     string `json:"error_type,omitempty"`
+	ErrorMessage  string `json:"error_message,omitempty"`
+	ResultPreview string `json:"result_preview,omitempty"`
+	SessionID     string `json:"session_id,omitempty"`
+	Worker        string `json:"worker,omitempty"`
+	DurationMs    int64  `json:"duration_ms,omitempty"`
+	At            string `json:"at,omitempty"`
 }
 
 // DelegateItem represents a delegation request from a session worker to another agent.
@@ -194,25 +199,27 @@ type TaskRecord struct {
 	// CardParentTaskID links a Kanban specialist card task (task-card-*) spawned by the platform
 	// agent to the foreground task that was running in the same conversation when the card was
 	// created, so card progress renders as steps of that task instead of as unrelated push events.
-	CardParentTaskID  string           `json:"cardParentTaskId,omitempty"`
-	State             lib.TaskState    `json:"state"`
-	Terminal          bool             `json:"terminal"`
-	StatusText        string           `json:"statusText,omitempty"`
-	PromptText        string           `json:"promptText,omitempty"`
-	SteerTurns        []string         `json:"steerTurns,omitempty"`
-	IntermediateTurns []string         `json:"intermediateTurns,omitempty"`
-	Thinking          string           `json:"thinking,omitempty"`
-	Activities        []ActivityItem   `json:"activities,omitempty"`
-	ProgressText      string           `json:"progressText,omitempty"`
-	ProgressChat      *chatmsg.Message `json:"progressChat,omitempty"`
-	Delegates         []DelegateItem   `json:"delegates,omitempty"`
-	Notices           []string         `json:"notices,omitempty"`
-	PRLinks           []string         `json:"prLinks,omitempty"`
-	ResultText        string           `json:"resultText,omitempty"`
-	ResultChat        *chatmsg.Message `json:"resultChat,omitempty"`
-	CreatedAt         time.Time        `json:"createdAt"`
-	UpdatedAt         time.Time        `json:"updatedAt"`
-	EnvelopeCount     int              `json:"envelopeCount"`
+	CardParentTaskID     string           `json:"cardParentTaskId,omitempty"`
+	State                lib.TaskState    `json:"state"`
+	Terminal             bool             `json:"terminal"`
+	StatusText           string           `json:"statusText,omitempty"`
+	PromptText           string           `json:"promptText,omitempty"`
+	SteerTurns           []string         `json:"steerTurns,omitempty"`
+	SteerTimestamps      []time.Time      `json:"steerTimestamps,omitempty"`
+	IntermediateTurns    []string         `json:"intermediateTurns,omitempty"`
+	Thinking             string           `json:"thinking,omitempty"`
+	Activities           []ActivityItem   `json:"activities,omitempty"`
+	ProgressText         string           `json:"progressText,omitempty"`
+	ProgressChat         *chatmsg.Message `json:"progressChat,omitempty"`
+	Delegates            []DelegateItem   `json:"delegates,omitempty"`
+	Notices              []string         `json:"notices,omitempty"`
+	PRLinks              []string         `json:"prLinks,omitempty"`
+	ResultText           string           `json:"resultText,omitempty"`
+	ResultChat           *chatmsg.Message `json:"resultChat,omitempty"`
+	CreatedAt            time.Time        `json:"createdAt"`
+	UpdatedAt            time.Time        `json:"updatedAt"`
+	EnvelopeCount        int              `json:"envelopeCount"`
+	EnvelopeCountsByKind map[string]int   `json:"envelopeCountsByKind,omitempty"`
 }
 
 // TopicSnapshot holds the latest envelope and parsed summary/data for a topic subject.
@@ -274,10 +281,12 @@ type TurnOutcome struct {
 	WakeTask          *TaskRecord       `json:"wakeTask,omitempty"`
 	// CardTasks are Kanban specialist card tasks (task-card-*) the platform agent fanned out while
 	// working on PrimaryTask (or its delegated child); their progress is surfaced as steps.
-	CardTasks         []*TaskRecord `json:"cardTasks,omitempty"`
-	TimedOut          bool          `json:"timedOut"`
-	PrevStepCount     int           `json:"prevStepCount,omitempty"`
-	ReportedStepCount int           `json:"reportedStepCount,omitempty"`
+	CardTasks             []*TaskRecord `json:"cardTasks,omitempty"`
+	TimedOut              bool          `json:"timedOut"`
+	PrevStepCount         int           `json:"prevStepCount,omitempty"`
+	ReportedStepCount     int           `json:"reportedStepCount,omitempty"`
+	PrevActivityCount     int           `json:"prevActivityCount,omitempty"`
+	ReportedActivityCount int           `json:"reportedActivityCount,omitempty"`
 }
 
 type authorityWire struct {
@@ -318,6 +327,8 @@ type BusSession struct {
 	foregroundTasks   map[string]time.Time
 	prevReportedSteps map[string]int
 	lastReportedSteps map[string]int
+	prevReportedActs  map[string]int
+	lastReportedActs  map[string]int
 	// stepProgressPath, when set, persists the per-task step cursor across process restarts.
 	stepProgressPath string
 }
@@ -627,6 +638,10 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 		rec.CreatedAt = env.TS
 	}
 	rec.EnvelopeCount++
+	if rec.EnvelopeCountsByKind == nil {
+		rec.EnvelopeCountsByKind = make(map[string]int)
+	}
+	rec.EnvelopeCountsByKind[string(env.Kind)]++
 
 	if len(env.Authority) > 0 {
 		var auth authorityWire
@@ -680,6 +695,7 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 				}
 			} else if text != "" {
 				rec.SteerTurns = append(rec.SteerTurns, text)
+				rec.SteerTimestamps = append(rec.SteerTimestamps, env.TS)
 			}
 		}
 	case lib.KindStatusUpdate:
@@ -739,6 +755,9 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 		var au lib.ArtifactUpdate
 		if json.Unmarshal(env.Payload, &au) == nil {
 			art := au.Artifact
+			if art.Name != "" {
+				rec.EnvelopeCountsByKind["artifact:"+art.Name]++
+			}
 			text := joinMessageText(art.Parts)
 			dataText := joinDataOrTextParts(art.Parts)
 			chatMsg := extractChatMessage(art.Parts)
@@ -1187,14 +1206,17 @@ func (s *BusSession) SendTurnWithOptions(ctx context.Context, store *ConfigStore
 func (s *BusSession) BuildTaskOutcome(primaryID string, convAlias string, convToken string, sentText string, timedOut bool) *TurnOutcome {
 	primary := s.GetTask(primaryID)
 	prevSteps, reportedSteps := s.getStepProgress(primaryID)
+	prevActs, reportedActs := s.getActProgress(primaryID)
 	outcome := &TurnOutcome{
-		ConversationAlias: convAlias,
-		ConversationToken: convToken,
-		SentText:          sentText,
-		PrimaryTask:       primary,
-		TimedOut:          timedOut,
-		PrevStepCount:     prevSteps,
-		ReportedStepCount: reportedSteps,
+		ConversationAlias:     convAlias,
+		ConversationToken:     convToken,
+		SentText:              sentText,
+		PrimaryTask:           primary,
+		TimedOut:              timedOut,
+		PrevStepCount:         prevSteps,
+		ReportedStepCount:     reportedSteps,
+		PrevActivityCount:     prevActs,
+		ReportedActivityCount: reportedActs,
 	}
 	if primary == nil {
 		return outcome
@@ -1213,6 +1235,26 @@ func (s *BusSession) BuildTaskOutcome(primaryID string, convAlias string, convTo
 	}
 	outcome.CardTasks = s.findCardTasks(primaryID, childIDs...)
 	return outcome
+}
+
+func totalOutcomeActivityCount(outcome *TurnOutcome) int {
+	if outcome == nil {
+		return 0
+	}
+	n := 0
+	if outcome.PrimaryTask != nil {
+		n += len(outcome.PrimaryTask.Activities)
+	}
+	for _, c := range outcome.ChildTasks {
+		n += len(c.Activities)
+	}
+	for _, ct := range outcome.CardTasks {
+		n += len(ct.Activities)
+	}
+	if outcome.WakeTask != nil {
+		n += len(outcome.WakeTask.Activities)
+	}
+	return n
 }
 
 // IsTaskTreeSettled returns true if the primary task and any expected delegated child / wake tasks
@@ -1267,13 +1309,16 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 	defer s.watchTask(primaryID, -1)
 
 	baseline := s.getReportedStepCount(primaryID)
+	_, baseActs := s.getActProgress(primaryID)
 	if !streamSteps {
 		timedOut := s.waitForTaskAndDelegations(ctx, primaryID)
 		if !timedOut {
 			s.markForegroundStepTask(primaryID, true)
 		}
-		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", timedOut))
+		built := s.BuildTaskOutcome(primaryID, "", "", "", timedOut)
+		steps := CollectOutcomeSteps(built)
 		s.recordStepProgress(primaryID, baseline, len(steps))
+		s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(built))
 		return timedOut
 	}
 
@@ -1293,12 +1338,14 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 
 	for {
 		settled := s.IsTaskTreeSettled(primaryID)
-		steps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !settled))
+		built := s.BuildTaskOutcome(primaryID, "", "", "", !settled)
+		steps := CollectOutcomeSteps(built)
 		curCount := len(steps)
 
 		if settled {
 			s.markForegroundStepTask(primaryID, true)
 			s.recordStepProgress(primaryID, baseline, curCount)
+			s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(built))
 			return false
 		}
 
@@ -1310,6 +1357,7 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 			if now.Sub(startedAt) >= minStepBatchWait && now.Sub(firstSeenAboveBaseline) >= stepDebounceWait {
 				s.markForegroundStepTask(primaryID, false)
 				s.recordStepProgress(primaryID, baseline, baseline+1)
+				s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(built))
 				return true
 			}
 		}
@@ -1317,10 +1365,12 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 		select {
 		case <-stepCtx.Done():
 			finalSettled := s.IsTaskTreeSettled(primaryID)
-			finalSteps := CollectOutcomeSteps(s.BuildTaskOutcome(primaryID, "", "", "", !finalSettled))
+			finalBuilt := s.BuildTaskOutcome(primaryID, "", "", "", !finalSettled)
+			finalSteps := CollectOutcomeSteps(finalBuilt)
 			if finalSettled {
 				s.markForegroundStepTask(primaryID, true)
 				s.recordStepProgress(primaryID, baseline, len(finalSteps))
+				s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(finalBuilt))
 				return false
 			}
 			s.markForegroundStepTask(primaryID, false)
@@ -1329,6 +1379,7 @@ func (s *BusSession) WaitForTaskStepOrSettlement(ctx context.Context, primaryID 
 				nextCount = baseline + 1
 			}
 			s.recordStepProgress(primaryID, baseline, nextCount)
+			s.recordActProgress(primaryID, baseActs, totalOutcomeActivityCount(finalBuilt))
 			return true
 		case <-ticker.C:
 		}
@@ -1356,8 +1407,34 @@ func (s *BusSession) getStepProgress(taskID string) (prev int, reported int) {
 	return prev, reported
 }
 
+func (s *BusSession) getActProgress(taskID string) (prev int, reported int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.prevReportedActs != nil {
+		prev = s.prevReportedActs[taskID]
+	}
+	if s.lastReportedActs != nil {
+		reported = s.lastReportedActs[taskID]
+	}
+	return prev, reported
+}
+
+func (s *BusSession) recordActProgress(taskID string, prev int, reported int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prevReportedActs == nil {
+		s.prevReportedActs = make(map[string]int)
+	}
+	if s.lastReportedActs == nil {
+		s.lastReportedActs = make(map[string]int)
+	}
+	s.prevReportedActs[taskID] = prev
+	s.lastReportedActs[taskID] = reported
+}
+
 func (s *BusSession) resetStepProgress(taskID string) {
 	s.recordStepProgress(taskID, 0, 0)
+	s.recordActProgress(taskID, 0, 0)
 }
 
 func (s *BusSession) recordStepProgress(taskID string, prev int, reported int) {
@@ -1927,11 +2004,18 @@ func cloneTaskRecord(rec *TaskRecord) *TaskRecord {
 	}
 	cp := *rec
 	cp.SteerTurns = append([]string(nil), rec.SteerTurns...)
+	cp.SteerTimestamps = append([]time.Time(nil), rec.SteerTimestamps...)
 	cp.IntermediateTurns = append([]string(nil), rec.IntermediateTurns...)
 	cp.Activities = append([]ActivityItem(nil), rec.Activities...)
 	cp.Delegates = append([]DelegateItem(nil), rec.Delegates...)
 	cp.Notices = append([]string(nil), rec.Notices...)
 	cp.PRLinks = append([]string(nil), rec.PRLinks...)
+	if rec.EnvelopeCountsByKind != nil {
+		cp.EnvelopeCountsByKind = make(map[string]int, len(rec.EnvelopeCountsByKind))
+		for k, v := range rec.EnvelopeCountsByKind {
+			cp.EnvelopeCountsByKind[k] = v
+		}
+	}
 	return &cp
 }
 
@@ -2002,16 +2086,23 @@ func extractChatMessage(parts []lib.Part) *chatmsg.Message {
 
 func parseActivityItem(raw string) (ActivityItem, bool) {
 	var wire struct {
-		Tool         string          `json:"tool"`
-		Input        json.RawMessage `json:"input"`
-		CallID       string          `json:"callId"`
-		CallIDSnake  string          `json:"call_id"`
-		Status       string          `json:"status"`
-		ErrorType    string          `json:"errorType"`
-		ErrTypeSnake string          `json:"error_type"`
-		DurationMs   int64           `json:"durationMs"`
-		DurMsSnake   int64           `json:"duration_ms"`
-		At           string          `json:"at"`
+		Tool            string          `json:"tool"`
+		Input           json.RawMessage `json:"input"`
+		CallID          string          `json:"callId"`
+		CallIDSnake     string          `json:"call_id"`
+		Status          string          `json:"status"`
+		ErrorType       string          `json:"errorType"`
+		ErrTypeSnake    string          `json:"error_type"`
+		ErrorMessage    string          `json:"errorMessage"`
+		ErrMsgSnake     string          `json:"error_message"`
+		ResultPreview   string          `json:"resultPreview"`
+		ResPreviewSnake string          `json:"result_preview"`
+		SessionID       string          `json:"sessionId"`
+		SessionIDSnake  string          `json:"session_id"`
+		Worker          string          `json:"worker"`
+		DurationMs      int64           `json:"durationMs"`
+		DurMsSnake      int64           `json:"duration_ms"`
+		At              string          `json:"at"`
 	}
 	if err := json.Unmarshal([]byte(raw), &wire); err != nil || wire.Tool == "" {
 		return ActivityItem{}, false
@@ -2036,26 +2127,197 @@ func parseActivityItem(raw string) (ActivityItem, bool) {
 		dur = wire.DurMsSnake
 	}
 	return ActivityItem{
-		Tool:       wire.Tool,
-		Input:      inputStr,
-		CallID:     firstNonEmptyStr(wire.CallID, wire.CallIDSnake),
-		Status:     wire.Status,
-		ErrorType:  firstNonEmptyStr(wire.ErrorType, wire.ErrTypeSnake),
-		DurationMs: dur,
-		At:         wire.At,
+		Tool:          wire.Tool,
+		Input:         inputStr,
+		CallID:        firstNonEmptyStr(wire.CallID, wire.CallIDSnake),
+		Status:        wire.Status,
+		ErrorType:     firstNonEmptyStr(wire.ErrorType, wire.ErrTypeSnake),
+		ErrorMessage:  firstNonEmptyStr(wire.ErrorMessage, wire.ErrMsgSnake),
+		ResultPreview: firstNonEmptyStr(wire.ResultPreview, wire.ResPreviewSnake),
+		SessionID:     firstNonEmptyStr(wire.SessionID, wire.SessionIDSnake),
+		Worker:        wire.Worker,
+		DurationMs:    dur,
+		At:            wire.At,
 	}, true
 }
 
 func upsertActivityItem(list []ActivityItem, item ActivityItem) []ActivityItem {
+	replaced := false
 	if item.CallID != "" {
 		for i := range list {
 			if list[i].CallID == item.CallID {
+				item.Index = i + 1
 				list[i] = item
-				return list
+				replaced = true
+				break
 			}
 		}
 	}
-	return append(list, item)
+	if !replaced {
+		item.Index = len(list) + 1
+		list = append(list, item)
+	}
+	backfillActivityWorkers(list)
+	return list
+}
+
+func backfillActivityWorkers(list []ActivityItem) {
+	cardTitles := make(map[string]string)
+	cardAssignees := make(map[string]string)
+	cardClusters := make(map[string]string)
+	sessToCard := make(map[string]string)
+
+	for i := range list {
+		list[i].Index = i + 1
+		act := list[i]
+		var m map[string]any
+		if act.Input != "" && strings.HasPrefix(strings.TrimSpace(act.Input), "{") {
+			_ = json.Unmarshal([]byte(act.Input), &m)
+		}
+		if act.Tool == "kanban_create" {
+			cid := extractCardIDFromPreview(act.ResultPreview)
+			if cid == "" {
+				cid = firstNonEmptyArgString(m, "task_id", "card_id", "id")
+			}
+			rawTitle, _ := m["title"].(string)
+			title := cleanShortCardTitle(rawTitle)
+			assignee, _ := m["assignee"].(string)
+			assignee = strings.ToLower(strings.TrimSpace(assignee))
+			cluster := strings.ToLower(extractClusterFromText(rawTitle + " " + assignee))
+			if cid != "" {
+				if title != "" {
+					cardTitles[cid] = title
+					cardClusters[strings.ToLower(title)] = cid
+				}
+				if assignee != "" {
+					cardAssignees[assignee] = cid
+				}
+				if cluster != "" {
+					cardClusters[cluster] = cid
+				}
+			}
+		} else if strings.HasPrefix(act.Tool, "kanban_") {
+			cid := firstNonEmptyArgString(m, "card_id", "task_id", "id")
+			if cid != "" && act.SessionID != "" && !strings.HasPrefix(act.SessionID, "a2a-") {
+				sessToCard[act.SessionID] = cid
+			}
+		}
+		if strings.HasPrefix(act.Worker, "card:") && act.SessionID != "" && !strings.HasPrefix(act.SessionID, "a2a-") {
+			rest := strings.TrimPrefix(act.Worker, "card:")
+			if idx := strings.IndexByte(rest, ' '); idx > 0 {
+				rest = rest[:idx]
+			}
+			if rest != "" {
+				sessToCard[act.SessionID] = rest
+			}
+		}
+	}
+
+	for i := range list {
+		act := list[i]
+		if act.SessionID == "" || strings.HasPrefix(act.SessionID, "a2a-") || sessToCard[act.SessionID] != "" {
+			continue
+		}
+		lowerIn := strings.ToLower(act.Input)
+		if lowerIn == "" {
+			continue
+		}
+		for assignee, cid := range cardAssignees {
+			if assignee != "" && cid != "" && strings.Contains(lowerIn, assignee) {
+				sessToCard[act.SessionID] = cid
+				break
+			}
+		}
+		if sessToCard[act.SessionID] == "" {
+			for cluster, cid := range cardClusters {
+				if cluster != "" && cid != "" && strings.Contains(lowerIn, cluster) {
+					sessToCard[act.SessionID] = cid
+					break
+				}
+			}
+		}
+		if sessToCard[act.SessionID] == "" {
+			for cid := range cardTitles {
+				if cid != "" && strings.Contains(lowerIn, strings.ToLower(cid)) {
+					sessToCard[act.SessionID] = cid
+					break
+				}
+			}
+		}
+	}
+
+	if len(cardTitles) == 1 {
+		var soleCID string
+		for cid := range cardTitles {
+			soleCID = cid
+		}
+		for i := range list {
+			act := list[i]
+			if act.SessionID != "" && !strings.HasPrefix(act.SessionID, "a2a-") && sessToCard[act.SessionID] == "" {
+				sessToCard[act.SessionID] = soleCID
+			}
+		}
+	}
+
+	for i := range list {
+		act := &list[i]
+		if act.SessionID != "" && !strings.HasPrefix(act.SessionID, "a2a-") {
+			if cid := sessToCard[act.SessionID]; cid != "" {
+				if t := cardTitles[cid]; t != "" {
+					act.Worker = fmt.Sprintf("card:%s (%s)", cid, t)
+				} else {
+					act.Worker = "card:" + cid
+				}
+			} else if act.Worker == "" {
+				act.Worker = "worker:" + truncateText(act.SessionID, 20)
+			}
+		} else if act.Worker == "" && strings.HasPrefix(act.SessionID, "a2a-") {
+			act.Worker = "platform"
+		}
+	}
+}
+
+func extractCardIDFromPreview(preview string) string {
+	for _, field := range strings.Fields(preview) {
+		if strings.HasPrefix(field, "card_id=") {
+			return strings.Trim(strings.TrimPrefix(field, "card_id="), ",;)")
+		}
+		if strings.HasPrefix(field, "t_") {
+			return strings.Trim(field, ",;)")
+		}
+	}
+	return ""
+}
+
+func cleanShortCardTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	lower := strings.ToLower(title)
+	for _, p := range []string{
+		"live health check for ",
+		"live health check: ",
+		"health check for ",
+		"health check: ",
+		"check health of ",
+		"check live health of ",
+		"inspect ",
+	} {
+		if strings.HasPrefix(lower, p) {
+			trimmed := strings.TrimSpace(title[len(p):])
+			if trimmed != "" {
+				return truncateText(trimmed, 48)
+			}
+		}
+	}
+	if idx := strings.LastIndex(title, ": "); idx >= 0 && idx+2 < len(title) {
+		trimmed := strings.TrimSpace(title[idx+2:])
+		if trimmed != "" {
+			return truncateText(trimmed, 48)
+		}
+	}
+	return truncateText(title, 48)
 }
 
 func isPureControlCommand(text string) bool {

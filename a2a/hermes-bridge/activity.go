@@ -368,9 +368,13 @@ type ActivityEntry struct {
 	// status word (blocked, cancelled, timeout, error) or error_type
 	// (tool_error), so a guardrail refusal stays distinguishable from a
 	// tool failure in the trace.
-	ErrorType  string `json:"errorType,omitempty"`
-	DurationMs int64  `json:"durationMs,omitempty"`
-	At         string `json:"at,omitempty"`
+	ErrorType     string `json:"errorType,omitempty"`
+	ErrorMessage  string `json:"errorMessage,omitempty"`
+	ResultPreview string `json:"resultPreview,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	Worker        string `json:"worker,omitempty"`
+	DurationMs    int64  `json:"durationMs,omitempty"`
+	At            string `json:"at,omitempty"`
 	// Dropped is set only on the activityTruncatedTool entry: how many
 	// calls are missing from the trace, past the budget, failed to publish,
 	// or left unreported by the drain's deadline.
@@ -393,6 +397,8 @@ type hookDelivery struct {
 		DurationMs       json.Number     `json:"duration_ms"`
 		Status           string          `json:"status"`
 		ErrorType        string          `json:"error_type"`
+		ErrorMessage     string          `json:"error_message"`
+		Result           json.RawMessage `json:"result"`
 		FinishReason     string          `json:"finish_reason"`
 		APICallCount     json.Number     `json:"api_call_count"`
 		AssistantMessage json.RawMessage `json:"assistant_message"`
@@ -425,6 +431,8 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.ErrorMessage = lenientString(extra["error_message"])
+	d.Extra.Result = extra["result"]
 	d.Extra.FinishReason = lenientString(extra["finish_reason"])
 	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
 	d.Extra.AssistantMessage = extra["assistant_message"]
@@ -504,7 +512,14 @@ type activityState struct {
 	lastThinking      string
 	prevThinking      string
 	startedAt         time.Time
-	appended          map[string]bool // artifact name -> a first part went out
+	appended          map[string]bool   // artifact name -> a first part went out
+	sessionCards      map[string]string // worker sessionID -> cardID
+	cardTitles        map[string]string // cardID -> short cluster/card title
+	cardAssignees     map[string]string // lower(assignee) -> cardID
+	cardClusters      map[string]string // lower(cluster/shortTitle) -> cardID
+	claimedSessions   map[string]bool   // worker sessionID claimed by this task
+	pendingAssignees  []string          // lower(assignee) seen on pre_tool_call before cardID is known
+	pendingClusters   []string          // lower(cluster) seen on pre_tool_call before cardID is known
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -516,12 +531,17 @@ type activityState struct {
 
 func newActivityState(withKey bool) *activityState {
 	a := &activityState{
-		open:      make(map[string]ActivityEntry),
-		seen:      make(map[string]struct{}),
-		startedAt: time.Now(),
-		appended:  make(map[string]bool),
-		stop:      make(chan struct{}),
-		done:      make(chan struct{}),
+		open:            make(map[string]ActivityEntry),
+		seen:            make(map[string]struct{}),
+		startedAt:       time.Now(),
+		appended:        make(map[string]bool),
+		sessionCards:    make(map[string]string),
+		cardTitles:      make(map[string]string),
+		cardAssignees:   make(map[string]string),
+		cardClusters:    make(map[string]string),
+		claimedSessions: make(map[string]bool),
+		stop:            make(chan struct{}),
+		done:            make(chan struct{}),
 	}
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
@@ -616,8 +636,13 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
 		// end well enough for the interrupted flush, which is all the id
-		// is for.
-		id = "tool:" + d.ToolName
+		// is for. Include SessionID on API session tasks so concurrent
+		// specialist workers do not collide on a.open["tool:<name>"].
+		if a.sessionID != "" && d.SessionID != "" {
+			id = "tool:" + d.SessionID + ":" + d.ToolName
+		} else {
+			id = "tool:" + d.ToolName
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -643,7 +668,10 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	switch d.Event {
 	case hookPostAPIRequest:
 		a.apiCalls++
-		cand := formatAPIRequestThinking(d, a.apiCalls, a.calls)
+		if a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID {
+			return ActivityEntry{}, false
+		}
+		cand := formatAPIRequestThinkingWithMode(d, a.apiCalls, a.calls, a.sessionID != "")
 		if cand != "" && cand != a.prevThinking {
 			a.lastThinking = cand
 			a.prevThinking = cand
@@ -653,26 +681,59 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
+		inp := redactInput(d.ToolName, d.ToolInput)
+		var sessID, worker string
+		if a.sessionID != "" {
+			inp = redactInputDetailed(d.ToolName, d.ToolInput)
+			a.observeCardBindingLocked(d.SessionID, d.ToolName, d.ToolInput, "")
+			sessID = capRunes(d.SessionID, activityCallIDCap)
+			worker = a.workerLabelLocked(d.SessionID, d.ToolName, d.ToolInput, "")
+		}
 		a.open[id] = ActivityEntry{
-			Tool:   capRunes(d.ToolName, activityToolNameCap),
-			Input:  redactInput(d.ToolName, d.ToolInput),
-			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
-			At:     capRunes(d.Timestamp, activityWordCap),
+			Tool:      capRunes(d.ToolName, activityToolNameCap),
+			Input:     inp,
+			CallID:    capRunes(d.Extra.ToolCallID, activityCallIDCap),
+			SessionID: sessID,
+			Worker:    worker,
+			At:        capRunes(d.Timestamp, activityWordCap),
 		}
 		return ActivityEntry{}, false
 	case hookPostToolCall:
-		if _, seen := a.open[id]; seen {
+		openEntry, seen := a.open[id]
+		if seen {
 			delete(a.open, id)
 			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
+		} else if a.sessionID != "" && d.SessionID != "" {
+			fallbackTool := capRunes(d.ToolName, activityToolNameCap)
+			for _, openID := range a.openOrder {
+				oe := a.open[openID]
+				if oe.SessionID == d.SessionID && oe.Tool == fallbackTool {
+					openEntry = oe
+					delete(a.open, openID)
+					a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == openID })
+					break
+				}
+			}
 		}
 		a.calls++
+		rawToolInput := d.ToolInput
+		if len(rawToolInput) == 0 && len(openEntry.Input) > 0 {
+			rawToolInput = openEntry.Input
+		}
 		status := activityStatus(d)
-		if status != ActivityStatusError && (d.ToolName == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(d.ToolInput), kanbanCreateTool))) {
+		if status != ActivityStatusError && (d.ToolName == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
 			a.cardsFiled.Store(true)
+		}
+		inp := redactInput(d.ToolName, d.ToolInput)
+		if a.sessionID != "" {
+			inp = redactInputDetailed(d.ToolName, d.ToolInput)
+		}
+		if len(inp) == 0 && len(openEntry.Input) > 0 {
+			inp = openEntry.Input
 		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
-			Input:      redactInput(d.ToolName, d.ToolInput),
+			Input:      inp,
 			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -681,9 +742,203 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
+		if a.sessionID != "" {
+			resPreview, errMsg, createdCardID := summarizeToolResult(d.ToolName, status, d.Extra.ErrorMessage, d.Extra.Result)
+			a.observeCardBindingLocked(d.SessionID, d.ToolName, rawToolInput, createdCardID)
+			e.SessionID = capRunes(d.SessionID, activityCallIDCap)
+			e.Worker = a.workerLabelLocked(d.SessionID, d.ToolName, rawToolInput, createdCardID)
+			if status == ActivityStatusError && errMsg != "" {
+				e.ErrorMessage = capRunes(errMsg, 320)
+			}
+			if resPreview != "" {
+				e.ResultPreview = capRunes(resPreview, 320)
+			}
+		}
 		return e, true
 	}
 	return ActivityEntry{}, false
+}
+
+// SyncKanbanCardMeta updates the task's known Kanban card titles and worker
+// session bindings from the SQLite poll loop so subsequent worker tool calls
+// carry their card ID and cluster title on the bus.
+func (a *activityState) SyncKanbanCardMeta(cardID, title, workerSessionID string) {
+	a.SyncKanbanCardDetails(cardID, title, "", workerSessionID)
+}
+
+// SyncKanbanCardDetails updates the task's known Kanban card titles, assignee
+// profiles, cluster names, and worker session bindings from the SQLite poll loop.
+func (a *activityState) SyncKanbanCardDetails(cardID, title, assignee, workerSessionID string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cardID = strings.TrimSpace(cardID)
+	title = strings.TrimSpace(title)
+	assignee = strings.TrimSpace(assignee)
+	workerSessionID = strings.TrimSpace(workerSessionID)
+	if cardID != "" && title != "" {
+		shortTitle := shortCardClusterOrTitle(title)
+		a.cardTitles[cardID] = shortTitle
+		if shortTitle != "" {
+			a.cardClusters[strings.ToLower(shortTitle)] = cardID
+		}
+	}
+	if cardID != "" && assignee != "" {
+		a.cardAssignees[strings.ToLower(assignee)] = cardID
+	}
+	if workerSessionID != "" && cardID != "" {
+		a.sessionCards[workerSessionID] = cardID
+		a.claimedSessions[workerSessionID] = true
+	}
+}
+
+func (a *activityState) observeCardBindingLocked(sessionID, toolName string, rawInput json.RawMessage, createdCardID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	parsed := decodeToolArgsMap(rawInput)
+	if toolName == kanbanCreateTool {
+		title := extractArgStr(parsed, "title")
+		assignee := strings.ToLower(extractArgStr(parsed, "assignee"))
+		shortTitle := shortCardClusterOrTitle(title)
+		lowerCluster := strings.ToLower(shortTitle)
+		if assignee != "" && !slices.Contains(a.pendingAssignees, assignee) {
+			a.pendingAssignees = append(a.pendingAssignees, assignee)
+		}
+		if lowerCluster != "" && !slices.Contains(a.pendingClusters, lowerCluster) {
+			a.pendingClusters = append(a.pendingClusters, lowerCluster)
+		}
+		if createdCardID != "" {
+			if shortTitle != "" {
+				a.cardTitles[createdCardID] = shortTitle
+				a.cardClusters[lowerCluster] = createdCardID
+			}
+			if assignee != "" {
+				a.cardAssignees[assignee] = createdCardID
+			}
+		}
+		return
+	}
+	if strings.HasPrefix(toolName, "kanban_") {
+		cid := extractArgStr(parsed, "card_id", "task_id", "id")
+		if cid != "" && sessionID != "" && sessionID != a.sessionID {
+			a.sessionCards[sessionID] = cid
+			a.claimedSessions[sessionID] = true
+		}
+	}
+	if sessionID != "" && sessionID != a.sessionID && !strings.HasPrefix(sessionID, apiSessionIDPrefix) && a.sessionCards[sessionID] == "" {
+		if cid := a.matchCardFromTextLocked(string(rawInput)); cid != "" {
+			a.sessionCards[sessionID] = cid
+			a.claimedSessions[sessionID] = true
+		}
+	}
+}
+
+func (a *activityState) matchCardFromTextLocked(raw string) string {
+	lower := strings.ToLower(raw)
+	if lower != "" {
+		for assignee, cid := range a.cardAssignees {
+			if assignee != "" && cid != "" && strings.Contains(lower, assignee) {
+				return cid
+			}
+		}
+		for cluster, cid := range a.cardClusters {
+			if cluster != "" && cid != "" && strings.Contains(lower, cluster) {
+				return cid
+			}
+		}
+		for cid := range a.cardTitles {
+			if cid != "" && strings.Contains(lower, strings.ToLower(cid)) {
+				return cid
+			}
+		}
+	}
+	if len(a.cardTitles) == 1 {
+		for cid := range a.cardTitles {
+			return cid
+		}
+	}
+	return ""
+}
+
+func (a *activityState) hasWorkerSession(sessionID string) bool {
+	if a == nil || sessionID == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.claimedSessions[sessionID] || a.sessionCards[sessionID] != ""
+}
+
+func (a *activityState) claimWorkerSession(sessionID string) {
+	if a == nil || sessionID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.claimedSessions[sessionID] = true
+}
+
+func (a *activityState) matchesWorkerPayload(body []byte) bool {
+	if a == nil || len(body) == 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lower := strings.ToLower(string(body))
+	for assignee := range a.cardAssignees {
+		if assignee != "" && strings.Contains(lower, assignee) {
+			return true
+		}
+	}
+	for _, assignee := range a.pendingAssignees {
+		if assignee != "" && strings.Contains(lower, assignee) {
+			return true
+		}
+	}
+	for cluster := range a.cardClusters {
+		if cluster != "" && strings.Contains(lower, cluster) {
+			return true
+		}
+	}
+	for _, cluster := range a.pendingClusters {
+		if cluster != "" && strings.Contains(lower, cluster) {
+			return true
+		}
+	}
+	for cid := range a.cardTitles {
+		if cid != "" && strings.Contains(lower, strings.ToLower(cid)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *activityState) workerLabelLocked(sessionID, toolName string, rawInput json.RawMessage, createdCardID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || sessionID == a.sessionID || strings.HasPrefix(sessionID, apiSessionIDPrefix) {
+		return "platform"
+	}
+	cid := a.sessionCards[sessionID]
+	if cid == "" && strings.HasPrefix(toolName, "kanban_") {
+		cid = extractArgStr(decodeToolArgsMap(rawInput), "card_id", "task_id", "id")
+	}
+	if cid == "" && createdCardID != "" {
+		cid = createdCardID
+	}
+	if cid == "" {
+		cid = a.matchCardFromTextLocked(string(rawInput))
+		if cid != "" {
+			a.sessionCards[sessionID] = cid
+		}
+	}
+	if cid != "" {
+		if title := a.cardTitles[cid]; title != "" {
+			return fmt.Sprintf("card:%s (%s)", cid, title)
+		}
+		return "card:" + cid
+	}
+	return "worker:" + capRunes(sessionID, 24)
 }
 
 // interrupted returns the calls still open, in start order, as entries, and
@@ -694,6 +949,9 @@ func (a *activityState) interrupted() []ActivityEntry {
 	out := make([]ActivityEntry, 0, len(a.openOrder))
 	for _, id := range a.openOrder {
 		e := a.open[id]
+		if a.sessionID != "" && e.SessionID != "" && e.SessionID != a.sessionID {
+			continue
+		}
 		e.Status = ActivityStatusInterrupted
 		out = append(out, e)
 	}
@@ -851,6 +1109,10 @@ func extractPyReprField(pyRepr, field string) string {
 }
 
 func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) string {
+	return formatAPIRequestThinkingWithMode(d, fallbackStep, completedTools, false)
+}
+
+func formatAPIRequestThinkingWithMode(d hookDelivery, fallbackStep, completedTools int, detailed bool) string {
 	step := fallbackStep
 	if n := durationMillis(d.Extra.APICallCount); n > 0 {
 		step = int(n)
@@ -969,6 +1231,21 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 			plannedTools = append(plannedTools, desc)
 		}
 	}
+	kanbanCreateCount := 0
+	if detailed {
+		for _, tc := range msg.ToolCalls {
+			name := strings.TrimSpace(tc.Function.Name)
+			if name == "" {
+				name = strings.TrimSpace(tc.Name)
+			}
+			argsRaw := tc.Function.Arguments
+			if len(argsRaw) == 0 {
+				argsRaw = tc.Arguments
+			}
+			kanbanCreateCount += countKanbanCreateCalls(name, argsRaw)
+		}
+	}
+	addedBatchKanban := false
 	for _, tc := range msg.ToolCalls {
 		name := strings.TrimSpace(tc.Function.Name)
 		if name == "" {
@@ -978,7 +1255,7 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 		if len(argsRaw) == 0 {
 			argsRaw = tc.Arguments
 		}
-		for _, expanded := range expandPlannedToolCall(name, argsRaw) {
+		for _, expanded := range expandPlannedToolCallWithMode(name, argsRaw, detailed, kanbanCreateCount, &addedBatchKanban) {
 			addPlannedTool(expanded)
 		}
 	}
@@ -1009,10 +1286,51 @@ func formatAPIRequestThinking(d hookDelivery, fallbackStep, completedTools int) 
 	return capRunes(out, activityThinkingCap)
 }
 
+func countKanbanCreateCalls(toolName string, argsRaw json.RawMessage) int {
+	if toolName == kanbanCreateTool {
+		return 1
+	}
+	if toolName == hermesToolCallWrapper {
+		parsed := decodeToolArgsMap(argsRaw)
+		if calls, ok := parsed[wrapperCallsKey].([]any); ok {
+			n := 0
+			for _, item := range calls {
+				if cm, ok := item.(map[string]any); ok {
+					if sub, _ := cm[wrapperCallNameKey].(string); strings.TrimSpace(sub) == kanbanCreateTool {
+						n++
+					}
+				}
+			}
+			return n
+		}
+	}
+	return 0
+}
+
 func expandPlannedToolCall(toolName string, argsRaw json.RawMessage) []string {
+	var dummy bool
+	return expandPlannedToolCallWithMode(toolName, argsRaw, false, 0, &dummy)
+}
+
+func expandPlannedToolCallWithMode(toolName string, argsRaw json.RawMessage, detailed bool, kanbanCreateCount int, addedBatchKanban *bool) []string {
 	toolName = capRunes(strings.TrimSpace(toolName), activityToolNameCap)
 	if toolName == "" {
 		return nil
+	}
+	describe := describePlannedTool
+	if detailed {
+		describe = func(tn string, pa map[string]any) string {
+			if tn == kanbanCreateTool && kanbanCreateCount > 1 {
+				if addedBatchKanban != nil && *addedBatchKanban {
+					return ""
+				}
+				if addedBatchKanban != nil {
+					*addedBatchKanban = true
+				}
+				return fmt.Sprintf("Dispatching %d specialist tasks on the Kanban board.", kanbanCreateCount)
+			}
+			return describePlannedToolDetailed(tn, pa)
+		}
 	}
 	parsed := decodeToolArgsMap(argsRaw)
 	if toolName == hermesToolCallWrapper && parsed != nil {
@@ -1029,14 +1347,19 @@ func expandPlannedToolCall(toolName string, argsRaw json.RawMessage) []string {
 					continue
 				}
 				subArgs, _ := cm[wrapperCallArgsKey].(map[string]any)
-				out = append(out, describePlannedTool(subName, subArgs))
+				if desc := describe(subName, subArgs); desc != "" {
+					out = append(out, desc)
+				}
 			}
 			if len(out) > 0 {
 				return out
 			}
 		}
 	}
-	return []string{describePlannedTool(toolName, parsed)}
+	if desc := describe(toolName, parsed); desc != "" {
+		return []string{desc}
+	}
+	return nil
 }
 
 func decodeToolArgsMap(raw json.RawMessage) map[string]any {
@@ -1053,6 +1376,200 @@ func decodeToolArgsMap(raw json.RawMessage) map[string]any {
 		return nil
 	}
 	return m
+}
+
+func extractArgStr(m map[string]any, keys ...string) string {
+	if m == nil {
+		return ""
+	}
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok {
+			v = strings.TrimSpace(v)
+			if v != "" && v != redactedValue && !strings.HasPrefix(v, "<string,") {
+				return scrubInlineSecrets(v)
+			}
+		}
+	}
+	return ""
+}
+
+func shortClusterRef(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(raw, "/clusters/"); idx >= 0 {
+		raw = raw[idx+len("/clusters/"):]
+	}
+	if strings.HasPrefix(raw, "gke_") {
+		parts := strings.Split(raw, "_")
+		if len(parts) >= 4 {
+			raw = strings.Join(parts[3:], "_")
+		}
+	}
+	return capRunes(raw, 48)
+}
+
+func shortFilePath(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if idx := strings.Index(raw, "/skills/"); idx >= 0 {
+		return "skill " + capRunes(strings.TrimPrefix(raw[idx+len("/skills/"):], "/"), 56)
+	}
+	parts := strings.Split(strings.Trim(raw, "/"), "/")
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	return capRunes(strings.Join(parts, "/"), 56)
+}
+
+func shortCardClusterOrTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	lower := strings.ToLower(title)
+	for _, p := range []string{
+		"live health check for ",
+		"live health check: ",
+		"health check for ",
+		"health check: ",
+		"check health of ",
+		"check live health of ",
+		"inspect ",
+	} {
+		if strings.HasPrefix(lower, p) {
+			trimmed := strings.TrimSpace(title[len(p):])
+			if trimmed != "" {
+				return capRunes(trimmed, 48)
+			}
+		}
+	}
+	if idx := strings.LastIndex(title, ": "); idx >= 0 && idx+2 < len(title) {
+		trimmed := strings.TrimSpace(title[idx+2:])
+		if trimmed != "" {
+			return capRunes(trimmed, 48)
+		}
+	}
+	return capRunes(title, 48)
+}
+
+func describePlannedToolDetailed(toolName string, parsedArgs map[string]any) string {
+	switch {
+	case toolName == "mcp__gke__list_clusters":
+		return "Listing GKE clusters in the fleet."
+	case toolName == "mcp__gke__get_cluster":
+		if c := shortClusterRef(extractArgStr(parsedArgs, "name", "cluster", "cluster_name")); c != "" {
+			return "Inspecting GKE cluster " + c + "."
+		}
+		return "Inspecting GKE cluster configuration."
+	case strings.HasPrefix(toolName, "mcp__gke__"):
+		if c := shortClusterRef(extractArgStr(parsedArgs, "name", "cluster", "cluster_name")); c != "" {
+			return "Querying GKE cluster state (" + c + ")."
+		}
+		return "Querying GKE cluster state."
+	case toolName == "mcp__platform_control__list_cluster_profiles":
+		return "Listing GKE cluster profiles in the fleet."
+	case strings.HasPrefix(toolName, "mcp__platform_control__"):
+		if c := shortClusterRef(extractArgStr(parsedArgs, "cluster_name", "name", "cluster")); c != "" {
+			return "Querying platform control state (" + c + ")."
+		}
+		return "Querying platform control state."
+	case toolName == "terminal" || toolName == "kubectl" || toolName == "run_kubectl" || toolName == "bash":
+		cmd := extractArgStr(parsedArgs, "command", "cmd")
+		cluster := shortClusterRef(extractArgStr(parsedArgs, "cluster", "cluster_name", "context"))
+		return classifyShellIntentDetailed(cmd, cluster)
+	case toolName == kanbanCreateTool:
+		if t := shortCardClusterOrTitle(extractArgStr(parsedArgs, "title")); t != "" {
+			return "Delegating specialist task: " + t + "."
+		}
+		return "Delegating task to specialist agent."
+	case toolName == "kanban_heartbeat":
+		if cid := extractArgStr(parsedArgs, "card_id", "id"); cid != "" {
+			return "Updating progress on Kanban card " + cid + "."
+		}
+		return "Updating task status on the Kanban board."
+	case toolName == "kanban_complete":
+		if cid := extractArgStr(parsedArgs, "card_id", "id"); cid != "" {
+			return "Completing Kanban card " + cid + "."
+		}
+		return "Updating task status on the Kanban board."
+	case strings.HasPrefix(toolName, "kanban_"):
+		return "Updating task status on the Kanban board."
+	case toolName == "read_file":
+		if p := shortFilePath(extractArgStr(parsedArgs, "path", "file_path", "filepath")); p != "" {
+			return "Reading " + p + "."
+		}
+		return "Reading file in the workspace."
+	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
+		if p := shortFilePath(extractArgStr(parsedArgs, "path", "pattern", "query")); p != "" {
+			return "Inspecting workspace files (" + p + ")."
+		}
+		return "Inspecting files in the workspace."
+	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
+		if p := shortFilePath(extractArgStr(parsedArgs, "path", "file_path", "filepath")); p != "" {
+			return "Editing " + p + "."
+		}
+		return "Editing a file in the agent workspace."
+	case toolName == "write_file" || toolName == "create_file":
+		if p := shortFilePath(extractArgStr(parsedArgs, "path", "file_path", "filepath")); p != "" {
+			return "Writing " + p + "."
+		}
+		return "Writing a file in the agent workspace."
+	case toolName == "tool_search":
+		if q := extractArgStr(parsedArgs, "query", "pattern"); q != "" {
+			return "Searching available tools (" + capRunes(q, 36) + ")."
+		}
+		return "Searching available tools."
+	case toolName == "tool_describe":
+		if n := extractArgStr(parsedArgs, "name", "tool_name"); n != "" {
+			return "Inspecting tool schema (" + capRunes(n, 36) + ")."
+		}
+		return "Inspecting tool schema."
+	case toolName == "execute_code":
+		return "Running analysis script."
+	case toolName == "skill_view":
+		if s := extractArgStr(parsedArgs, "name", "skill", "skill_name"); s != "" {
+			return "Loading skill " + capRunes(s, 48) + "."
+		}
+		return "Loading skill instructions."
+	default:
+		return describePlannedTool(toolName, parsedArgs)
+	}
+}
+
+var cmdClusterFlagPattern = regexp.MustCompile(`(?:--cluster|--context)\s+['"]?([A-Za-z0-9_.:-]+)['"]?`)
+
+func extractClusterFromCmd(cmd string) string {
+	if m := cmdClusterFlagPattern.FindStringSubmatch(cmd); len(m) > 1 {
+		return shortClusterRef(m[1])
+	}
+	return ""
+}
+
+func classifyShellIntentDetailed(cmd, explicitCluster string) string {
+	base := classifyShellIntent(cmd)
+	cluster := explicitCluster
+	if cluster == "" {
+		cluster = extractClusterFromCmd(cmd)
+	}
+	if cluster == "" {
+		return base
+	}
+	switch base {
+	case "Checking Kubernetes node status and readiness.":
+		return "Checking Kubernetes node status on " + cluster + "."
+	case "Inspecting Kubernetes pods and workload health.":
+		return "Inspecting Kubernetes pods on " + cluster + "."
+	case "Inspecting deployment replica configuration.":
+		return "Inspecting deployment replicas on " + cluster + "."
+	case "Querying Kubernetes cluster resources.":
+		return "Querying Kubernetes resources on " + cluster + "."
+	default:
+		return strings.TrimSuffix(base, ".") + " (" + cluster + ")."
+	}
 }
 
 func describePlannedTool(toolName string, parsedArgs map[string]any) string {
@@ -1357,6 +1874,232 @@ func redactKeys(v any) any {
 		return t
 	}
 	return v
+}
+
+var (
+	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
+	inlineAuthHeaderPattern = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	inlineURLCredPattern    = regexp.MustCompile(`(https?://[^/\s:@]+:)[^@\s/]+(@)`)
+	inlineKVSecretPattern   = regexp.MustCompile(`(?i)\b(token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret|pgpassword|dbpassword)\s*([=:])\s*(['"]?)[^\s'"]+(['"]?)`)
+	kanbanCardIDPattern     = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
+)
+
+func scrubInlineSecrets(s string) string {
+	if s == "" || s == redactedValue {
+		return s
+	}
+	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
+	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
+	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
+	s = inlineKVSecretPattern.ReplaceAllString(s, "${1}${2}${3}"+redactedValue+"${4}")
+	return s
+}
+
+// redactInputDetailed returns the tool input fit for the bus on the API
+// executor: secret-looking keys are blanked via redactKeys and inline
+// credential patterns inside string values are scrubbed via
+// scrubInlineSecrets, while keeping non-secret strings (file paths, commands,
+// cluster names, Kanban card notes) readable and bounded.
+func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return json.RawMessage(unparseableInput)
+	}
+	red := scrubValueDetailed(redactKeys(v))
+	out, err := json.Marshal(red)
+	if err != nil {
+		return json.RawMessage(unparseableInput)
+	}
+	if len(out) <= activityInputCap*2 {
+		return out
+	}
+	if tool == hermesToolCallWrapper {
+		if capped, ok := capWrapperCalls(red); ok {
+			return capped
+		}
+	}
+	out, _ = json.Marshal(truncatedStandIn(out, activityInputHead))
+	return out
+}
+
+func scrubValueDetailed(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		shaped := 0
+		for k, val := range t {
+			nk := k
+			if tokenShapedKey(k) {
+				shaped++
+				nk = fmt.Sprintf("<key %d, %d chars>", shaped, utf8.RuneCountInString(k))
+			}
+			out[nk] = scrubValueDetailed(val)
+		}
+		return out
+	case []any:
+		for i := range t {
+			t[i] = scrubValueDetailed(t[i])
+		}
+		return t
+	case string:
+		if t == redactedValue {
+			return t
+		}
+		return capRunes(scrubInlineSecrets(t), 512)
+	}
+	return v
+}
+
+func summarizeToolResult(toolName, status, rawErrMsg string, rawResult json.RawMessage) (resPreview, errMsg, createdCardID string) {
+	rawErrMsg = strings.TrimSpace(scrubInlineSecrets(rawErrMsg))
+	trimmed := strings.TrimSpace(string(rawResult))
+	var decoded any
+	if trimmed != "" && trimmed != "null" {
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		dec.UseNumber()
+		if dec.Decode(&decoded) == nil {
+			if s, ok := decoded.(string); ok {
+				st := strings.TrimSpace(s)
+				if strings.HasPrefix(st, "{") || strings.HasPrefix(st, "[") {
+					var inner any
+					innerDec := json.NewDecoder(strings.NewReader(st))
+					innerDec.UseNumber()
+					if innerDec.Decode(&inner) == nil {
+						decoded = inner
+					}
+				}
+			}
+		}
+	}
+
+	if m, ok := decoded.(map[string]any); ok {
+		if cid := extractArgStr(m, "id", "card_id", "task_id"); strings.HasPrefix(cid, "t_") {
+			createdCardID = cid
+		}
+		if rawErrMsg == "" {
+			rawErrMsg = extractArgStr(m, "error", "error_message", "stderr", "message")
+		}
+	}
+	if createdCardID == "" && toolName == kanbanCreateTool && trimmed != "" {
+		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
+			createdCardID = m[1]
+		}
+	}
+
+	if status == ActivityStatusError {
+		if rawErrMsg == "" && trimmed != "" && trimmed != "null" {
+			if s, ok := decoded.(string); ok {
+				rawErrMsg = oneLinePreview(scrubInlineSecrets(s), 240)
+			} else {
+				rawErrMsg = oneLinePreview(scrubInlineSecrets(trimmed), 240)
+			}
+		}
+		return rawErrMsg, rawErrMsg, createdCardID
+	}
+
+	switch {
+	case toolName == kanbanCreateTool:
+		if createdCardID != "" {
+			if m, ok := decoded.(map[string]any); ok {
+				st := extractArgStr(m, "status")
+				if st == "" {
+					st = "todo"
+				}
+				return fmt.Sprintf("card_id=%s status=%s", createdCardID, st), "", createdCardID
+			}
+			return "card_id=" + createdCardID, "", createdCardID
+		}
+	case toolName == "kanban_heartbeat":
+		return "heartbeat recorded", "", ""
+	case toolName == "kanban_complete":
+		return "card marked completed", "", ""
+	case toolName == "read_file":
+		if s := extractResultText(decoded, trimmed); s != "" {
+			lines := strings.Count(s, "\n") + 1
+			head := oneLinePreview(scrubInlineSecrets(s), 120)
+			if head != "" {
+				return fmt.Sprintf("%d lines (%d B) — %s", lines, len(s), head), "", ""
+			}
+			return fmt.Sprintf("%d lines (%d B)", lines, len(s)), "", ""
+		}
+	case toolName == "terminal" || toolName == "bash" || toolName == "kubectl" || toolName == "run_kubectl":
+		if m, ok := decoded.(map[string]any); ok {
+			outStr := extractArgStr(m, "output", "stdout", "result")
+			if outStr == "" {
+				outStr = extractArgStr(m, "stderr")
+			}
+			exitStr := ""
+			if ec, has := m["exit_code"]; has {
+				exitStr = fmt.Sprintf("exit=%v ", ec)
+			} else if ec, has := m["returncode"]; has {
+				exitStr = fmt.Sprintf("exit=%v ", ec)
+			}
+			if outStr != "" {
+				lines := strings.Count(outStr, "\n") + 1
+				return fmt.Sprintf("%s(%d lines) %s", exitStr, lines, oneLinePreview(scrubInlineSecrets(outStr), 140)), "", ""
+			}
+			if exitStr != "" {
+				return strings.TrimSpace(exitStr), "", ""
+			}
+		}
+		if s := extractResultText(decoded, ""); s != "" {
+			lines := strings.Count(s, "\n") + 1
+			return fmt.Sprintf("(%d lines) %s", lines, oneLinePreview(scrubInlineSecrets(s), 150)), "", ""
+		}
+	}
+
+	if s := extractResultText(decoded, trimmed); s != "" {
+		return oneLinePreview(scrubInlineSecrets(s), 200), "", createdCardID
+	}
+	return "", "", createdCardID
+}
+
+func extractResultText(decoded any, fallbackRaw string) string {
+	switch t := decoded.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case map[string]any:
+		for _, k := range []string{"output", "content", "result", "text", "stdout", "message", "summary"} {
+			if v, ok := t[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		b, err := json.Marshal(scrubValueDetailed(redactKeys(t)))
+		if err == nil {
+			return string(b)
+		}
+	case []any:
+		b, err := json.Marshal(scrubValueDetailed(redactKeys(t)))
+		if err == nil {
+			return string(b)
+		}
+	}
+	if fallbackRaw != "" && fallbackRaw != "null" {
+		return fallbackRaw
+	}
+	return ""
+}
+
+func oneLinePreview(s string, maxBytes int) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		collapsed := strings.Join(strings.Fields(line), " ")
+		return capRunes(collapsed, maxBytes)
+	}
+	return capRunes(strings.Join(strings.Fields(s), " "), maxBytes)
 }
 
 // --- the child's managed scope ---
@@ -1712,12 +2455,61 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 			return r
 		}
 	}
-	for _, r := range runs {
-		if a := r.act.Load(); a != nil && a.waitingCard.Load() && !strings.HasPrefix(d.SessionID, apiSessionIDPrefix) {
-			return r
+	if !strings.HasPrefix(d.SessionID, apiSessionIDPrefix) {
+		var waiting []*taskRun
+		for _, r := range runs {
+			if a := r.act.Load(); a != nil && a.waitingCard.Load() {
+				if !a.hasWorkerSession(d.SessionID) && workerSessionStartedBefore(d.SessionID, a.startedAt) {
+					continue
+				}
+				waiting = append(waiting, r)
+			}
 		}
+		if len(waiting) == 0 {
+			return nil
+		}
+		slices.SortFunc(waiting, func(x, y *taskRun) int {
+			ax, ay := x.act.Load(), y.act.Load()
+			if ax != nil && ay != nil && !ax.startedAt.Equal(ay.startedAt) {
+				if ax.startedAt.After(ay.startedAt) {
+					return -1
+				}
+				return 1
+			}
+			idX, idY := "", ""
+			if x.origin != nil {
+				idX = x.origin.TaskID
+			}
+			if y.origin != nil {
+				idY = y.origin.TaskID
+			}
+			return strings.Compare(idX, idY)
+		})
+		for _, r := range waiting {
+			if a := r.act.Load(); a != nil && a.hasWorkerSession(d.SessionID) {
+				return r
+			}
+		}
+		for _, r := range waiting {
+			if a := r.act.Load(); a != nil && a.matchesWorkerPayload(body) {
+				a.claimWorkerSession(d.SessionID)
+				return r
+			}
+		}
+		return waiting[0]
 	}
 	return nil
+}
+
+func workerSessionStartedBefore(sessionID string, startedAt time.Time) bool {
+	if len(sessionID) < 15 || sessionID[8] != '_' || startedAt.IsZero() {
+		return false
+	}
+	ts, err := time.Parse("20060102_150405", sessionID[:15])
+	if err != nil {
+		return false
+	}
+	return ts.Before(startedAt.UTC().Add(-2 * time.Second))
 }
 
 // --- the heartbeat ---

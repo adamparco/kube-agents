@@ -1395,3 +1395,117 @@ print("Here is the fleet summary.")
 		t.Fatalf("second thinking part = %q", second)
 	}
 }
+
+func TestSessionActivityState_DetailedInputsResultPreviewsAndWorkerAttribution(t *testing.T) {
+	act := newSessionActivityState("a2a-platform-1", true)
+
+	mustDelivery := func(raw string) hookDelivery {
+		var d hookDelivery
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			t.Fatalf("unmarshal hookDelivery: %v", err)
+		}
+		return d
+	}
+
+	// Sync Kanban card metadata from waitForKanbanCards.
+	act.SyncKanbanCardMeta("t_01", "Live health check for drift-peer-ap-1", "worker-sess-01")
+
+	// 1. Platform read_file call with an inline token and secret key in arguments:
+	// real file path must be preserved while sensitive keys and inline tokens are scrubbed.
+	fakeGHP := "ghp_" + "secretTokenValue123456"
+	fakeOAuth := "ya29." + "a0AfH6SMBsecret999"
+	act.observe(mustDelivery(`{
+		"hook_event_name": "pre_tool_call",
+		"tool_name": "read_file",
+		"session_id": "a2a-platform-1",
+		"tool_input": {"path":"/var/lib/hermes/skills/gke-cluster-diagnostics/SKILL.md","token":"` + fakeGHP + `","note":"auth with Bearer ` + fakeOAuth + `"},
+		"extra": {"tool_call_id": "c-read-1"}
+	}`))
+	e1, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"tool_name": "read_file",
+		"session_id": "a2a-platform-1",
+		"extra": {
+			"tool_call_id": "c-read-1",
+			"duration_ms": 42,
+			"status": "ok",
+			"result": "# GKE Cluster Diagnostics Skill\nCheck node pools and pods.\nToken ` + fakeGHP + `"
+		}
+	}`))
+	if !ok {
+		t.Fatal("expected post_tool_call to produce entry")
+	}
+	if e1.Worker != "platform" || e1.SessionID != "a2a-platform-1" {
+		t.Fatalf("unexpected worker/session: worker=%q session=%q", e1.Worker, e1.SessionID)
+	}
+	inStr := string(e1.Input)
+	if !strings.Contains(inStr, "/var/lib/hermes/skills/gke-cluster-diagnostics/SKILL.md") {
+		t.Fatalf("expected unshaped path in session activity input, got %s", inStr)
+	}
+	if strings.Contains(inStr, fakeGHP) || strings.Contains(inStr, fakeOAuth) {
+		t.Fatalf("secret leaked in input: %s", inStr)
+	}
+	if !strings.Contains(e1.ResultPreview, "GKE Cluster Diagnostics Skill") || strings.Contains(e1.ResultPreview, fakeGHP) {
+		t.Fatalf("unexpected resultPreview: %q", e1.ResultPreview)
+	}
+
+	// 2. Specialist card worker tool call (attributed via SyncKanbanCardMeta session binding).
+	act.observe(mustDelivery(`{
+		"hook_event_name": "pre_tool_call",
+		"tool_name": "terminal",
+		"session_id": "worker-sess-01",
+		"tool_input": {"command":"kubectl --context=gke_adamparco-kage_us-east4_drift-peer-ap-1 get pods -A"},
+		"extra": {"tool_call_id": "c-term-1"}
+	}`))
+	e2, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"tool_name": "terminal",
+		"session_id": "worker-sess-01",
+		"extra": {
+			"tool_call_id": "c-term-1",
+			"duration_ms": 810,
+			"status": "error",
+			"error_type": "ExitCode1",
+			"error_message": "error: server https://user:secretpass@10.0.0.1:443 returned 403"
+		}
+	}`))
+	if !ok {
+		t.Fatal("expected specialist post_tool_call entry")
+	}
+	if e2.Worker != "card:t_01 (drift-peer-ap-1)" {
+		t.Fatalf("expected worker label card:t_01 (drift-peer-ap-1), got %q", e2.Worker)
+	}
+	if !strings.Contains(e2.ErrorMessage, ":[redacted]@") || strings.Contains(e2.ErrorMessage, "secretpass") {
+		t.Fatalf("expected scrubbed errorMessage, got %q", e2.ErrorMessage)
+	}
+
+	// 3. Resource-qualified step title from post_api_request on session activity state.
+	act.observe(mustDelivery(`{
+		"hook_event_name": "post_api_request",
+		"session_id": "a2a-platform-1",
+		"extra": {
+			"finish_reason": "tool_calls",
+			"response": {
+				"finish_reason": "tool_calls",
+				"assistant_message": {
+					"role": "assistant",
+					"content": "<think>Inspecting drift-peer-ap-1 cluster configuration.</think>",
+					"tool_calls": [
+						{
+							"id": "call_gke_1",
+							"type": "function",
+							"function": {
+								"name": "mcp__gke__get_cluster",
+								"arguments": "{\"name\":\"projects/p/locations/us-east4/clusters/drift-peer-ap-1\"}"
+							}
+						}
+					]
+				}
+			}
+		}
+	}`))
+	thinkingLine, ok := act.takeThinking()
+	if !ok || !strings.HasPrefix(thinkingLine, "Inspecting GKE cluster drift-peer-ap-1.\t") {
+		t.Fatalf("expected resource-qualified thinking line, got %q", thinkingLine)
+	}
+}

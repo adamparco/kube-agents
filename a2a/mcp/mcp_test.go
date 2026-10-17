@@ -1685,3 +1685,142 @@ func TestStepCursorSurvivesSessionRestart(t *testing.T) {
 		t.Fatalf("CreatedAt should be back-dated to the submission, got %v", got)
 	}
 }
+
+func TestNormalAndDebugModeStreamingAndPanels(t *testing.T) {
+	now := time.Now().UTC()
+	rec := &TaskRecord{
+		TaskID:         "task-debug-panel-1",
+		ContextID:      "ctx-debug-panel-1",
+		Addressee:      "platform",
+		Conversation:   "console:tok-dbg",
+		State:          lib.StateWorking,
+		Terminal:       false,
+		CreatedAt:      now.Add(-45 * time.Second),
+		UpdatedAt:      now,
+		EnvelopeCount:  24,
+		SteerTimestamps: []time.Time{now.Add(-15 * time.Second)},
+		EnvelopeCountsByKind: map[string]int{
+			"message":         1,
+			"status-update":   2,
+			"artifact-update": 21,
+		},
+		Thinking: strings.Join([]string{
+			"Reading skill gke-cluster-diagnostics/SKILL.md.\tLoading diagnostic playbook.",
+			"Dispatching 2 specialist tasks on the Kanban board.\tCreating specialist cards for drift-peer-ap-1 and kube-agents-host.",
+			"Reading skill gke-cluster-diagnostics/SKILL.md.\tRe-checking reference section after card dispatch.",
+			"Specialist check completed: drift-peer-ap-1 (healthy — 1/2 cards done).\tCluster RUNNING (v1.34.1-gke.2037001), 0 pod restarts.",
+		}, "\n"),
+		Activities: []ActivityItem{
+			{
+				Index:         1,
+				Tool:          "read_file",
+				Input:         `{"path":"/var/lib/hermes/skills/gke-cluster-diagnostics/SKILL.md"}`,
+				CallID:        "c1",
+				Status:        "ok",
+				ResultPreview: "# GKE Cluster Diagnostics Skill (112 lines)",
+				SessionID:     "a2a-platform-1",
+				Worker:        "platform",
+				DurationMs:    38,
+				At:            now.Add(-40 * time.Second).Format(time.RFC3339),
+			},
+			{
+				Index:         2,
+				Tool:          "kanban_create",
+				Input:         `{"assignee":"cluster-diagnostics","title":"Live health check for drift-peer-ap-1"}`,
+				CallID:        "c2",
+				Status:        "ok",
+				ResultPreview: "card_id=t_01 status=pending",
+				SessionID:     "a2a-platform-1",
+				Worker:        "platform",
+				DurationMs:    19,
+				At:            now.Add(-35 * time.Second).Format(time.RFC3339),
+			},
+			{
+				Index:         3,
+				Tool:          "kanban_create",
+				Input:         `{"assignee":"cluster-diagnostics","title":"Live health check for kube-agents-host"}`,
+				CallID:        "c3",
+				Status:        "ok",
+				ResultPreview: "card_id=t_02 status=pending",
+				SessionID:     "a2a-platform-1",
+				Worker:        "platform",
+				DurationMs:    21,
+				At:            now.Add(-34 * time.Second).Format(time.RFC3339),
+			},
+			{
+				Index:         4,
+				Tool:          "kanban_done",
+				Input:         `{"summary":"Cluster RUNNING, 0 pod restarts","task_id":"t_01","verdict":"healthy"}`,
+				CallID:        "c4",
+				Status:        "ok",
+				ResultPreview: "card_id=t_01 status=done",
+				SessionID:     "worker-sess-01",
+				Worker:        "card:t_01 (drift-peer-ap-1)",
+				DurationMs:    15,
+				At:            now.Add(-10 * time.Second).Format(time.RFC3339),
+			},
+			{
+				Index:         5,
+				Tool:          "kanban_heartbeat",
+				Input:         `{"note":"Checking kubeagents-system pods on kube-agents-host","task_id":"t_02"}`,
+				CallID:        "c5",
+				Status:        "ok",
+				ResultPreview: "heartbeat ok",
+				SessionID:     "worker-sess-02",
+				Worker:        "card:t_02 (kube-agents-host)",
+				DurationMs:    12,
+				At:            now.Add(-3 * time.Second).Format(time.RFC3339),
+			},
+		},
+	}
+
+	outcome := &TurnOutcome{
+		ConversationAlias:     "default",
+		ConversationToken:     "tok-dbg",
+		PrimaryTask:           rec,
+		TimedOut:              true,
+		PrevStepCount:         4,
+		ReportedStepCount:     4,
+		PrevActivityCount:     4,
+		ReportedActivityCount: 5,
+	}
+
+	// Verify A2: Consecutive-only coalescing keeps both non-consecutive "Reading skill..." steps (4 total steps, not 3).
+	details := CollectOutcomeStepDetails(outcome)
+	if len(details) != 4 {
+		t.Fatalf("expected 4 steps with consecutive-only coalescing, got %d: %+v", len(details), details)
+	}
+
+	// Verify A1: When a poll times out with no new step (PrevStepCount == ReportedStepCount == 4),
+	// it shows live Kanban card progress + delta activity (c5) and NEVER repeats c1 (`read_file`).
+	waitTitle, waitMD, _ := FormatTurnCustomToolEnvelope(outcome, false)
+	if !strings.Contains(waitTitle, "Specialist checks in progress (1/2 completed, 1 running)") {
+		t.Fatalf("unexpected waitTitle: %q", waitTitle)
+	}
+	if strings.Contains(waitMD, "read_file") {
+		t.Fatalf("wait step markdown repeated stale read_file from earlier step:\n%s", waitMD)
+	}
+	if !strings.Contains(waitMD, "kanban_heartbeat") || !strings.Contains(waitMD, "Checking kubeagents-system pods on kube-agents-host") {
+		t.Fatalf("wait step markdown missing delta kanban_heartbeat activity:\n%s", waitMD)
+	}
+
+	// Verify B1 + B2 + B3 in Debug Mode when task completes: all 4 collapsible panels render.
+	rec.State = lib.StateCompleted
+	rec.Terminal = true
+	rec.ResultText = "Both clusters are healthy."
+	outcome.TimedOut = false
+	_, dbgMD, _ := FormatTurnCustomToolEnvelope(outcome, true)
+	for _, needle := range []string{
+		"Bus Envelope &amp; Task Telemetry",
+		"Kanban Specialist Cards",
+		"Full Tool Activity Stream",
+		"Raw LLM API Turn Log",
+		"card:t_01 (drift-peer-ap-1)",
+		"# GKE Cluster Diagnostics Skill (112 lines)",
+		"Both clusters are healthy.",
+	} {
+		if !strings.Contains(dbgMD, needle) {
+			t.Errorf("debug mode output missing %q:\n%s", needle, dbgMD)
+		}
+	}
+}
