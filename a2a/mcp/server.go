@@ -775,7 +775,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		rawTasks := sess.ListTasks(conv.Token, false, defaultTaskListLimit)
 		var tasks []*TaskRecord
 		for _, t := range rawTasks {
-			if t != nil && t.CardParentTaskID == "" {
+			if t != nil && t.CardParentTaskID == "" && t.DelegatedFromTaskID == "" && t.WakeFromChildTaskID == "" {
 				tasks = append(tasks, t)
 			}
 		}
@@ -795,15 +795,22 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		omittedOlder := 0
 		for i := 0; i < len(tasks); i++ {
 			t := tasks[i]
+			outcome := sess.BuildTaskOutcome(t.TaskID, conv.Alias, conv.Token, t.PromptText, false)
+			hasDelegation := outcome != nil && (len(outcome.ChildTasks) > 0 || outcome.WakeTask != nil)
 			var sec, llmSec strings.Builder
 			promptHdr := fmt.Sprintf("### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
 			sec.WriteString(promptHdr)
-			sec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
+			if hasDelegation {
+				sec.WriteString(FormatTurnOutcomeMarkdownWithOptions(outcome, debug))
+			} else {
+				sec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
+			}
 			sec.WriteString("\n---\n")
 			llmSec.WriteString(promptHdr)
 			if debug {
-				outcome := sess.BuildTaskOutcome(t.TaskID, conv.Alias, conv.Token, t.PromptText, false)
 				llmSec.WriteString(formatCompactDebugLLMResult(outcome, FormatTurnOutcomeMarkdownWithOptions(outcome, false)))
+			} else if hasDelegation {
+				llmSec.WriteString(FormatTurnOutcomeMarkdownWithOptions(outcome, false))
 			} else {
 				llmSec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", false))
 			}
