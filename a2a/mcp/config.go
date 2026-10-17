@@ -483,8 +483,11 @@ func (s *ConfigStore) UpdatePushConfig(jetskiConvID string, enabled *bool, agent
 	if trimmedID != "" {
 		s.cfg.Push.JetskiConversationID = trimmedID
 		s.addKnownJetskiConvLocked(trimmedID)
+		// Only adopt the active console conversation if nobody owns it yet. Stealing it here
+		// (as this used to) silently re-pointed every concurrent Jetski conversation at the same
+		// console token; ConversationForJetski mints a separate one instead.
 		if s.cfg.ActiveConversation != "" {
-			if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok {
+			if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && active.JetskiConversationID == "" {
 				active.JetskiConversationID = trimmedID
 				s.cfg.Conversations[s.cfg.ActiveConversation] = active
 			}

@@ -1584,23 +1584,34 @@ func TestConcurrentJetskiConversationsGetIsolatedConsoleConversations(t *testing
 	s := &Server{store: store}
 	ctxA := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "aaaaaaaa-1111-4111-8111-111111111111"})
 	ctxB := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "bbbbbbbb-2222-4222-8222-222222222222"})
+	enabled := true
+	// HandleJSONRPC records the push binding for every _meta-carrying call before dispatch; replay
+	// that pre-step so the test covers the real request path (it used to steal the active
+	// conversation for the newest Jetski id, which is exactly how round 2 re-hijacked).
+	preStep := func(ctx context.Context) {
+		_, _ = store.UpdatePushConfig(callMetaFromContext(ctx).ConversationID, &enabled, "")
+	}
 
 	// A connects: binds the default conversation.
+	preStep(ctxA)
 	a1 := s.conversationFor(ctxA, "", "")
 	if a1.Alias != defaultConvAlias {
 		t.Fatalf("A should bind the default conversation, got %q", a1.Alias)
 	}
 	// B explicitly uses its own alias (becomes the global active conversation).
+	preStep(ctxB)
 	b1 := s.conversationFor(ctxB, "soak-r1b", "")
 	if b1.Alias != "soak-r1b" || store.ActiveConversation().Alias != "soak-r1b" {
 		t.Fatalf("B should use soak-r1b and make it active, got %q / active %q", b1.Alias, store.ActiveConversation().Alias)
 	}
 	// A's next message with no conversation arg must stay on A's conversation, not B's.
+	preStep(ctxA)
 	a2 := s.conversationFor(ctxA, "", "")
 	if a2.Alias != a1.Alias || a2.Token != a1.Token {
 		t.Fatalf("A hijacked onto %q (token %s); want %q (token %s)", a2.Alias, a2.Token, a1.Alias, a1.Token)
 	}
 	// And B keeps its own.
+	preStep(ctxB)
 	b2 := s.conversationFor(ctxB, "", "")
 	if b2.Alias != "soak-r1b" {
 		t.Fatalf("B lost its conversation: %q", b2.Alias)
@@ -1608,6 +1619,7 @@ func TestConcurrentJetskiConversationsGetIsolatedConsoleConversations(t *testing
 	// A third Jetski conversation arriving while the active conversation is bound elsewhere gets a
 	// fresh auto alias rather than stealing.
 	ctxC := withCallMeta(context.Background(), rpcCallToolMeta{ConversationID: "cccccccc-3333-4333-8333-333333333333"})
+	preStep(ctxC)
 	c1 := s.conversationFor(ctxC, "", "")
 	if c1.Alias != jetskiAliasPrefix+"cccccccc" || c1.Token == a1.Token || c1.Token == b1.Token {
 		t.Fatalf("C should get an isolated auto-bound conversation, got %q (token %s)", c1.Alias, c1.Token)
