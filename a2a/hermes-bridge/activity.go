@@ -2648,7 +2648,8 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 				return r
 			}
 		}
-		if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+		cid := extractKanbanCardIDFromCwd(d.Cwd)
+		if cid != "" {
 			for _, r := range waiting {
 				if a := r.act.Load(); a != nil && a.hasCardID(cid) {
 					a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
@@ -2657,19 +2658,24 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 			}
 		}
 		for _, r := range waiting {
-			if a := r.act.Load(); a != nil && a.matchesWorkerPayload(body) {
-				a.claimWorkerSession(d.SessionID)
-				if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
-					a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
+			if a := r.act.Load(); a != nil {
+				if cid != "" && a.hasAnyCardBindings() {
+					continue
 				}
-				return r
+				if a.matchesWorkerPayload(body) {
+					a.claimWorkerSession(d.SessionID)
+					if cid != "" {
+						a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
+					}
+					return r
+				}
 			}
 		}
 		if a := waiting[0].act.Load(); a != nil {
 			if a.hasAnyCardBindings() {
 				return nil
 			}
-			if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+			if cid != "" {
 				a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
 			}
 		}
