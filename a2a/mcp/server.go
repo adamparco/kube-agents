@@ -787,7 +787,7 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		sb.WriteString(header)
 		llmSB.WriteString(header)
 		const maxTranscriptBytes = 14 * 1024
-		const maxLLMTranscriptBytes = 3600
+		const maxLLMTranscriptBytes = 8000
 		// Render newest-last, but ensure the newest turns are never dropped if the transcript is long:
 		var sections, llmSections []string
 		totalBytes := sb.Len()
@@ -817,7 +817,8 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 			llmSec.WriteString("\n---\n")
 			sStr := sec.String()
 			lStr := llmSec.String()
-			if len(sections) > 0 && (totalBytes+len(sStr) > maxTranscriptBytes || totalLLMBytes+len(lStr) > maxLLMTranscriptBytes) {
+			exceedsBudget := totalBytes+len(sStr) > maxTranscriptBytes || (debug && totalLLMBytes+len(lStr) > maxLLMTranscriptBytes)
+			if len(sections) > 0 && exceedsBudget {
 				omittedOlder = len(tasks) - i
 				break
 			}

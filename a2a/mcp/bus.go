@@ -110,10 +110,10 @@ const (
 
 var (
 	allKnownStreams = []string{
-		streamTasks,
 		streamDirectory,
 		streamTopicsState,
 		streamTopicsJournal,
+		streamTasks,
 	}
 	errNotConnected = errors.New("not connected to any kube-agents deployment")
 )
