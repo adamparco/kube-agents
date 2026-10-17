@@ -190,6 +190,12 @@ func InspectPullRequest(
 		if err != nil {
 			insp, err = fetchPRViaGHCLI(fetchCtx, runner, repo, num)
 			if err != nil {
+				if strings.Contains(httpErr.Error(), "returned HTTP 404") {
+					return nil, fmt.Errorf("pull request %s#%d not found on GitHub (HTTP 404)", repo, num)
+				}
+				if strings.Contains(err.Error(), "executable file not found") {
+					return nil, httpErr
+				}
 				return nil, fmt.Errorf("%w (GitHub API: %v)", err, httpErr)
 			}
 		}

@@ -818,7 +818,7 @@ func collectDeltaActivities(outcome *TurnOutcome) []ActivityItem {
 var (
 	kanbanResultIDRe       = regexp.MustCompile(`\bid=([A-Za-z0-9_-]+)`)
 	specialistStepHeaderRe = regexp.MustCompile(`(?i)^Specialist check completed:\s*(.+?)\s*\(([^()—-]+?)\s*[—-]\s*(\d+)/(\d+)\s+cards\s+done\)\.?$`)
-	knownClusterNameRe     = regexp.MustCompile(`\b(drift-peer-[a-z0-9-]+|kube-agents-host|spot-capacity-test|gke-[a-z0-9_-]+)\b`)
+	profileRegionSuffixRe  = regexp.MustCompile(`-(?:us|europe|asia|australia|northamerica|southamerica|me|africa)-[a-z0-9-]+$`)
 )
 
 func parseActivityArgMap(raw string) map[string]any {
@@ -858,9 +858,11 @@ func summarizeKanbanMetadata(args map[string]any) string {
 	return formatArgMapSummaryWithLimit(meta, 80)
 }
 
-func extractClusterFromText(text string) string {
-	if m := knownClusterNameRe.FindStringSubmatch(text); len(m) >= 2 {
-		return m[1]
+func extractClusterFromAssignee(assignee string) string {
+	assignee = strings.ToLower(strings.TrimSpace(assignee))
+	if strings.HasPrefix(assignee, "cluster-") {
+		rest := strings.TrimPrefix(assignee, "cluster-")
+		return profileRegionSuffixRe.ReplaceAllString(rest, "")
 	}
 	return ""
 }
@@ -924,11 +926,13 @@ func extractKanbanCardsFromTask(rec *TaskRecord) (cards []KanbanCardSummary, don
 				if t := firstNonEmptyArgString(args, "title"); t != "" {
 					c.Title = t
 				}
-				if cl := extractClusterFromText(c.Title + " " + firstNonEmptyArgString(args, "cluster", "description")); cl != "" {
-					c.Cluster = cl
-				}
 				if as := firstNonEmptyArgString(args, "assignee"); as != "" && c.Worker == "" {
 					c.Worker = as
+				}
+				if cl := firstNonEmptyArgString(args, "cluster", "cluster_name"); cl != "" {
+					c.Cluster = cl
+				} else if cl := extractClusterFromAssignee(c.Worker); cl != "" {
+					c.Cluster = cl
 				}
 			}
 		case "kanban_claim":
@@ -1040,8 +1044,8 @@ func extractKanbanCardsFromTask(rec *TaskRecord) (cards []KanbanCardSummary, don
 			detail = strings.TrimSpace(sub[tabIdx+1:])
 		}
 		if m := specialistStepHeaderRe.FindStringSubmatch(head); len(m) == 5 {
-			shortTitle := strings.TrimSpace(m[1])
-			verdict := strings.TrimSpace(m[2])
+			shortTitle := cleanShortCardTitle(m[1])
+			verdict := strings.ToLower(strings.TrimSpace(m[2]))
 			var matched *KanbanCardSummary
 			for _, id := range order {
 				c := byID[id]
@@ -1054,7 +1058,6 @@ func extractKanbanCardsFromTask(rec *TaskRecord) (cards []KanbanCardSummary, don
 				matched = ensureCard(shortTitle)
 				if matched != nil && matched.Title == "" {
 					matched.Title = shortTitle
-					matched.Cluster = extractClusterFromText(shortTitle)
 				}
 			}
 			if matched != nil {
@@ -1148,7 +1151,8 @@ func extractWorkerCluster(act ActivityItem) string {
 			}
 		}
 	}
-	return extractClusterFromText(act.Input)
+	args := parseActivityArgMap(act.Input)
+	return firstNonEmptyArgString(args, "cluster", "cluster_name")
 }
 
 func shortActivityPath(raw string) string {
@@ -1183,87 +1187,22 @@ func describeActivityWaitStep(act ActivityItem, activeAgent string) string {
 			toolName = names[0]
 		}
 	}
-
-	switch {
-	case toolName == "terminal" || toolName == "kubectl" || toolName == "run_kubectl" || toolName == "bash":
-		cmd := firstNonEmptyArgString(args, "command", "cmd")
-		lowerCmd := strings.ToLower(cmd)
-		switch {
-		case strings.Contains(lowerCmd, "cluster_preflight"):
-			return qualifyWithCluster("Running cluster preflight check", "on", cluster)
-		case strings.Contains(lowerCmd, "/user.md"):
-			return qualifyWithCluster("Reading cluster profile USER.md", "for", cluster)
-		case strings.Contains(lowerCmd, "gh pr create") || strings.Contains(lowerCmd, "gh pr "):
-			return qualifyWithCluster("Opening GitHub Pull Request", "for", cluster)
-		case strings.Contains(lowerCmd, "git commit") || strings.Contains(lowerCmd, "git push"):
-			return qualifyWithCluster("Committing and pushing manifest changes", "for", cluster)
-		case strings.Contains(lowerCmd, "git checkout") || strings.Contains(lowerCmd, "git switch") || strings.Contains(lowerCmd, "git branch"):
-			return qualifyWithCluster("Preparing feature branch in GitOps repository", "for", cluster)
-		case strings.Contains(lowerCmd, "git clone") || strings.Contains(lowerCmd, "git fetch") || strings.Contains(lowerCmd, "git pull"):
-			return qualifyWithCluster("Cloning and syncing GitOps repository", "for", cluster)
-		case strings.Contains(lowerCmd, "git status") || strings.Contains(lowerCmd, "git diff") || strings.Contains(lowerCmd, "git log"):
-			return qualifyWithCluster("Reviewing repository status and manifest diff", "for", cluster)
-		case strings.Contains(lowerCmd, "kubectl top"):
-			return qualifyWithCluster("Checking node and pod resource usage", "on", cluster)
-		case strings.Contains(lowerCmd, "kubectl describe node"):
-			return qualifyWithCluster("Inspecting Kubernetes node conditions", "on", cluster)
-		case strings.Contains(lowerCmd, "kubectl get node"):
-			return qualifyWithCluster("Checking Kubernetes node readiness", "on", cluster)
-		case strings.Contains(lowerCmd, "kubectl get pod") || strings.Contains(lowerCmd, "kubectl describe pod") || strings.Contains(lowerCmd, "kubectl logs"):
-			return qualifyWithCluster("Inspecting Kubernetes pod health", "on", cluster)
-		case strings.Contains(lowerCmd, "kubectl get event"):
-			return qualifyWithCluster("Checking Kubernetes cluster events", "on", cluster)
-		case strings.Contains(lowerCmd, "kubectl get deploy") || strings.Contains(lowerCmd, "kubectl get sts") || strings.Contains(lowerCmd, "kubectl get ds") || strings.Contains(lowerCmd, "kubectl get hpa"):
-			return qualifyWithCluster("Inspecting Kubernetes workloads and autoscalers", "on", cluster)
-		case strings.Contains(lowerCmd, "gcloud monitoring") || strings.Contains(lowerCmd, "gcloud logging"):
-			return qualifyWithCluster("Querying Cloud Monitoring and Logging", "for", cluster)
-		default:
-			return qualifyWithCluster("Running cluster and workspace diagnostics", "on", cluster)
-		}
-	case toolName == "read_file":
-		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
-		if strings.Contains(strings.ToLower(p), "/user.md") {
-			return qualifyWithCluster("Reading cluster profile USER.md", "for", cluster)
-		}
-		if sp := shortActivityPath(p); sp != "" {
-			return qualifyWithCluster("Reading "+sp, "on", cluster)
-		}
-		return qualifyWithCluster("Reading file in the workspace", "on", cluster)
-	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
-		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
-		if sp := shortActivityPath(p); sp != "" {
-			return qualifyWithCluster("Editing "+sp, "for", cluster)
-		}
-		return qualifyWithCluster("Editing file in the workspace", "for", cluster)
-	case toolName == "write_file" || toolName == "create_file":
-		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
-		if sp := shortActivityPath(p); sp != "" {
-			return qualifyWithCluster("Writing "+sp, "for", cluster)
-		}
-		return qualifyWithCluster("Writing file in the workspace", "for", cluster)
-	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
-		p := firstNonEmptyArgString(args, "path", "pattern", "query")
-		if sp := shortActivityPath(p); sp != "" {
-			return qualifyWithCluster("Inspecting workspace files ("+sp+")", "for", cluster)
-		}
-		return qualifyWithCluster("Inspecting files in the workspace", "for", cluster)
-	case toolName == "mcp__gke__list_node_pools" || toolName == "mcp__gke__get_node_pool":
-		return qualifyWithCluster("Inspecting GKE node pools", "for", cluster)
-	case toolName == "mcp__gke__list_operations":
-		return qualifyWithCluster("Checking recent GKE operations", "for", cluster)
-	case toolName == "mcp__gke__get_cluster":
-		return qualifyWithCluster("Inspecting GKE cluster configuration", "for", cluster)
-	case strings.HasPrefix(toolName, "mcp__gke__"):
-		return qualifyWithCluster("Querying GKE cluster state", "for", cluster)
-	case toolName == "kanban_show":
-		return qualifyWithCluster("Starting specialist diagnostics", "on", cluster)
-	case toolName == "kanban_heartbeat":
+	if toolName == "kanban_heartbeat" {
 		if note := firstNonEmptyArgString(args, "note", "status", "message"); note != "" && !strings.HasPrefix(note, "<string,") {
 			return truncateText(note, 64)
 		}
 		return qualifyWithCluster("Updating specialist progress", "on", cluster)
 	}
-
+	if p := shortActivityPath(firstNonEmptyArgString(args, "path", "file_path", "filepath")); p != "" {
+		switch toolName {
+		case "read_file":
+			return qualifyWithCluster("Reading "+p, "on", cluster)
+		case "patch", "edit_file", "replace_in_file":
+			return qualifyWithCluster("Editing "+p, "for", cluster)
+		case "write_file", "create_file":
+			return qualifyWithCluster("Writing "+p, "for", cluster)
+		}
+	}
 	titles := activityCandidateStepTitles(act)
 	if len(titles) > 0 && titles[0] != "" {
 		return qualifyWithCluster(strings.TrimSuffix(titles[0], "."), "on", cluster)
@@ -1449,36 +1388,82 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 	}
 
 	// Settled / completed task:
-	if debug {
-		if len(allDetails) > 0 {
-			title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allDetails), pluralizeStep(len(allDetails)))
-		} else {
-			title = fmt.Sprintf("Completed in %ds", sec)
-		}
-		return title, fullMD, fullMD
-	}
-
 	answerOnlyMD := formatCleanTurnAnswerOnlyMarkdown(outcome)
+	llmOut := answerOnlyMD
+	if debug {
+		llmOut = formatCompactDebugLLMResult(outcome, answerOnlyMD)
+	}
 	if prev > 0 {
 		if len(deltaDetails) >= 1 {
 			lastDetail := deltaDetails[len(deltaDetails)-1]
 			lastStep := strings.TrimSuffix(lastDetail.Title, ".")
 			title = fmt.Sprintf("%s (%ds)", lastStep, sec)
-			return title, FormatStepDetailsBatchMarkdownWithOptions(deltaDetails, sec, true, debug, outcome), answerOnlyMD
+			userMD := FormatStepDetailsBatchMarkdownWithOptions(deltaDetails, sec, true, debug, outcome)
+			if debug {
+				userMD = fullMD
+			}
+			return title, userMD, llmOut
 		}
 		title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allDetails), pluralizeStep(len(allDetails)))
-		return title, fmt.Sprintf("- **Agent**: `%s` (task `%s`)\n- **Status**: ✅ Completed in %ds (%d %s)",
-			activeAgent, activeTaskID, sec, len(allDetails), pluralizeStep(len(allDetails))), answerOnlyMD
+		userMD := fmt.Sprintf("- **Agent**: `%s` (task `%s`)\n- **Status**: ✅ Completed in %ds (%d %s)",
+			activeAgent, activeTaskID, sec, len(allDetails), pluralizeStep(len(allDetails)))
+		if debug {
+			userMD = fullMD
+		}
+		return title, userMD, llmOut
 	}
 
 	if len(allDetails) >= 1 {
 		lastDetail := allDetails[len(allDetails)-1]
 		lastStep := strings.TrimSuffix(lastDetail.Title, ".")
 		title = fmt.Sprintf("%s (%ds)", lastStep, sec)
-		return title, FormatStepDetailsBatchMarkdownWithOptions(allDetails, sec, true, debug, outcome), answerOnlyMD
+		userMD := FormatStepDetailsBatchMarkdownWithOptions(allDetails, sec, true, debug, outcome)
+		if debug {
+			if len(allDetails) > 1 {
+				title = fmt.Sprintf("Completed in %ds (%d %s)", sec, len(allDetails), pluralizeStep(len(allDetails)))
+			}
+			userMD = fullMD
+		}
+		return title, userMD, llmOut
 	}
 	title = fmt.Sprintf("Completed in %ds", sec)
-	return title, fmt.Sprintf("- **Agent**: `%s` (task `%s`)\n- **Status**: ✅ Task completed in %ds", activeAgent, activeTaskID, sec), answerOnlyMD
+	userMD := fmt.Sprintf("- **Agent**: `%s` (task `%s`)\n- **Status**: ✅ Task completed in %ds", activeAgent, activeTaskID, sec)
+	if debug {
+		userMD = fullMD
+	}
+	return title, userMD, llmOut
+}
+
+func formatCompactDebugLLMResult(outcome *TurnOutcome, answerOnlyMD string) string {
+	if outcome == nil || outcome.PrimaryTask == nil {
+		return answerOnlyMD
+	}
+	rec := outcome.PrimaryTask
+	sec := computeOutcomeElapsedSeconds(rec, outcome.ChildTasks, outcome.WakeTask)
+	cards, doneCards, runningCards, totalCards, _ := extractKanbanCardsFromTask(rec)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "### Debug Telemetry Summary (`%s`)\n", rec.TaskID)
+	fmt.Fprintf(&sb, "- **Task / Context**: `%s` / `%s` (`%s`, `%s`, `%ds` elapsed)\n",
+		rec.TaskID, firstNonEmptyStr(rec.ContextID, "—"), firstNonEmptyStr(rec.Addressee, "platform"), rec.State, sec)
+	fmt.Fprintf(&sb, "- **Envelopes & Tool Calls**: `%d` envelopes (%s), `%d` tool calls\n",
+		rec.EnvelopeCount, firstNonEmptyStr(formatEnvelopeKindBreakdown(rec.EnvelopeCountsByKind), "—"), len(rec.Activities))
+	if len(rec.SteerTimestamps) > 0 {
+		var steerTimes []string
+		for _, ts := range rec.SteerTimestamps {
+			steerTimes = append(steerTimes, ts.UTC().Format("15:04:05 UTC"))
+		}
+		fmt.Fprintf(&sb, "- **Steer / Follow-Up Timeline**: `%d` steer(s) at `%s`\n", len(rec.SteerTimestamps), strings.Join(steerTimes, "`, `"))
+	}
+	if totalCards > 0 {
+		fmt.Fprintf(&sb, "- **Specialist Kanban Cards**: `%d/%d` completed (`%d` running)\n", doneCards, totalCards, runningCards)
+		for _, c := range cards {
+			fmt.Fprintf(&sb, "  - `%s` (%s): status=`%s`, verdict=`%s` — %s\n",
+				c.ID, firstNonEmptyStr(c.Cluster, c.Title, "—"), c.Status, firstNonEmptyStr(c.Verdict, c.Status), truncateText(c.Summary, 140))
+		}
+	}
+	sb.WriteString("\n### Final Answer\n\n")
+	sb.WriteString(answerOnlyMD)
+	return strings.TrimSpace(sb.String()) + "\n"
 }
 
 const maxDebugStepActivitiesShown = 12
@@ -2178,40 +2163,6 @@ func normalizeStepTitleAndThought(rawLine string) (title string, thought string)
 	if nodePoolInspectRe.MatchString(cleaned) {
 		return "Inspecting Kubernetes pods, nodes, and cluster events.", cleaned
 	}
-	if conversationalStartRe.MatchString(cleaned) || strings.Contains(cleaned, ". ") || strings.Contains(cleaned, "! ") || strings.Contains(cleaned, " — ") {
-		lower := strings.ToLower(cleaned)
-		var normTitle string
-		switch {
-		case strings.Contains(lower, "let me finalize") || strings.Contains(lower, "let's finalize") || strings.Contains(lower, "both actions are done") || strings.Contains(lower, "all done"):
-			normTitle = synthFinalStepTitle
-		case strings.HasPrefix(lower, "delegating ") && strings.Contains(lower, "platform"):
-			normTitle = "Delegating task to platform."
-		case strings.Contains(lower, "remove") && strings.Contains(lower, "manifest") && strings.Contains(lower, "commit"):
-			normTitle = "Removing stale manifest and committing changes."
-		case strings.Contains(lower, "commit") || strings.Contains(lower, "push"):
-			normTitle = "Committing and pushing manifest changes."
-		case strings.Contains(lower, "pod") && strings.Contains(lower, "node"):
-			normTitle = "Inspecting Kubernetes pods, nodes, and cluster events."
-		case strings.Contains(lower, "pod") || strings.Contains(lower, "workload"):
-			normTitle = "Inspecting Kubernetes pods and workload health."
-		case strings.Contains(lower, "node"):
-			normTitle = "Checking Kubernetes node status and readiness."
-		case strings.Contains(lower, "diagnostic"):
-			normTitle = "Running cluster and workspace diagnostics."
-		case strings.Contains(lower, "kanban") || strings.Contains(lower, "specialist"):
-			normTitle = "Coordinating specialist agent tasks."
-		case strings.Contains(lower, "manifest") || strings.Contains(lower, "yaml"):
-			normTitle = "Inspecting and updating workload manifests."
-		case strings.Contains(lower, "pr #") || strings.Contains(lower, "pull request"):
-			normTitle = "Creating or updating GitHub pull request."
-		}
-		if normTitle != "" {
-			if strings.EqualFold(strings.TrimSuffix(normTitle, "."), strings.TrimSuffix(cleaned, ".")) {
-				return normTitle, ""
-			}
-			return normTitle, cleaned
-		}
-	}
 
 	return cleaned, ""
 }
@@ -2325,7 +2276,18 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		label := formatThoughtSummaryLabel(rec, nil, nil, len(thoughts))
 		sb.WriteString("<details>\n")
 		fmt.Fprintf(&sb, "<summary>%s</summary>\n\n", label)
-		for _, line := range thoughts {
+		const (
+			maxDebugThoughts = 15
+			headThoughts     = 6
+			tailThoughts     = 9
+		)
+		for i, line := range thoughts {
+			if debug && len(thoughts) > maxDebugThoughts && i >= headThoughts && i < len(thoughts)-tailThoughts {
+				if i == headThoughts {
+					fmt.Fprintf(&sb, "- *… (%d intermediate steps omitted — see telemetry panels below)*\n", len(thoughts)-headThoughts-tailThoughts)
+				}
+				continue
+			}
 			fmt.Fprintf(&sb, "- ✅ %s\n", line)
 		}
 		sb.WriteString("\n</details>\n\n")
@@ -2430,14 +2392,14 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		sb.WriteString("| ---: | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n")
 		maxInputChars := 240
 		maxPreviewChars := 180
-		if len(rec.Activities) > 35 {
-			maxInputChars = 80
-			maxPreviewChars = 70
+		if len(rec.Activities) > 24 {
+			maxInputChars = 75
+			maxPreviewChars = 65
 		}
 		const (
-			maxDebugTableRows = 35
-			headDebugRows     = 12
-			tailDebugRows     = 23
+			maxDebugTableRows = 24
+			headDebugRows     = 8
+			tailDebugRows     = 16
 		)
 		for i, act := range rec.Activities {
 			if len(rec.Activities) > maxDebugTableRows && i >= headDebugRows && i < len(rec.Activities)-tailDebugRows {
@@ -2502,9 +2464,9 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 	if debug && (len(thinkingLines) > 0 || len(rec.IntermediateTurns) > 0) {
 		fmt.Fprintf(&sb, "<details>\n<summary>🧠 <strong>Raw LLM API Turn Log</strong> — <code>%d thinking frames</code></summary>\n\n", len(thinkingLines))
 		const (
-			maxDebugThinkingLines = 25
-			headThinkingLines     = 10
-			tailThinkingLines     = 15
+			maxDebugThinkingLines = 16
+			headThinkingLines     = 6
+			tailThinkingLines     = 10
 		)
 		for i, raw := range thinkingLines {
 			if len(thinkingLines) > maxDebugThinkingLines && i >= headThinkingLines && i < len(thinkingLines)-tailThinkingLines {
@@ -2514,17 +2476,28 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 				}
 				continue
 			}
-			clean := truncateText(strings.ReplaceAll(raw, "\t", " — "), 160)
+			tTitle, tThought := normalizeStepTitleAndThought(raw)
+			cleanRaw := raw
+			if tTitle != "" {
+				if tThought != "" {
+					cleanRaw = tTitle + " — " + tThought
+				} else {
+					cleanRaw = tTitle
+				}
+			} else {
+				cleanRaw = strings.ReplaceAll(raw, "\t", " — ")
+			}
+			clean := truncateText(cleanRaw, 150)
 			fmt.Fprintf(&sb, "%d. %s\n", i+1, clean)
 		}
 		if len(rec.IntermediateTurns) > 0 {
 			sb.WriteString("\n#### 🔄 Intermediate Turns\n")
 			for i, t := range rec.IntermediateTurns {
-				if i >= 3 {
-					fmt.Fprintf(&sb, "*… (%d additional intermediate turns omitted)*\n\n", len(rec.IntermediateTurns)-3)
+				if i >= 2 {
+					fmt.Fprintf(&sb, "*… (%d additional intermediate turns omitted)*\n\n", len(rec.IntermediateTurns)-2)
 					break
 				}
-				fmt.Fprintf(&sb, "> %s\n\n", truncateText(strings.TrimSpace(t), 800))
+				fmt.Fprintf(&sb, "> %s\n\n", truncateText(strings.TrimSpace(t), 450))
 			}
 		}
 		sb.WriteString("\n</details>\n\n")

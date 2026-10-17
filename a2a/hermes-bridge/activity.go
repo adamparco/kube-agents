@@ -907,6 +907,15 @@ func (a *activityState) hasCardID(cardID string) bool {
 	return false
 }
 
+func (a *activityState) hasAnyCardBindings() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.cardTitles) > 0 || len(a.cardAssignees) > 0 || len(a.cardClusters) > 0 || len(a.pendingAssignees) > 0 || len(a.pendingClusters) > 0
+}
+
 func (a *activityState) observeCardBindingLocked(sessionID, toolName string, rawInput json.RawMessage, createdCardID string) {
 	sessionID = strings.TrimSpace(sessionID)
 	parsed := decodeToolArgsMap(rawInput)
@@ -1564,18 +1573,12 @@ func shortFilePath(raw string) string {
 	return capRunes(strings.Join(parts, "/"), 56)
 }
 
-var (
-	bridgeClusterNameRe = regexp.MustCompile(`\b(drift-peer-[a-z0-9-]+|kube-agents-host|spot-capacity-test|gke-[a-z0-9_-]+)\b`)
-	profileRegionSufRe  = regexp.MustCompile(`-(?:us|europe|asia|australia|northamerica|southamerica|me|africa)-[a-z0-9-]+$`)
-)
+var profileRegionSufRe = regexp.MustCompile(`-(?:us|europe|asia|australia|northamerica|southamerica|me|africa)-[a-z0-9-]+$`)
 
 func extractClusterFromProfile(profile string) string {
 	profile = strings.ToLower(strings.TrimSpace(profile))
 	if profile == "" || profile == "platform" || profile == "default" {
 		return ""
-	}
-	if m := bridgeClusterNameRe.FindStringSubmatch(profile); len(m) >= 2 {
-		return m[1]
 	}
 	if strings.HasPrefix(profile, "cluster-") {
 		rest := strings.TrimPrefix(profile, "cluster-")
@@ -1600,31 +1603,12 @@ func shortCardClusterOrTitle(title string) string {
 		return ""
 	}
 	lower := strings.ToLower(title)
-	if !strings.HasPrefix(lower, "fleet-wide") {
-		if m := bridgeClusterNameRe.FindStringSubmatch(lower); len(m) >= 2 {
-			return m[1]
-		}
-	}
-	for _, p := range []string{
-		"live health check for ",
-		"live health check: ",
-		"health check for ",
-		"health check: ",
-		"check health of ",
-		"check live health of ",
-		"inspect ",
-	} {
-		if strings.HasPrefix(lower, p) {
-			trimmed := strings.TrimSpace(title[len(p):])
-			if trimmed != "" {
-				return trimUnclosedParen(capRunes(trimmed, 48))
+	for _, sep := range []string{" for ", ": "} {
+		if idx := strings.LastIndex(lower, sep); idx >= 0 && idx+len(sep) < len(title) {
+			candidate := strings.TrimSpace(title[idx+len(sep):])
+			if candidate != "" && !strings.Contains(candidate, " ") {
+				return trimUnclosedParen(capRunes(candidate, 48))
 			}
-		}
-	}
-	if idx := strings.LastIndex(title, ": "); idx >= 0 && idx+2 < len(title) {
-		trimmed := strings.TrimSpace(title[idx+2:])
-		if trimmed != "" {
-			return trimUnclosedParen(capRunes(trimmed, 48))
 		}
 	}
 	return trimUnclosedParen(capRunes(title, 48))
@@ -2681,8 +2665,11 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 				return r
 			}
 		}
-		if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
-			if a := waiting[0].act.Load(); a != nil {
+		if a := waiting[0].act.Load(); a != nil {
+			if a.hasAnyCardBindings() {
+				return nil
+			}
+			if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
 				a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
 			}
 		}

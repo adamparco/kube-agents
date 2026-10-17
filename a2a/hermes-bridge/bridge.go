@@ -428,11 +428,13 @@ type Bridge struct {
 	routes   map[string]rememberedRoute
 	// kanbanMu guards in-flight Kanban waits and out-of-turn completion
 	// delivery for non-routed (console:) sessions (api.go).
-	kanbanMu            sync.Mutex
-	kanbanActiveWaits   map[string]int
-	kanbanDeliveredIDs  map[string]bool
-	kanbanPendingSettle map[string]int
-	consoleSessions     map[string]consoleSessionMeta
+	kanbanMu               sync.Mutex
+	kanbanActiveWaits      map[string]int
+	kanbanDeliveredIDs     map[string]bool
+	kanbanPendingSettle    map[string]int
+	kanbanCanceledSessions map[string]bool
+	sessionEpochs          map[string]int
+	consoleSessions        map[string]consoleSessionMeta
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server

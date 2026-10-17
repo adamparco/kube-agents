@@ -258,7 +258,12 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 			"reason: no-text-parts - the submission message carries nothing hermes can be asked", nil)
 		return
 	}
-	sessionID := apiSessionID(run.origin.ContextID)
+	sessionID := b.sessionIDForContext(run.origin.ContextID)
+	defer func() {
+		if run.canceled.Load() {
+			b.markSessionCanceled(run.origin.ContextID, sessionID)
+		}
+	}()
 	// The task's own context: the deadline bounds every turn together;
 	// cancel and shutdown end whichever request is in flight. Not the
 	// consumer's context, which a shutdown cancels before shutdownTasks can
@@ -335,16 +340,20 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	if !run.routeRecorded.Load() {
+		b.beginKanbanWait(sessionID)
+		defer b.endKanbanWait(sessionID)
+	}
+	taskStartUnix := time.Now().Unix() - 2
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
-		turnStartUnix := time.Now().Unix() - 2
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
 		}
 		if !run.routeRecorded.Load() {
-			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, turnStartUnix, turn, text)
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
 			if !ok {
 				return
 			}
@@ -659,7 +668,7 @@ if session_id == "*":
         (since_ts,),
     ).fetchall()
 else:
-    conds = ["created_at >= ?", f"LOWER(COALESCE(status, '')) NOT IN ({settled_sql})"]
+    conds = ["created_at >= ?"]
     params = [session_id, since_ts]
     if tracked:
         conds.append(f"id IN ({','.join('?' for _ in tracked)})")
@@ -738,6 +747,99 @@ type consoleSessionMeta struct {
 	Authority     json.RawMessage
 }
 
+const kanbanCancelSessionPyScript = `
+import os, signal, sqlite3, subprocess, sys, time
+
+db_path, session_id = sys.argv[1], sys.argv[2]
+settled = ("done", "archived", "completed", "blocked", "failed", "gave_up", "canceled", "cancelled")
+settled_sql = ",".join(f"'{s}'" for s in settled)
+now = int(time.time())
+card_ids = []
+if os.path.exists(db_path):
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(tasks)")}
+        sess_col = "session_id" if "session_id" in cols else ("origin_session_id" if "origin_session_id" in cols else "source_session_id")
+        rows = conn.execute(
+            f"SELECT id FROM tasks WHERE {sess_col} = ? AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})",
+            (session_id,),
+        ).fetchall()
+        card_ids = [r[0] for r in rows if r and r[0]]
+        if card_ids and "parent_id" in cols:
+            ph = ",".join("?" for _ in card_ids)
+            child_rows = conn.execute(
+                f"SELECT id FROM tasks WHERE parent_id IN ({ph}) AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})",
+                card_ids,
+            ).fetchall()
+            for cr in child_rows:
+                if cr and cr[0] and cr[0] not in card_ids:
+                    card_ids.append(cr[0])
+        if card_ids:
+            ph = ",".join("?" for _ in card_ids)
+            err_col = "error" if "error" in cols else ("err" if "err" in cols else None)
+            upd_cols = ["status = 'canceled'"]
+            upd_params = []
+            if "updated_at" in cols:
+                upd_cols.append("updated_at = ?")
+                upd_params.append(now)
+            if err_col:
+                upd_cols.append(f"{err_col} = 'Canceled by user (A2A task stopped)'")
+            conn.execute(f"UPDATE tasks SET {', '.join(upd_cols)} WHERE id IN ({ph})", upd_params + card_ids)
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+for cid in card_ids:
+    try:
+        subprocess.run(["pkill", "-TERM", "-f", f"/kanban/workspaces/{cid}"], check=False, timeout=2)
+    except Exception:
+        pass
+`
+
+func (b *Bridge) sessionIDForContext(contextID string) string {
+	base := apiSessionID(contextID)
+	b.kanbanMu.Lock()
+	defer b.kanbanMu.Unlock()
+	if epoch := b.sessionEpochs[contextID]; epoch > 0 {
+		return fmt.Sprintf("%s-e%d", base, epoch)
+	}
+	return base
+}
+
+func (b *Bridge) markSessionCanceled(contextID, sessionID string) {
+	b.kanbanMu.Lock()
+	if b.kanbanCanceledSessions == nil {
+		b.kanbanCanceledSessions = make(map[string]bool)
+	}
+	b.kanbanCanceledSessions[sessionID] = true
+	if b.sessionEpochs == nil {
+		b.sessionEpochs = make(map[string]int)
+	}
+	if contextID != "" {
+		b.sessionEpochs[contextID]++
+	}
+	b.kanbanMu.Unlock()
+
+	go b.abortCanceledSessionKanbanCards(sessionID)
+}
+
+func (b *Bridge) abortCanceledSessionKanbanCards(sessionID string) {
+	dbPath := resolveKanbanDBPath()
+	if dbPath == "" || sessionID == "" {
+		return
+	}
+	pythonBin := resolvePythonBin()
+	for i := 0; i < 4; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = exec.CommandContext(ctx, pythonBin, "-c", kanbanCancelSessionPyScript, dbPath, sessionID).Run()
+		cancel()
+		if i < 3 {
+			time.Sleep(1500 * time.Millisecond)
+		}
+	}
+}
+
 func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) {
 	if sessionID == "" || origin == nil {
 		return
@@ -793,7 +895,7 @@ func (b *Bridge) isKanbanCardDelivered(cardID string) bool {
 func (b *Bridge) shouldDeliverOutOfTurnKanbanCard(cardID, sessionID string) (consoleSessionMeta, bool) {
 	b.kanbanMu.Lock()
 	defer b.kanbanMu.Unlock()
-	if b.kanbanDeliveredIDs[cardID] {
+	if b.kanbanDeliveredIDs[cardID] || b.kanbanCanceledSessions[sessionID] {
 		return consoleSessionMeta{}, false
 	}
 	if b.kanbanActiveWaits[sessionID] > 0 {
@@ -865,28 +967,7 @@ func inferKanbanCardVerdict(c kanbanCardRow) string {
 	if v := strings.TrimSpace(c.Verdict); v != "" {
 		return strings.ToLower(v)
 	}
-	st := strings.ToLower(strings.TrimSpace(c.Status))
-	switch st {
-	case "blocked", "failed", "gave_up", "canceled", "cancelled":
-		return st
-	}
-	leadLine := ""
-	for _, line := range strings.Split(formatKanbanCardOutput(c), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			leadLine = strings.ToLower(line)
-			break
-		}
-	}
-	switch {
-	case strings.Contains(leadLine, "unhealthy") || strings.Contains(leadLine, "critical"):
-		return "unhealthy"
-	case strings.Contains(leadLine, "is degraded") || strings.Contains(leadLine, "status: degraded") || strings.HasPrefix(leadLine, "degraded"):
-		return "degraded"
-	case strings.Contains(leadLine, "healthy") || strings.Contains(leadLine, "all nodes ready"):
-		return "healthy"
-	}
-	if st != "" {
+	if st := strings.ToLower(strings.TrimSpace(c.Status)); st != "" {
 		return st
 	}
 	return "completed"
@@ -946,9 +1027,6 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	}
 	run.answerHeld = false
 	run.mu.Unlock()
-
-	b.beginKanbanWait(sessionID)
-	defer b.endKanbanWait(sessionID)
 
 	act.inTurn.Store(false)
 	act.waitingCard.Store(true)

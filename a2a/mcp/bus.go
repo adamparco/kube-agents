@@ -711,6 +711,36 @@ func (s *BusSession) ingestA2AMessage(subject string, data []byte, isLive bool) 
 	}
 }
 
+func (s *BusSession) isContextOrParentCanceledLocked(rec *TaskRecord) bool {
+	if rec == nil {
+		return false
+	}
+	if rec.State == lib.StateCanceled {
+		return true
+	}
+	if strings.HasPrefix(rec.TaskID, cardTaskIDPrefix) {
+		if parentID := firstNonEmptyStr(rec.CardParentTaskID, rec.DelegatedFromTaskID); parentID != "" {
+			if p, ok := s.tasks[parentID]; ok && (p.State == lib.StateCanceled || p.State == lib.StateCompleted) {
+				return true
+			}
+		}
+		if rec.ContextID != "" {
+			var latest *TaskRecord
+			for _, other := range s.tasks {
+				if other != rec && other.ContextID == rec.ContextID && !strings.HasPrefix(other.TaskID, cardTaskIDPrefix) {
+					if latest == nil || other.CreatedAt.After(latest.CreatedAt) {
+						latest = other
+					}
+				}
+			}
+			if latest != nil && (latest.State == lib.StateCanceled || latest.State == lib.StateCompleted) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool) {
 	var env lib.Envelope
 	if err := json.Unmarshal(data, &env); err != nil || env.TaskID == "" {
@@ -851,7 +881,7 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 				}
 			}
 			if isLive && s.bootstrapped && !watched {
-				if rec.Terminal && !prevTerminal {
+				if rec.Terminal && !prevTerminal && !s.isContextOrParentCanceledLocked(rec) {
 					kind := eventKindTaskCompleted
 					title := fmt.Sprintf("Task %s (%s) %s", rec.TaskID, rec.Addressee, rec.State)
 					if rec.State == lib.StateFailed || rec.State == lib.StateRejected || rec.State == lib.StateCanceled {
@@ -2522,7 +2552,7 @@ func backfillActivityWorkers(list []ActivityItem) {
 			title := cleanShortCardTitle(rawTitle)
 			assignee, _ := m["assignee"].(string)
 			assignee = strings.ToLower(strings.TrimSpace(assignee))
-			cluster := strings.ToLower(extractClusterFromText(rawTitle + " " + assignee))
+			cluster := strings.ToLower(extractClusterFromAssignee(assignee))
 			if cid != "" {
 				if title != "" {
 					cardTitles[cid] = title
@@ -2634,26 +2664,12 @@ func cleanShortCardTitle(title string) string {
 		return ""
 	}
 	lower := strings.ToLower(title)
-	for _, p := range []string{
-		"live health check for ",
-		"live health check: ",
-		"health check for ",
-		"health check: ",
-		"check health of ",
-		"check live health of ",
-		"inspect ",
-	} {
-		if strings.HasPrefix(lower, p) {
-			trimmed := strings.TrimSpace(title[len(p):])
-			if trimmed != "" {
-				return truncateText(trimmed, 48)
+	for _, sep := range []string{" for ", ": "} {
+		if idx := strings.LastIndex(lower, sep); idx >= 0 && idx+len(sep) < len(title) {
+			candidate := strings.TrimSpace(title[idx+len(sep):])
+			if candidate != "" && !strings.Contains(candidate, " ") {
+				return truncateText(candidate, 48)
 			}
-		}
-	}
-	if idx := strings.LastIndex(title, ": "); idx >= 0 && idx+2 < len(title) {
-		trimmed := strings.TrimSpace(title[idx+2:])
-		if trimmed != "" {
-			return truncateText(trimmed, 48)
 		}
 	}
 	return truncateText(title, 48)
