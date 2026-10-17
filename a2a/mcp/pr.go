@@ -19,6 +19,7 @@ import (
 const (
 	githubHost               = "github.com"
 	githubAPIBaseURL         = "https://api.github.com"
+	prStateMerged            = "MERGED"
 	githubPRURLPrefix        = "https://github.com/"
 	githubPRURLFormat        = "https://github.com/%s/pull/%d"
 	githubAPIPRFormat        = "%s/repos/%s/pulls/%d"
@@ -259,6 +260,8 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		Number       int    `json:"number"`
 		Title        string `json:"title"`
 		State        string `json:"state"`
+		Merged       bool   `json:"merged"`
+		MergedAt     string `json:"merged_at"`
 		HTMLURL      string `json:"html_url"`
 		Body         string `json:"body"`
 		Additions    int    `json:"additions"`
@@ -278,11 +281,17 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		return nil, err
 	}
 
+	// GitHub reports merged PRs as state "closed" with merged=true; a user reading "CLOSED" assumes
+	// the change was rejected (soak round 13), so surface MERGED explicitly.
+	state := strings.ToUpper(payload.State)
+	if payload.Merged || strings.TrimSpace(payload.MergedAt) != "" {
+		state = prStateMerged
+	}
 	insp := &PRInspection{
 		Repo:         repo,
 		Number:       num,
 		Title:        payload.Title,
-		State:        strings.ToUpper(payload.State),
+		State:        state,
 		Author:       payload.User.Login,
 		URL:          firstNonEmptyStr(payload.HTMLURL, fmt.Sprintf(githubPRURLFormat, repo, num)),
 		HeadRef:      payload.Head.Ref,
