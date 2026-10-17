@@ -49,6 +49,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+		os.Exit(errExitCode)
+	}()
 
 	if err := srv.ServeStdio(ctx, os.Stdin, rpcOut); err != nil {
 		fmt.Fprintf(os.Stderr, "kube-agents-mcp: %v\n", err)
