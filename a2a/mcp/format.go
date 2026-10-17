@@ -2331,7 +2331,25 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		sb.WriteString("#### 🛠️ Tool Activity Stream\n\n")
 		sb.WriteString("| # | Time | Worker / Card | Tool | Status | Duration | Arguments | Result / Error Preview |\n")
 		sb.WriteString("| ---: | :--- | :--- | :--- | :--- | ---: | :--- | :--- |\n")
+		maxInputChars := 240
+		maxPreviewChars := 180
+		if len(rec.Activities) > 50 {
+			maxInputChars = 120
+			maxPreviewChars = 100
+		}
+		const (
+			maxDebugTableRows = 80
+			headDebugRows     = 25
+			tailDebugRows     = 55
+		)
 		for i, act := range rec.Activities {
+			if len(rec.Activities) > maxDebugTableRows && i >= headDebugRows && i < len(rec.Activities)-tailDebugRows {
+				if i == headDebugRows {
+					omitted := len(rec.Activities) - headDebugRows - tailDebugRows
+					fmt.Fprintf(&sb, "| … | — | — | *(%d intermediate tool calls)* | — | — | *See per-step expandable cards above* | — |\n", omitted)
+				}
+				continue
+			}
 			idx := act.Index
 			if idx <= 0 {
 				idx = i + 1
@@ -2360,17 +2378,17 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 			}
 			inputClean := strings.ReplaceAll(strings.TrimSpace(act.Input), "\n", " ")
 			inputClean = strings.ReplaceAll(inputClean, "|", "\\|")
-			inputClean = truncateText(inputClean, 240)
+			inputClean = truncateText(inputClean, maxInputChars)
 
 			previewClean := "—"
 			if act.ErrorMessage != "" {
 				errClean := strings.ReplaceAll(strings.TrimSpace(act.ErrorMessage), "\n", " ")
 				errClean = strings.ReplaceAll(errClean, "|", "\\|")
-				previewClean = fmt.Sprintf("❌ `%s`", truncateText(errClean, 180))
+				previewClean = fmt.Sprintf("❌ `%s`", truncateText(errClean, maxPreviewChars))
 			} else if act.ResultPreview != "" {
 				resClean := strings.ReplaceAll(strings.TrimSpace(act.ResultPreview), "\n", " ")
 				resClean = strings.ReplaceAll(resClean, "|", "\\|")
-				previewClean = fmt.Sprintf("`%s`", truncateText(resClean, 180))
+				previewClean = fmt.Sprintf("`%s`", truncateText(resClean, maxPreviewChars))
 			}
 			fmt.Fprintf(&sb, "| %d | %s | %s | `%s` | `%s` | %s | `%s` | %s |\n",
 				idx, timeStr, strings.ReplaceAll(workerStr, "|", "\\|"), act.Tool, statusStr, durStr, firstNonEmptyStr(inputClean, "—"), previewClean)
@@ -2393,7 +2411,7 @@ func FormatTaskRecordMarkdownWithOptions(rec *TaskRecord, titlePrefix string, de
 		if len(rec.IntermediateTurns) > 0 {
 			sb.WriteString("\n#### 🔄 Intermediate Turns\n")
 			for _, t := range rec.IntermediateTurns {
-				fmt.Fprintf(&sb, "> %s\n\n", strings.TrimSpace(t))
+				fmt.Fprintf(&sb, "> %s\n\n", truncateText(strings.TrimSpace(t), 1200))
 			}
 		}
 		sb.WriteString("\n</details>\n\n")

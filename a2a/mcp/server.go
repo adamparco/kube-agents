@@ -637,28 +637,51 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 	switch action {
 	case actionList:
 		snap := s.store.Snapshot()
+		activeConv := s.conversationFor(ctx, "", "")
+		activeAlias := firstNonEmptyStr(activeConv.Alias, snap.ActiveConversation)
 		var sb strings.Builder
 		sb.WriteString("## 💬 Saved Kube-Agents Conversations & Sessions\n\n")
-		fmt.Fprintf(&sb, "- **Debug Mode (Tool Calls & Timings)**: `%v`\n\n", snap.DebugMode)
+		fmt.Fprintf(&sb, "- **Active Conversation**: **`%s`** (`console:%s`)\n", activeAlias, firstNonEmptyStr(activeConv.Token, activeAlias))
+		fmt.Fprintf(&sb, "- **Debug Mode (Active Conversation)**: `%v`\n\n", s.store.DebugModeFor(activeAlias))
 		sb.WriteString("| Active | Alias | Console Token | Mode | Last Used | Description |\n")
 		sb.WriteString("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
-		aliases := make([]string, 0, len(snap.Conversations))
-		for k := range snap.Conversations {
-			aliases = append(aliases, k)
+		var namedAliases, autoAliases []string
+		for k, c := range snap.Conversations {
+			if strings.HasPrefix(k, "jetski-") && k != activeAlias && !c.SessionMode && !c.DebugMode {
+				autoAliases = append(autoAliases, k)
+			} else {
+				namedAliases = append(namedAliases, k)
+			}
 		}
-		sort.Strings(aliases)
-		for _, a := range aliases {
+		sort.Strings(namedAliases)
+		sort.Slice(autoAliases, func(i, j int) bool {
+			return snap.Conversations[autoAliases[i]].LastUsedAt.After(snap.Conversations[autoAliases[j]].LastUsedAt)
+		})
+		const maxAutoShown = 8
+		omittedAuto := 0
+		if len(autoAliases) > maxAutoShown {
+			omittedAuto = len(autoAliases) - maxAutoShown
+			autoAliases = autoAliases[:maxAutoShown]
+		}
+		allShown := append(namedAliases, autoAliases...)
+		for _, a := range allShown {
 			c := snap.Conversations[a]
 			act := badgeStandby
-			if a == snap.ActiveConversation {
+			if a == activeAlias {
 				act = badgeActive
 			}
 			mLabel := "`platform`"
 			if c.SessionMode {
 				mLabel = "`/session` (persistent worker)"
 			}
+			if c.DebugMode {
+				mLabel += " (🐞 `debug`)"
+			}
 			fmt.Fprintf(&sb, "| %s | **`%s`** | `console:%s` | %s | `%s` | %s |\n",
 				act, c.Alias, c.Token, mLabel, c.LastUsedAt.Format(time.RFC3339), firstNonEmptyStr(c.Description, "—"))
+		}
+		if omittedAuto > 0 {
+			fmt.Fprintf(&sb, "\n*(+ %d older idle auto-bound `jetski-*` conversations omitted)*\n", omittedAuto)
 		}
 		return sb.String(), nil
 
@@ -743,17 +766,42 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		if strings.TrimSpace(targetAlias) != "" {
 			conv, _ = s.store.EnsureConversation(targetAlias, false, "")
 		}
-		tasks := sess.ListTasks(conv.Token, false, defaultTaskListLimit)
+		rawTasks := sess.ListTasks(conv.Token, false, defaultTaskListLimit)
+		var tasks []*TaskRecord
+		for _, t := range rawTasks {
+			if t != nil && t.CardParentTaskID == "" {
+				tasks = append(tasks, t)
+			}
+		}
 		if len(tasks) == 0 {
 			return fmt.Sprintf("No tasks recorded yet on conversation **`%s`** (`console:%s`).", conv.Alias, conv.Token), nil
 		}
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
-		for i := len(tasks) - 1; i >= 0; i-- {
+		const maxTranscriptBytes = 24 * 1024
+		// Render newest-last, but ensure the newest turns are never dropped if the transcript is long:
+		var sections []string
+		totalBytes := sb.Len()
+		omittedOlder := 0
+		for i := 0; i < len(tasks); i++ {
 			t := tasks[i]
-			fmt.Fprintf(&sb, "### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
-			sb.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
-			sb.WriteString("\n---\n")
+			var sec strings.Builder
+			fmt.Fprintf(&sec, "### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
+			sec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
+			sec.WriteString("\n---\n")
+			sStr := sec.String()
+			if len(sections) > 0 && totalBytes+len(sStr) > maxTranscriptBytes {
+				omittedOlder = len(tasks) - i
+				break
+			}
+			sections = append(sections, sStr)
+			totalBytes += len(sStr)
+		}
+		if omittedOlder > 0 {
+			fmt.Fprintf(&sb, "*(%d older task(s) omitted to keep transcript concise; use `task_control` `action: \"list\"` to inspect earlier task IDs)*\n\n---\n", omittedOlder)
+		}
+		for i := len(sections) - 1; i >= 0; i-- {
+			sb.WriteString(sections[i])
 		}
 		return sb.String(), nil
 
