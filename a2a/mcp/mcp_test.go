@@ -2040,4 +2040,3 @@ func TestBoundedSessionMapEvictionAndGenericStepFallback(t *testing.T) {
 		t.Fatalf("unexpected fallback steps: %q", synth)
 	}
 }
-

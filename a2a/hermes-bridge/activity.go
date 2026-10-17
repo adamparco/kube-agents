@@ -52,7 +52,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -500,31 +499,20 @@ type activityState struct {
 	// to check a session's delivery against.
 	traced bool
 
-	mu                sync.Mutex
-	open              map[string]ActivityEntry // calls started and not yet ended
-	openOrder         []string                 // their ids, in start order
-	seen              map[string]struct{}      // delivery ids, so a hermes retry is one call
-	seenRing          []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
-	seenNext          int
-	calls             int
-	apiCalls          int
-	published         int // trace parts sent, against the budget less the reserve
-	heartbeats        int // progress parts sent, against the reserve
-	thinkingPublished int // thinking parts sent, against activityThinkingBudget
-	dropped           int // calls past the trace's share, reported once at the terminal
-	lastTool          string
-	lastThinking      string
-	prevThinking      string
-	startedAt         time.Time
-	appended          map[string]bool   // artifact name -> a first part went out
-	sessionCards      map[string]string // worker sessionID -> cardID
-	sessionProfiles   map[string]string // worker sessionID -> hermes profile name
-	cardTitles        map[string]string // cardID -> short cluster/card title
-	cardAssignees     map[string]string // lower(assignee) -> cardID
-	cardClusters      map[string]string // lower(cluster/shortTitle) -> cardID
-	claimedSessions   map[string]bool   // worker sessionID claimed by this task
-	pendingAssignees  []string          // lower(assignee) seen on pre_tool_call before cardID is known
-	pendingClusters   []string          // lower(cluster) seen on pre_tool_call before cardID is known
+	mu         sync.Mutex
+	open       map[string]ActivityEntry // calls started and not yet ended
+	openOrder  []string                 // their ids, in start order
+	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
+	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
+	seenNext   int
+	calls      int
+	published  int // trace parts sent, against the budget less the reserve
+	heartbeats int // progress parts sent, against the reserve
+	dropped    int // calls past the trace's share, reported once at the terminal
+	lastTool   string
+	startedAt  time.Time
+	appended   map[string]bool // artifact name -> a first part went out
+	trace      sessionTrace
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -536,18 +524,12 @@ type activityState struct {
 
 func newActivityState(withKey bool) *activityState {
 	a := &activityState{
-		open:            make(map[string]ActivityEntry),
-		seen:            make(map[string]struct{}),
-		startedAt:       time.Now(),
-		appended:        make(map[string]bool),
-		sessionCards:    make(map[string]string),
-		sessionProfiles: make(map[string]string),
-		cardTitles:      make(map[string]string),
-		cardAssignees:   make(map[string]string),
-		cardClusters:    make(map[string]string),
-		claimedSessions: make(map[string]bool),
-		stop:            make(chan struct{}),
-		done:            make(chan struct{}),
+		open:      make(map[string]ActivityEntry),
+		seen:      make(map[string]struct{}),
+		startedAt: time.Now(),
+		appended:  make(map[string]bool),
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
@@ -652,7 +634,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.lastThinking = ""
+	a.trace.lastThinking = ""
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
 			return ActivityEntry{}, false
@@ -673,84 +655,31 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	}
 	switch d.Event {
 	case hookPostAPIRequest:
-		a.apiCalls++
-		if a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID && !a.waitingCard.Load() {
-			return ActivityEntry{}, false
-		}
-		isWorker := a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID
-		if isWorker {
-			a.observeWorkerHookContextLocked(d)
-		}
-		cand := formatAPIRequestThinkingWithMode(d, a.apiCalls, a.calls, a.sessionID != "")
-		if (isWorker || a.cardsFiled.Load()) && cand == "Synthesizing findings into final response." {
-			cand = ""
-		}
-		if isWorker && cand != "" {
-			cand = a.qualifyWorkerThinkingLocked(d.SessionID, cand)
-		}
-		if cand != "" && cand != a.prevThinking {
-			a.lastThinking = cand
-			a.prevThinking = cand
-		}
+		a.observePostAPIRequestLocked(d)
 		return ActivityEntry{}, false
 	case hookPreToolCall:
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
-		inp := redactInput(d.ToolName, d.ToolInput)
-		var sessID, worker string
-		if a.sessionID != "" {
-			inp = redactInputDetailed(d.ToolName, d.ToolInput)
-			a.observeWorkerHookContextLocked(d)
-			a.observeCardBindingLocked(d.SessionID, d.ToolName, d.ToolInput, "")
-			sessID = capRunes(d.SessionID, activityCallIDCap)
-			worker = a.workerLabelLocked(d.SessionID, d.ToolName, d.ToolInput, "")
+		entry := ActivityEntry{
+			Tool:   capRunes(d.ToolName, activityToolNameCap),
+			Input:  redactInput(d.ToolName, d.ToolInput),
+			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
+			At:     capRunes(d.Timestamp, activityWordCap),
 		}
-		a.open[id] = ActivityEntry{
-			Tool:      capRunes(d.ToolName, activityToolNameCap),
-			Input:     inp,
-			CallID:    capRunes(d.Extra.ToolCallID, activityCallIDCap),
-			SessionID: sessID,
-			Worker:    worker,
-			At:        capRunes(d.Timestamp, activityWordCap),
-		}
+		a.enrichPreToolCallLocked(d, &entry)
+		a.open[id] = entry
 		return ActivityEntry{}, false
 	case hookPostToolCall:
-		openEntry, seen := a.open[id]
-		if seen {
-			delete(a.open, id)
-			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
-		} else if a.sessionID != "" && d.SessionID != "" {
-			fallbackTool := capRunes(d.ToolName, activityToolNameCap)
-			for _, openID := range a.openOrder {
-				oe := a.open[openID]
-				if oe.SessionID == d.SessionID && oe.Tool == fallbackTool {
-					openEntry = oe
-					delete(a.open, openID)
-					a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == openID })
-					break
-				}
-			}
-		}
+		openEntry := a.popOpenCallLocked(id, d)
 		a.calls++
-		rawToolInput := d.ToolInput
-		if len(rawToolInput) == 0 && len(openEntry.Input) > 0 {
-			rawToolInput = openEntry.Input
-		}
 		status := activityStatus(d)
-		if status != ActivityStatusError && (d.ToolName == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
+		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
 			a.cardsFiled.Store(true)
-		}
-		inp := redactInput(d.ToolName, d.ToolInput)
-		if a.sessionID != "" {
-			inp = redactInputDetailed(d.ToolName, d.ToolInput)
-		}
-		if len(inp) == 0 && len(openEntry.Input) > 0 {
-			inp = openEntry.Input
 		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
-			Input:      inp,
+			Input:      redactInput(d.ToolName, d.ToolInput),
 			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -759,19 +688,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
-		if a.sessionID != "" {
-			a.observeWorkerHookContextLocked(d)
-			resPreview, errMsg, createdCardID := summarizeToolResult(d.ToolName, status, d.Extra.ErrorMessage, d.Extra.Result)
-			a.observeCardBindingLocked(d.SessionID, d.ToolName, rawToolInput, createdCardID)
-			e.SessionID = capRunes(d.SessionID, activityCallIDCap)
-			e.Worker = a.workerLabelLocked(d.SessionID, d.ToolName, rawToolInput, createdCardID)
-			if status == ActivityStatusError && errMsg != "" {
-				e.ErrorMessage = capRunes(errMsg, 320)
-			}
-			if resPreview != "" {
-				e.ResultPreview = capRunes(resPreview, 320)
-			}
-		}
+		a.enrichPostToolCallLocked(d, openEntry, status, &e)
 		return e, true
 	}
 	return ActivityEntry{}, false
@@ -1438,7 +1355,7 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 			return r
 		}
 	}
-	return matchWorkerDeliveryRun(runs, d, body)
+	return matchWorkerDeliveryRun(runs, d)
 }
 
 // --- the heartbeat ---

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -25,101 +26,23 @@ const (
 	hermesVenvPythonPath      = "/opt/hermes/.venv/bin/python3"
 	maxTrackedKanbanEntries   = 2048
 
-	// Card synthesis (synthesizeCardAnswer).
-	cardAnswerSubstantiveChars = 600             // a model answer at least this long already synthesized its cards
-	cardSynthesisInputCap      = 120 << 10       // raw card text handed to the synthesis turn
-	cardSynthesisTimeout       = 4 * time.Minute // one extra model turn; falls back on expiry
-	cardTurnArtifactStride     = 1000            // keeps card-dump turn artifact ids clear of real turn numbers
+	cardAnswerSubstantiveChars = 600
+	cardSynthesisInputCap      = 120 << 10
+	cardSynthesisTimeout       = 4 * time.Minute
+	cardTurnArtifactStride     = 1000
 	cardResultsHeader          = "Specialist card results (raw):\n\n"
 	silentSentinel             = "[SILENT]"
 )
 
-const kanbanPollPyScript = `
-import json, sqlite3, sys
-db_path, session_id, since_ts = sys.argv[1], sys.argv[2], float(sys.argv[3])
-tracked = [x for x in (sys.argv[4].split(",") if len(sys.argv) > 4 and sys.argv[4] else []) if x]
-conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-conn.row_factory = sqlite3.Row
-cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id"
-err_col = "last_failure_error" if "last_failure_error" in cols else "''"
-assignee_col = "assignee" if "assignee" in cols else "''"
-settled = ("done", "archived", "completed", "blocked", "failed", "gave_up", "canceled", "cancelled")
-settled_sql = ",".join(repr(s) for s in settled)
-if session_id == "*":
-    rows = conn.execute(
-        f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
-        f"FROM tasks WHERE {sess_col} LIKE 'a2a-%' AND (created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})) "
-        f"ORDER BY created_at ASC, id ASC",
-        (since_ts,),
-    ).fetchall()
-else:
-    conds = ["created_at >= ?"]
-    params = [session_id, since_ts]
-    if tracked:
-        conds.append(f"id IN ({','.join('?' for _ in tracked)})")
-        params.extend(tracked)
-    rows = conn.execute(
-        f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err "
-        f"FROM tasks WHERE {sess_col} = ? AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC",
-        params,
-    ).fetchall()
-
-run_cols = set()
-try:
-    run_cols = {c[1] for c in conn.execute("PRAGMA table_info(task_runs)")}
-except Exception:
-    pass
-ws_col = "session_id" if "session_id" in run_cols else ("worker_session_id" if "worker_session_id" in run_cols else "''")
-verd_col = "verdict" if "verdict" in run_cols else "''"
-meta_col = "metadata" if "metadata" in run_cols else "''"
-
-out = []
-for r in rows:
-    item = dict(r)
-    if run_cols:
-        try:
-            run_row = conn.execute(
-                f"SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error, COALESCE({ws_col}, '') AS worker_session_id, COALESCE({verd_col}, '') AS verdict, COALESCE({meta_col}, '') AS metadata "
-                "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-                (r["id"],),
-            ).fetchone()
-            if run_row:
-                if not item["result"] and run_row["summary"]:
-                    item["result"] = run_row["summary"]
-                if not item["err"] and run_row["error"]:
-                    item["err"] = run_row["error"]
-                if run_row["worker_session_id"]:
-                    item["worker_session_id"] = run_row["worker_session_id"]
-                if run_row["verdict"]:
-                    item["verdict"] = run_row["verdict"]
-                if run_row["metadata"]:
-                    try:
-                        meta = json.loads(run_row["metadata"])
-                        if isinstance(meta, dict):
-                            if not item.get("worker_session_id") and meta.get("worker_session_id"):
-                                item["worker_session_id"] = str(meta["worker_session_id"])
-                            if not item.get("verdict"):
-                                for vk in ("health_status", "verdict", "status"):
-                                    if meta.get(vk):
-                                        item["verdict"] = str(meta[vk])
-                                        break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    try:
-        ev_row = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'gave_up') ORDER BY id DESC LIMIT 1",
-            (r["id"],),
-        ).fetchone()
-        if ev_row and ev_row[0]:
-            item["block_payload"] = ev_row[0]
-    except Exception:
-        pass
-    out.append(item)
-print(json.dumps(out))
-`
+type kanbanTracker struct {
+	mu               sync.Mutex
+	activeWaits      map[string]int
+	deliveredIDs     map[string]bool
+	pendingSettle    map[string]int
+	canceledSessions map[string]bool
+	sessionEpochs    map[string]int
+	consoleSessions  map[string]consoleSessionMeta
+}
 
 type kanbanCardRow struct {
 	ID              string `json:"id"`
@@ -140,97 +63,156 @@ type consoleSessionMeta struct {
 	Authority     json.RawMessage
 }
 
-const kanbanCancelSessionPyScript = `
-import os, re, sqlite3, subprocess, sys, time
+const kanbanDBPyScript = `
+import json, os, re, sqlite3, subprocess, sys, time
 
-db_path, session_id = sys.argv[1], sys.argv[2]
+mode, db_path, session_id = sys.argv[1], sys.argv[2], sys.argv[3]
 settled = ("done", "archived", "completed", "blocked", "failed", "gave_up", "canceled", "cancelled")
-settled_sql = ",".join(f"'{s}'" for s in settled)
-now = int(time.time())
-card_ids = []
-if os.path.exists(db_path):
+settled_sql = ",".join(repr(s) for s in settled)
+
+if mode == "cancel":
+    if not os.path.exists(db_path):
+        sys.exit(0)
+    card_ids = []
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         cols = {c[1] for c in conn.execute("PRAGMA table_info(tasks)")}
-        sess_col = "creator_session_id" if "creator_session_id" in cols else ("session_id" if "session_id" in cols else ("origin_session_id" if "origin_session_id" in cols else "source_session_id"))
-        rows = conn.execute(
-            f"SELECT id FROM tasks WHERE {sess_col} = ? AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})",
-            (session_id,),
-        ).fetchall()
+        sess_col = "creator_session_id" if "creator_session_id" in cols else ("session_id" if "session_id" in cols else "origin_session_id")
+        rows = conn.execute(f"SELECT id FROM tasks WHERE {sess_col} = ? AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})", (session_id,)).fetchall()
         card_ids = [r[0] for r in rows if r and r[0]]
         if card_ids and "parent_id" in cols:
             ph = ",".join("?" for _ in card_ids)
-            child_rows = conn.execute(
-                f"SELECT id FROM tasks WHERE parent_id IN ({ph}) AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})",
-                card_ids,
-            ).fetchall()
-            for cr in child_rows:
+            for cr in conn.execute(f"SELECT id FROM tasks WHERE parent_id IN ({ph}) AND LOWER(COALESCE(status, '')) NOT IN ({settled_sql})", card_ids).fetchall():
                 if cr and cr[0] and cr[0] not in card_ids:
                     card_ids.append(cr[0])
         if card_ids:
             ph = ",".join("?" for _ in card_ids)
-            err_col = "last_failure_error" if "last_failure_error" in cols else ("error" if "error" in cols else ("err" if "err" in cols else None))
-            upd_cols = ["status = 'canceled'"]
-            upd_params = []
+            upd, params = ["status = 'canceled'"], []
             if "updated_at" in cols:
-                upd_cols.append("updated_at = ?")
-                upd_params.append(now)
+                upd.append("updated_at = ?")
+                params.append(int(time.time()))
+            err_col = next((c for c in ("last_failure_error", "error", "err") if c in cols), None)
             if err_col:
-                upd_cols.append(f"{err_col} = 'Canceled by user (A2A task stopped)'")
-            conn.execute(f"UPDATE tasks SET {', '.join(upd_cols)} WHERE id IN ({ph})", upd_params + card_ids)
+                upd.append(f"{err_col} = 'Canceled by user (A2A task stopped)'")
+            conn.execute(f"UPDATE tasks SET {', '.join(upd)} WHERE id IN ({ph})", params + card_ids)
             conn.commit()
         conn.close()
     except Exception:
         pass
+    for cid in card_ids:
+        if re.fullmatch(r"t_[A-Za-z0-9_-]{1,64}", str(cid)):
+            try:
+                subprocess.run(["pkill", "-TERM", "-f", f"/kanban/workspaces/{cid}"], check=False, timeout=2)
+            except Exception:
+                pass
+    sys.exit(0)
 
-for cid in card_ids:
-    if not re.fullmatch(r"t_[A-Za-z0-9_-]{1,64}", str(cid)):
-        continue
+since_ts = float(sys.argv[4])
+tracked = [x for x in (sys.argv[5].split(",") if len(sys.argv) > 5 and sys.argv[5] else []) if x]
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+conn.row_factory = sqlite3.Row
+cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id"
+err_col = "last_failure_error" if "last_failure_error" in cols else "''"
+assignee_col = "assignee" if "assignee" in cols else "''"
+select_sql = f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err FROM tasks"
+if session_id == "*":
+    rows = conn.execute(f"{select_sql} WHERE {sess_col} LIKE 'a2a-%' AND (created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})) ORDER BY created_at ASC, id ASC", (since_ts,)).fetchall()
+else:
+    conds, params = ["created_at >= ?"], [session_id, since_ts]
+    if tracked:
+        conds.append(f"id IN ({','.join('?' for _ in tracked)})")
+        params.extend(tracked)
+    rows = conn.execute(f"{select_sql} WHERE {sess_col} = ? AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC", params).fetchall()
+
+run_cols = set()
+try:
+    run_cols = {c[1] for c in conn.execute("PRAGMA table_info(task_runs)")}
+except Exception:
+    pass
+ws_col = "session_id" if "session_id" in run_cols else ("worker_session_id" if "worker_session_id" in run_cols else "''")
+verd_col = "verdict" if "verdict" in run_cols else "''"
+meta_col = "metadata" if "metadata" in run_cols else "''"
+
+out = []
+for r in rows:
+    item = dict(r)
+    if run_cols:
+        try:
+            rr = conn.execute(
+                f"SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error, COALESCE({ws_col}, '') AS worker_session_id, COALESCE({verd_col}, '') AS verdict, COALESCE({meta_col}, '') AS metadata "
+                "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (r["id"],)
+            ).fetchone()
+            if rr:
+                item["result"] = item["result"] or rr["summary"]
+                item["err"] = item["err"] or rr["error"]
+                if rr["worker_session_id"]:
+                    item["worker_session_id"] = rr["worker_session_id"]
+                if rr["verdict"]:
+                    item["verdict"] = rr["verdict"]
+                if rr["metadata"]:
+                    meta = json.loads(rr["metadata"])
+                    if isinstance(meta, dict):
+                        if not item.get("worker_session_id") and meta.get("worker_session_id"):
+                            item["worker_session_id"] = str(meta["worker_session_id"])
+                        if not item.get("verdict"):
+                            for vk in ("health_status", "verdict", "status"):
+                                if meta.get(vk):
+                                    item["verdict"] = str(meta[vk])
+                                    break
+        except Exception:
+            pass
     try:
-        subprocess.run(["pkill", "-TERM", "-f", f"/kanban/workspaces/{cid}"], check=False, timeout=2)
+        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'gave_up') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        if ev and ev[0]:
+            item["block_payload"] = ev[0]
     except Exception:
         pass
+    out.append(item)
+print(json.dumps(out))
 `
 
-func (b *Bridge) pruneKanbanMapsLocked() {
-	if len(b.kanbanDeliveredIDs) > maxTrackedKanbanEntries {
-		clear(b.kanbanDeliveredIDs)
+func (k *kanbanTracker) ensureMapsLocked() {
+	if k.activeWaits == nil {
+		k.activeWaits = make(map[string]int)
+		k.deliveredIDs = make(map[string]bool)
+		k.pendingSettle = make(map[string]int)
+		k.canceledSessions = make(map[string]bool)
+		k.sessionEpochs = make(map[string]int)
+		k.consoleSessions = make(map[string]consoleSessionMeta)
 	}
-	if len(b.kanbanCanceledSessions) > maxTrackedKanbanEntries {
-		clear(b.kanbanCanceledSessions)
+	if len(k.deliveredIDs) > maxTrackedKanbanEntries {
+		clear(k.deliveredIDs)
 	}
-	if len(b.sessionEpochs) > maxTrackedKanbanEntries {
-		clear(b.sessionEpochs)
+	if len(k.canceledSessions) > maxTrackedKanbanEntries {
+		clear(k.canceledSessions)
 	}
-	if len(b.consoleSessions) > maxTrackedKanbanEntries {
-		clear(b.consoleSessions)
+	if len(k.sessionEpochs) > maxTrackedKanbanEntries {
+		clear(k.sessionEpochs)
+	}
+	if len(k.consoleSessions) > maxTrackedKanbanEntries {
+		clear(k.consoleSessions)
 	}
 }
 
 func (b *Bridge) sessionIDForContext(contextID string) string {
 	base := apiSessionID(contextID)
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	if epoch := b.sessionEpochs[contextID]; epoch > 0 {
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	if epoch := b.kanban.sessionEpochs[contextID]; epoch > 0 {
 		return fmt.Sprintf("%s-e%d", base, epoch)
 	}
 	return base
 }
 
 func (b *Bridge) markSessionCanceled(contextID, sessionID string) {
-	b.kanbanMu.Lock()
-	b.pruneKanbanMapsLocked()
-	if b.kanbanCanceledSessions == nil {
-		b.kanbanCanceledSessions = make(map[string]bool)
-	}
-	b.kanbanCanceledSessions[sessionID] = true
-	if b.sessionEpochs == nil {
-		b.sessionEpochs = make(map[string]int)
-	}
+	b.kanban.mu.Lock()
+	b.kanban.ensureMapsLocked()
+	b.kanban.canceledSessions[sessionID] = true
 	if contextID != "" {
-		b.sessionEpochs[contextID]++
+		b.kanban.sessionEpochs[contextID]++
 	}
-	b.kanbanMu.Unlock()
+	b.kanban.mu.Unlock()
 
 	go b.abortCanceledSessionKanbanCards(sessionID)
 }
@@ -243,7 +225,7 @@ func (b *Bridge) abortCanceledSessionKanbanCards(sessionID string) {
 	pythonBin := resolvePythonBin()
 	for i := 0; i < 4; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = exec.CommandContext(ctx, pythonBin, "-c", kanbanCancelSessionPyScript, dbPath, sessionID).Run()
+		_ = exec.CommandContext(ctx, pythonBin, "-c", kanbanDBPyScript, "cancel", dbPath, sessionID).Run()
 		cancel()
 		if i < 3 {
 			time.Sleep(1500 * time.Millisecond)
@@ -255,13 +237,10 @@ func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) 
 	if sessionID == "" || origin == nil {
 		return
 	}
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	b.pruneKanbanMapsLocked()
-	if b.consoleSessions == nil {
-		b.consoleSessions = make(map[string]consoleSessionMeta)
-	}
-	b.consoleSessions[sessionID] = consoleSessionMeta{
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	b.kanban.ensureMapsLocked()
+	b.kanban.consoleSessions[sessionID] = consoleSessionMeta{
 		ContextID:     origin.ContextID,
 		CorrelationID: origin.CorrelationID,
 		Authority:     append(json.RawMessage(nil), origin.Authority...),
@@ -269,21 +248,19 @@ func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) 
 }
 
 func (b *Bridge) beginKanbanWait(sessionID string) {
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	if b.kanbanActiveWaits == nil {
-		b.kanbanActiveWaits = make(map[string]int)
-	}
-	b.kanbanActiveWaits[sessionID]++
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	b.kanban.ensureMapsLocked()
+	b.kanban.activeWaits[sessionID]++
 }
 
 func (b *Bridge) endKanbanWait(sessionID string) {
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	if b.kanbanActiveWaits[sessionID] > 0 {
-		b.kanbanActiveWaits[sessionID]--
-		if b.kanbanActiveWaits[sessionID] == 0 {
-			delete(b.kanbanActiveWaits, sessionID)
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	if b.kanban.activeWaits[sessionID] > 0 {
+		b.kanban.activeWaits[sessionID]--
+		if b.kanban.activeWaits[sessionID] == 0 {
+			delete(b.kanban.activeWaits, sessionID)
 		}
 	}
 }
@@ -292,46 +269,37 @@ func (b *Bridge) markKanbanCardDelivered(cardID string) {
 	if cardID == "" {
 		return
 	}
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	b.pruneKanbanMapsLocked()
-	if b.kanbanDeliveredIDs == nil {
-		b.kanbanDeliveredIDs = make(map[string]bool)
-	}
-	b.kanbanDeliveredIDs[cardID] = true
-	delete(b.kanbanPendingSettle, cardID)
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	b.kanban.ensureMapsLocked()
+	b.kanban.deliveredIDs[cardID] = true
+	delete(b.kanban.pendingSettle, cardID)
 }
 
 func (b *Bridge) isKanbanCardDelivered(cardID string) bool {
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	return b.kanbanDeliveredIDs[cardID]
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	return b.kanban.deliveredIDs[cardID]
 }
 
 func (b *Bridge) shouldDeliverOutOfTurnKanbanCard(cardID, sessionID string) (consoleSessionMeta, bool) {
-	b.kanbanMu.Lock()
-	defer b.kanbanMu.Unlock()
-	if b.kanbanDeliveredIDs[cardID] || b.kanbanCanceledSessions[sessionID] {
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	b.kanban.ensureMapsLocked()
+	if b.kanban.deliveredIDs[cardID] || b.kanban.canceledSessions[sessionID] {
 		return consoleSessionMeta{}, false
 	}
-	if b.kanbanActiveWaits[sessionID] > 0 {
-		delete(b.kanbanPendingSettle, cardID)
+	if b.kanban.activeWaits[sessionID] > 0 {
+		delete(b.kanban.pendingSettle, cardID)
 		return consoleSessionMeta{}, false
 	}
-	if b.kanbanPendingSettle == nil {
-		b.kanbanPendingSettle = make(map[string]int)
-	}
-	b.kanbanPendingSettle[cardID]++
-	if b.kanbanPendingSettle[cardID] < 2 {
+	b.kanban.pendingSettle[cardID]++
+	if b.kanban.pendingSettle[cardID] < 2 {
 		return consoleSessionMeta{}, false
 	}
-	b.pruneKanbanMapsLocked()
-	if b.kanbanDeliveredIDs == nil {
-		b.kanbanDeliveredIDs = make(map[string]bool)
-	}
-	b.kanbanDeliveredIDs[cardID] = true
-	delete(b.kanbanPendingSettle, cardID)
-	meta := b.consoleSessions[sessionID]
+	b.kanban.deliveredIDs[cardID] = true
+	delete(b.kanban.pendingSettle, cardID)
+	meta := b.kanban.consoleSessions[sessionID]
 	if meta.ContextID == "" && strings.HasPrefix(sessionID, apiSessionIDPrefix) {
 		meta.ContextID = strings.TrimPrefix(sessionID, apiSessionIDPrefix)
 	}
@@ -345,21 +313,19 @@ func hasQueuedSteer(run *taskRun) bool {
 }
 
 func resolveKanbanDBPath() string {
-	var candidates []string
-	if v := strings.TrimSpace(os.Getenv("HERMES_KANBAN_DB")); v != "" {
-		candidates = append(candidates, v)
-	}
-	if v := strings.TrimSpace(os.Getenv("HERMES_HOME")); v != "" {
-		candidates = append(candidates, filepath.Join(v, "kanban.db"))
-	}
-	if v := strings.TrimSpace(os.Getenv("PLATFORM_AGENT_HOME")); v != "" {
-		candidates = append(candidates, filepath.Join(v, "kanban.db"))
-	}
-	candidates = append(candidates, "/opt/data/kanban.db")
-	for _, p := range candidates {
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p
+	for _, envKey := range []string{"HERMES_KANBAN_DB", "HERMES_HOME", "PLATFORM_AGENT_HOME"} {
+		if v := strings.TrimSpace(os.Getenv(envKey)); v != "" {
+			p := v
+			if envKey != "HERMES_KANBAN_DB" {
+				p = filepath.Join(v, "kanban.db")
+			}
+			if info, err := os.Stat(p); err == nil && !info.IsDir() {
+				return p
+			}
 		}
+	}
+	if info, err := os.Stat("/opt/data/kanban.db"); err == nil && !info.IsDir() {
+		return "/opt/data/kanban.db"
 	}
 	return ""
 }
@@ -405,16 +371,13 @@ func formatKanbanCardOutput(c kanbanCardRow) string {
 		}
 		return bp
 	}
-	if errTxt := strings.TrimSpace(c.Err); errTxt != "" {
-		return errTxt
-	}
-	return ""
+	return strings.TrimSpace(c.Err)
 }
 
 func querySessionKanbanCards(ctx context.Context, pythonBin, dbPath, sessionID string, sinceUnix int64, trackedIDs []string) ([]kanbanCardRow, error) {
 	qCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanPollPyScript, dbPath, sessionID, strconv.FormatInt(sinceUnix, 10), strings.Join(trackedIDs, ","))
+	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanDBPyScript, "poll", dbPath, sessionID, strconv.FormatInt(sinceUnix, 10), strings.Join(trackedIDs, ","))
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -426,10 +389,6 @@ func querySessionKanbanCards(ctx context.Context, pythonBin, dbPath, sessionID s
 	return rows, nil
 }
 
-// waitForKanbanCards waits for any Kanban card(s) filed or active during the
-// turn on a conversation with no chat.notify route (such as console:). While
-// waiting, waitingCard is set on act so the Kanban worker's tool-call and
-// thinking webhook deliveries stream onto this A2A task.
 func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *activityState, sessionID string, turnStartUnix int64, turn int, ackText string) (string, bool) {
 	dbPath := resolveKanbanDBPath()
 	if dbPath == "" {
@@ -510,8 +469,8 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					if summary != "" {
 						thinkingText = stepTitle + "\t" + summary
 					}
-					runningCount := totalCount - settledCount
-					progText := fmt.Sprintf("Kanban specialist checks: %d/%d completed (%d running) — latest: %s (%s)", settledCount, totalCount, runningCount, shortTitle, verdict)
+					progText := fmt.Sprintf("Kanban specialist checks: %d/%d completed (%d running) — latest: %s (%s)",
+						settledCount, totalCount, totalCount-settledCount, shortTitle, verdict)
 					run.mu.Lock()
 					if run.state == stateRunning {
 						if act.thinkingUnderBudget() {
@@ -574,19 +533,14 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	return ackText, true
 }
 
-// synthesizeCardAnswer turns the settled cards of a console turn into the turn's answer.
 func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, sessionID string, turn int, ackText string, cards []kanbanCardRow, parts []string) string {
 	joined := strings.Join(parts, "\n\n")
-	// The raw card results are the evidence; keep them on the stream regardless of what the
-	// answer becomes.
 	b.publishTurnAnswer(run, turn*cardTurnArtifactStride, cardResultsHeader+joined)
 
 	if len(strings.TrimSpace(ackText)) >= cardAnswerSubstantiveChars && !isSilentAnswer(ackText) {
-		// The model waited for its cards inside its own turn and already synthesized; its answer stands.
 		return ackText
 	}
 	if len(cards) == 1 {
-		// One card's report is already a complete answer; a synthesis turn would only restate it.
 		return joined
 	}
 	if len(joined) > cardSynthesisInputCap {
@@ -615,13 +569,11 @@ func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, ses
 	return synth
 }
 
-// isSilentAnswer reports whether text is the chat agents' "nothing to say" sentinel (or empty).
 func isSilentAnswer(text string) bool {
 	t := strings.TrimSpace(text)
 	return t == "" || strings.EqualFold(t, silentSentinel) || strings.EqualFold(strings.Trim(t, "`*_ "), silentSentinel)
 }
 
-// apiSynthesisTurn posts one extra, non-steer turn to the session and returns its answer.
 func (b *Bridge) apiSynthesisTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, turn int) (string, bool) {
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
@@ -685,11 +637,6 @@ func sanitizeKanbanTaskToken(cardID string) string {
 	return out
 }
 
-// watchOutOfTurnKanbanCards polls kanban.db for cards belonging to a2a-*
-// sessions that settle while no in-flight A2A task is waiting on them (for
-// example, after a pod restart or client timeout) and publishes their final
-// result onto a2a.tasks.<profile>.task-card-<id>.events so console/MCP clients
-// receive the completion asynchronously.
 func (b *Bridge) watchOutOfTurnKanbanCards(ctx context.Context) {
 	dbPath := resolveKanbanDBPath()
 	if dbPath == "" {
@@ -727,11 +674,9 @@ func (b *Bridge) watchOutOfTurnKanbanCards(ctx context.Context) {
 				b.markKanbanCardDelivered(c.ID)
 				continue
 			}
-			meta, ok := b.shouldDeliverOutOfTurnKanbanCard(c.ID, c.SessionID)
-			if !ok {
-				continue
+			if meta, ok := b.shouldDeliverOutOfTurnKanbanCard(c.ID, c.SessionID); ok {
+				b.publishOutOfTurnKanbanCard(ctx, c, meta)
 			}
-			b.publishOutOfTurnKanbanCard(ctx, c, meta)
 		}
 	}
 }
@@ -784,10 +729,8 @@ func (b *Bridge) publishOutOfTurnKanbanCard(ctx context.Context, c kanbanCardRow
 	stPayload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    synthTaskID,
 		ContextID: meta.ContextID,
-		Status: lib.TaskStatus{
-			State: termState,
-		},
-		Final: termState.Terminal(),
+		Status:    lib.TaskStatus{State: termState},
+		Final:     termState.Terminal(),
 	})
 	if err == nil {
 		if env, envErr := lib.NewStatusUpdateEnvelope(b.from, synthTaskID, meta.ContextID, corrID, stPayload); envErr == nil {
