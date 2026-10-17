@@ -782,66 +782,46 @@ func (s *Server) handleManageSession(ctx context.Context, rawArgs json.RawMessag
 		if len(tasks) == 0 {
 			return fmt.Sprintf("No tasks recorded yet on conversation **`%s`** (`console:%s`).", conv.Alias, conv.Token), "", "", nil
 		}
-		var sb, llmSB strings.Builder
+		var sb strings.Builder
 		header := fmt.Sprintf("## 📜 Conversation Transcript: `%s` (`console:%s`)\n\n", conv.Alias, conv.Token)
 		sb.WriteString(header)
-		llmSB.WriteString(header)
-		const maxTranscriptBytes = 14 * 1024
-		const maxLLMTranscriptBytes = 8000
-		// Render newest-last, but ensure the newest turns are never dropped if the transcript is long:
-		var sections, llmSections []string
+		const maxTranscriptBytes = 3500
+		// Render newest-last, ensuring newest turns are preserved and older turns are compactly
+		// summarized before ever omitting a turn so multi-turn transcripts stay inline (<3.5 KB).
+		var sections []string
 		totalBytes := sb.Len()
-		totalLLMBytes := llmSB.Len()
 		omittedOlder := 0
 		for i := 0; i < len(tasks); i++ {
 			t := tasks[i]
 			outcome := sess.BuildTaskOutcome(t.TaskID, conv.Alias, conv.Token, t.PromptText, false)
-			hasDelegation := outcome != nil && (len(outcome.ChildTasks) > 0 || outcome.WakeTask != nil)
-			var sec, llmSec strings.Builder
-			promptHdr := fmt.Sprintf("### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
-			sec.WriteString(promptHdr)
-			if hasDelegation {
-				sec.WriteString(FormatTurnOutcomeMarkdownWithOptions(outcome, debug))
-			} else {
-				sec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", debug))
+			sStr := FormatTranscriptTurnMarkdown(outcome, 0, debug)
+			if i == 0 && totalBytes+len(sStr) > maxTranscriptBytes {
+				sStr = FormatTranscriptTurnMarkdown(outcome, 1800, debug)
+			} else if len(sections) > 0 && totalBytes+len(sStr) > maxTranscriptBytes {
+				// Try compacting older turn answer bodies (800 runes, then 450 runes) before omitting the turn.
+				for _, capRunes := range []int{800, 450} {
+					candidate := FormatTranscriptTurnMarkdown(outcome, capRunes, debug)
+					if totalBytes+len(candidate) <= maxTranscriptBytes {
+						sStr = candidate
+						break
+					}
+				}
 			}
-			sec.WriteString("\n---\n")
-			llmSec.WriteString(promptHdr)
-			if debug {
-				llmSec.WriteString(formatCompactDebugLLMResult(outcome, FormatTurnOutcomeMarkdownWithOptions(outcome, false)))
-			} else if hasDelegation {
-				llmSec.WriteString(FormatTurnOutcomeMarkdownWithOptions(outcome, false))
-			} else {
-				llmSec.WriteString(FormatTaskRecordMarkdownWithOptions(t, "Task", false))
-			}
-			llmSec.WriteString("\n---\n")
-			sStr := sec.String()
-			lStr := llmSec.String()
-			exceedsBudget := totalBytes+len(sStr) > maxTranscriptBytes || (debug && totalLLMBytes+len(lStr) > maxLLMTranscriptBytes)
-			if len(sections) > 0 && exceedsBudget {
+			if len(sections) > 0 && totalBytes+len(sStr) > maxTranscriptBytes {
 				omittedOlder = len(tasks) - i
 				break
 			}
 			sections = append(sections, sStr)
-			llmSections = append(llmSections, lStr)
 			totalBytes += len(sStr)
-			totalLLMBytes += len(lStr)
 		}
 		if omittedOlder > 0 {
 			note := fmt.Sprintf("*(%d older task(s) omitted to keep transcript concise; use `task_control` `action: \"list\"` to inspect earlier task IDs)*\n\n---\n", omittedOlder)
 			sb.WriteString(note)
-			llmSB.WriteString(note)
 		}
 		for i := len(sections) - 1; i >= 0; i-- {
 			sb.WriteString(sections[i])
-			llmSB.WriteString(llmSections[i])
 		}
-		fullMD := sb.String()
-		meta := callMetaFromContext(ctx)
-		if debug && (meta.ConversationID != "" || meta.ProgressToken != nil) {
-			return llmSB.String(), fmt.Sprintf("Transcript for %s (%d task(s))", conv.Alias, len(sections)), fullMD, nil
-		}
-		return fullMD, "", "", nil
+		return sb.String(), "", "", nil
 
 	default:
 		return "", "", "", fmt.Errorf("unknown manage_session action %q (expected list, new, switch, session_on, session_off, debug_on, debug_off, status, help, transcript)", action)

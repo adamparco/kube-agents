@@ -1505,6 +1505,51 @@ func formatCompactDebugLLMResult(outcome *TurnOutcome, answerOnlyMD string) stri
 	return strings.TrimSpace(sb.String()) + "\n"
 }
 
+// FormatTranscriptTurnMarkdown renders a single root user turn for a conversation transcript.
+// In normal mode (debug=false), it renders the prompt header, a concise single-line thought/delegation
+// summary (without repeating the full multi-line <details> step list for every historical turn), and
+// the final answer. In debug mode (debug=true), it renders the prompt header and the compact debug
+// telemetry summary followed by the final answer. If maxAnswerRunes > 0, the answer body is capped
+// to maxAnswerRunes so multi-turn transcripts stay under inline tool output limits without dropping turns.
+func FormatTranscriptTurnMarkdown(outcome *TurnOutcome, maxAnswerRunes int, debug bool) string {
+	if outcome == nil || outcome.PrimaryTask == nil {
+		return ""
+	}
+	t := outcome.PrimaryTask
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "### Prompt: %s (`%s`)\n", firstNonEmptyStr(t.PromptText, "(no prompt text)"), t.TaskID)
+	answerMD := strings.TrimSpace(formatCleanTurnAnswerOnlyMarkdown(outcome))
+	if maxAnswerRunes > 0 && len([]rune(answerMD)) > maxAnswerRunes {
+		answerMD = truncateText(answerMD, maxAnswerRunes)
+	}
+	if answerMD != "" {
+		answerMD += "\n"
+	}
+	if debug {
+		sb.WriteString(formatCompactDebugLLMResult(outcome, answerMD))
+	} else {
+		thoughts := CollectOutcomeSteps(outcome)
+		summaryLabel := formatThoughtSummaryLabel(t, outcome.ChildTasks, outcome.WakeTask, len(thoughts))
+		fmt.Fprintf(&sb, "_%s_\n\n", summaryLabel)
+		if len(outcome.ChildTasks) > 0 || len(t.Delegates) > 0 {
+			var hops []string
+			hops = append(hops, fmt.Sprintf("`%s` (`%s`)", firstNonEmptyStr(t.Addressee, "session"), t.TaskID))
+			for _, child := range outcome.ChildTasks {
+				if child != nil {
+					hops = append(hops, fmt.Sprintf("`%s` (`%s`)", firstNonEmptyStr(child.Addressee, "platform"), child.TaskID))
+				}
+			}
+			if outcome.WakeTask != nil {
+				hops = append(hops, fmt.Sprintf("`%s` wake (`%s`)", firstNonEmptyStr(outcome.WakeTask.Addressee, t.Addressee, "session"), outcome.WakeTask.TaskID))
+			}
+			fmt.Fprintf(&sb, "- **Delegation Chain**: %s\n\n", strings.Join(hops, " → "))
+		}
+		sb.WriteString(answerMD)
+	}
+	sb.WriteString("\n---\n")
+	return sb.String()
+}
+
 const maxDebugStepActivitiesShown = 12
 
 // FormatStepDetailsBatchMarkdown renders the expandable markdown body for one or more StepDetails.
