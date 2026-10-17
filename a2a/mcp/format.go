@@ -189,7 +189,9 @@ var (
 )
 
 const (
-	synthFinalStepTitle = "Synthesizing findings into final response."
+	cardResultsRawHeader = "Specialist card results (raw):"
+	silentResultFallback = "_The agent completed this turn without a textual reply._"
+	synthFinalStepTitle  = "Synthesizing findings into final response."
 	// streamingStepContinuePrefix marks an intermediate (task still running) tool result frame.
 	streamingStepContinuePrefix = "STREAMING_STEP_CONTINUE:"
 	maxStepActivitiesShown      = 6
@@ -1206,6 +1208,11 @@ func formatCleanTurnAnswerOnlyMarkdown(outcome *TurnOutcome) string {
 	return strings.TrimSpace(sb.String()) + "\n"
 }
 
+func isSilentResultText(s string) bool {
+	t := strings.Trim(strings.TrimSpace(s), "`*_ ")
+	return strings.EqualFold(t, "[SILENT]")
+}
+
 func hasStructuredChatContent(cm *chatmsg.Message) bool {
 	if cm == nil {
 		return false
@@ -1225,6 +1232,20 @@ func renderTaskAnswerBody(rec *TaskRecord) string {
 	}
 	var sb strings.Builder
 	plain := strings.TrimSpace(rec.ResultText)
+	if isSilentResultText(plain) {
+		// The chat agents' "[SILENT]" sentinel means "someone else already posted the answer";
+		// on a console conversation nobody did, so show the evidence instead of the token.
+		plain = ""
+		for i := len(rec.IntermediateTurns) - 1; i >= 0; i-- {
+			if t := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rec.IntermediateTurns[i]), cardResultsRawHeader)); t != "" && !isSilentResultText(t) {
+				plain = t
+				break
+			}
+		}
+		if plain == "" {
+			plain = silentResultFallback
+		}
+	}
 	if rec.ResultChat != nil || plain != "" {
 		if rec.ResultChat != nil && (hasStructuredChatContent(rec.ResultChat) || plain == "") {
 			sb.WriteString(FormatChatMessageMarkdown(rec.ResultChat))

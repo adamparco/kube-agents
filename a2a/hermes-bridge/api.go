@@ -636,6 +636,7 @@ const (
 	cardSynthesisTimeout       = 4 * time.Minute // one extra model turn; falls back on expiry
 	cardTurnArtifactStride     = 1000            // keeps card-dump turn artifact ids clear of real turn numbers
 	cardResultsHeader          = "Specialist card results (raw):\n\n"
+	silentSentinel             = "[SILENT]"
 )
 
 const kanbanPollPyScript = `
@@ -991,15 +992,23 @@ func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, ses
 	// answer becomes.
 	b.publishTurnAnswer(run, turn*cardTurnArtifactStride, cardResultsHeader+joined)
 
-	if len(strings.TrimSpace(ackText)) >= cardAnswerSubstantiveChars {
+	if len(strings.TrimSpace(ackText)) >= cardAnswerSubstantiveChars && !isSilentAnswer(ackText) {
 		// The model waited for its cards and already synthesized; its answer stands.
 		return ackText
+	}
+	if len(cards) == 1 {
+		// One card's report is already a complete answer; a synthesis turn would only restate it
+		// (and the chat doctrine tells the model to answer [SILENT] for a single completion).
+		return joined
 	}
 	if len(joined) > cardSynthesisInputCap {
 		joined = joined[:cardSynthesisInputCap] + "\n\n[... further card results truncated for synthesis ...]"
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "All %d specialist card(s) you filed for this request have now completed. Their results are below. ", len(cards))
+	sb.WriteString("IMPORTANT: this conversation has no chat thread, so the gateway has NOT posted these results anywhere; ")
+	sb.WriteString("the user has seen nothing yet and your reply is the only answer they will get. [SILENT] is therefore not an ")
+	sb.WriteString("acceptable reply here. ")
 	sb.WriteString("Write the final answer to the user's original request as a synthesis: lead with the overall verdict, ")
 	sb.WriteString("then a compact per-item table (one row per card/cluster) with status and the one key fact, then only the ")
 	sb.WriteString("findings that need action with concrete next steps. Do not paste the raw reports; keep it under about ")
@@ -1012,10 +1021,18 @@ func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, ses
 		fmt.Fprintf(&sb, "### Card %d: %s (%s)\n%s\n\n", i+1, title, strings.TrimSpace(c.Status), strings.TrimSpace(parts[minInt(i, len(parts)-1)]))
 	}
 	synth, ok := b.apiSynthesisTurn(run, taskCtx, sessionID, sb.String(), turn)
-	if !ok || strings.TrimSpace(synth) == "" {
+	if !ok || isSilentAnswer(synth) {
 		return joined
 	}
 	return synth
+}
+
+// isSilentAnswer reports whether text is the chat agents' "nothing to say" sentinel (or empty).
+// On a console conversation nobody else posts for the agent, so a silent answer must be replaced
+// by the evidence the turn produced rather than delivered as the literal token.
+func isSilentAnswer(text string) bool {
+	t := strings.TrimSpace(text)
+	return t == "" || strings.EqualFold(t, silentSentinel) || strings.EqualFold(strings.Trim(t, "`*_ "), silentSentinel)
 }
 
 func minInt(a, b int) int {

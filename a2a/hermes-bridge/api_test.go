@@ -1815,7 +1815,6 @@ func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T)
 	}
 }
 
-
 // A console fan-out used to deliver the raw concatenation of every card's report as the answer
 // (16 clusters -> ~27 KB, no synthesis). Now: the raw results go on the stream as a turn artifact,
 // and one extra API turn on the same session (its own Idempotency-Key, never the opening turn's)
@@ -1828,6 +1827,10 @@ func TestAPI_CardResultsAreSynthesizedNotConcatenated(t *testing.T) {
 		if strings.Contains(c.prompt, "specialist card(s) you filed") {
 			if synthMode.Load() == 1 {
 				http.Error(w, "nope", http.StatusInternalServerError)
+				return
+			}
+			if synthMode.Load() == 2 {
+				writeCompletion(w, c.sessionID, "[SILENT]")
 				return
 			}
 			writeCompletion(w, c.sessionID, "SYNTH: 2/2 healthy")
@@ -1867,5 +1870,17 @@ func TestAPI_CardResultsAreSynthesizedNotConcatenated(t *testing.T) {
 	}
 	if run.state != stateRunning {
 		t.Fatalf("synthesis failure must never finalize the task; state = %v", run.state)
+	}
+
+	// The chat doctrine's "[SILENT]" (soak round 8: a single-card question delivered the literal
+	// token) is never an answer on a console conversation: fall back to the evidence.
+	synthMode.Store(2)
+	if got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 4, "checking.", cards, parts); got != strings.Join(parts, "\n\n") {
+		t.Fatalf("[SILENT] synthesis must fall back to the raw results, got %q", got[:min(len(got), 80)])
+	}
+	// A single card's report is the answer; no synthesis turn is spent on it.
+	before := len(stub.seen())
+	if got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 5, "checking.", cards[:1], parts[:1]); got != parts[0] || len(stub.seen()) != before {
+		t.Fatalf("single card should be returned verbatim without a synthesis turn; got %q, requests %d->%d", got[:min(len(got), 60)], before, len(stub.seen()))
 	}
 }
