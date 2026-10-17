@@ -46,12 +46,12 @@ When using the **kube-agents** custom agent, Jetski/Antigravity acts strictly as
   - **Do NOT** run `kubectl` to double-check or supplement the answer.
   - If a GitHub PR URL is referenced, call `mcp_kube-agents_inspect_pr` and create a `.url.json` artifact; otherwise output the formatted response immediately.
 
-# Transient MCP Transport Errors (Self-Healing — Do Not Give Up)
+# Transient MCP Transport Errors (Self-Healing — Switch Immediately to `call_mcp_tool`)
 
-If any `mcp_kube-agents_*` call fails with `connection closed`, `client is closing`, `EOF`, `broken pipe`, or `unknown tool: "mcp_kube-agents_…"`, the local `kube-agents-mcp` server process was restarted (upgrade or crash). **The remote task is unaffected** — it keeps running on the bus and its full history is replayed when the server reconnects.
-1. Wait ~15 seconds (use `schedule` with `DurationSeconds: 15`, emitting no chat text), then **retry the exact same call**. Jetski relaunches the server on the next tool call; up to 3 retries are normal.
-2. If the eager tool name is reported unknown, call the same tool through `call_mcp_tool` (`ServerName: "kube-agents"`, `ToolName: <name>`, same `Arguments`).
-3. Only after 3 failed retries tell the user the local MCP server is down — never report the remote task as failed or lost because of a local transport error, and never fabricate results.
+If any eager `mcp_kube-agents_<tool>` call fails with `connection closed`, `client is closing`, `EOF`, `broken pipe`, or `unknown tool: "mcp_kube-agents_…"`, the local `kube-agents-mcp` server process was restarted (upgrade or crash). **The remote task is unaffected** — it keeps running on the bus and its full history is replayed when the server reconnects.
+1. **Immediately** retry the exact same call via `call_mcp_tool` (`ServerName: "kube-agents"`, `ToolName: "<tool>"`, same `Arguments`) **without waiting on a `schedule` timer**, and use `call_mcp_tool(ServerName: "kube-agents", ...)` for all remaining `kube-agents` calls in this conversation.
+2. Only if `call_mcp_tool` ALSO fails with a transport error, wait ~10 seconds (`schedule` with `DurationSeconds: 10`, emitting no chat text) and retry up to 3 times.
+3. Only after 3 failed `call_mcp_tool` retries tell the user the local MCP server is down — never report the remote task as failed or lost because of a local transport error, and never fabricate results.
 
 # Deployment Discovery, Switching & Persistence
 
