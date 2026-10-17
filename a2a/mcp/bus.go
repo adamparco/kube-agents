@@ -65,20 +65,20 @@ const (
 	modeSession                  = "session"
 	modeDelegate                 = "delegate"
 	orderedConsumerIdleThreshold = 5 * time.Second
-	orderedFetchBatchSize        = 256
+	orderedFetchBatchSize        = 512
 	orderedFetchMaxWait          = 750 * time.Millisecond
 	bootstrapTimeout             = 8 * time.Second
 	bootstrapBackgroundTimeout   = 2 * time.Minute
-	bootstrapTasksLookback       = 24 * time.Hour
+	bootstrapTasksLookback       = 2 * time.Hour
 	controlNoticeWait            = 2500 * time.Millisecond
 	delegationChildWait          = 5 * time.Second
 	delegationWakeWait           = 8 * time.Second
 	defaultTurnWaitTimeout       = 150 * time.Second
-	defaultStepStreamWindow      = 10 * time.Second
-	initialStepStreamWindow      = 12 * time.Second
+	defaultStepStreamWindow      = 45 * time.Second
+	initialStepStreamWindow      = 15 * time.Second
 	minStepBatchWait             = 350 * time.Millisecond
 	stepDebounceWait             = 200 * time.Millisecond
-	activityStepBatchWait        = 3500 * time.Millisecond
+	activityStepBatchWait        = 8 * time.Second
 	activityStepDebounceWait     = 600 * time.Millisecond
 	pollTickInterval             = 100 * time.Millisecond
 	progressHeartbeatInterval    = 2 * time.Second
@@ -189,6 +189,52 @@ type DelegateItem struct {
 	ChildTaskID string `json:"childTaskId,omitempty"`
 }
 
+type timestampedChunk struct {
+	ts     time.Time
+	seq    int
+	append bool
+	text   string
+}
+
+func foldTimestampedChunks(chunks []timestampedChunk, sep string) string {
+	if len(chunks) == 0 {
+		return ""
+	}
+	ordered := chunks
+	needSort := false
+	for i := 1; i < len(chunks); i++ {
+		if !chunks[i].ts.IsZero() && !chunks[i-1].ts.IsZero() && chunks[i].ts.Before(chunks[i-1].ts) {
+			needSort = true
+			break
+		}
+	}
+	if needSort {
+		ordered = append([]timestampedChunk(nil), chunks...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			ti, tj := ordered[i].ts, ordered[j].ts
+			if !ti.Equal(tj) && !ti.IsZero() && !tj.IsZero() {
+				return ti.Before(tj)
+			}
+			if ordered[i].append != ordered[j].append {
+				return !ordered[i].append
+			}
+			return ordered[i].seq < ordered[j].seq
+		})
+	}
+	var acc string
+	for _, c := range ordered {
+		if !c.append {
+			acc = c.text
+			continue
+		}
+		if acc != "" && c.text != "" && sep != "" && !strings.HasSuffix(acc, sep) && !strings.HasPrefix(c.text, sep) {
+			acc += sep
+		}
+		acc += c.text
+	}
+	return acc
+}
+
 // TaskRecord holds the folded state and rich streaming artifacts of a task on TASKS.
 type TaskRecord struct {
 	TaskID              string `json:"taskId"`
@@ -201,27 +247,34 @@ type TaskRecord struct {
 	// CardParentTaskID links a Kanban specialist card task (task-card-*) spawned by the platform
 	// agent to the foreground task that was running in the same conversation when the card was
 	// created, so card progress renders as steps of that task instead of as unrelated push events.
-	CardParentTaskID     string           `json:"cardParentTaskId,omitempty"`
-	State                lib.TaskState    `json:"state"`
-	Terminal             bool             `json:"terminal"`
-	StatusText           string           `json:"statusText,omitempty"`
-	PromptText           string           `json:"promptText,omitempty"`
-	SteerTurns           []string         `json:"steerTurns,omitempty"`
-	SteerTimestamps      []time.Time      `json:"steerTimestamps,omitempty"`
-	IntermediateTurns    []string         `json:"intermediateTurns,omitempty"`
-	Thinking             string           `json:"thinking,omitempty"`
-	Activities           []ActivityItem   `json:"activities,omitempty"`
-	ProgressText         string           `json:"progressText,omitempty"`
-	ProgressChat         *chatmsg.Message `json:"progressChat,omitempty"`
-	Delegates            []DelegateItem   `json:"delegates,omitempty"`
-	Notices              []string         `json:"notices,omitempty"`
-	PRLinks              []string         `json:"prLinks,omitempty"`
-	ResultText           string           `json:"resultText,omitempty"`
-	ResultChat           *chatmsg.Message `json:"resultChat,omitempty"`
-	CreatedAt            time.Time        `json:"createdAt"`
-	UpdatedAt            time.Time        `json:"updatedAt"`
-	EnvelopeCount        int              `json:"envelopeCount"`
-	EnvelopeCountsByKind map[string]int   `json:"envelopeCountsByKind,omitempty"`
+	CardParentTaskID     string             `json:"cardParentTaskId,omitempty"`
+	State                lib.TaskState      `json:"state"`
+	Terminal             bool               `json:"terminal"`
+	StatusText           string             `json:"statusText,omitempty"`
+	PromptText           string             `json:"promptText,omitempty"`
+	SteerTurns           []string           `json:"steerTurns,omitempty"`
+	SteerTimestamps      []time.Time        `json:"steerTimestamps,omitempty"`
+	IntermediateTurns    []string           `json:"intermediateTurns,omitempty"`
+	Thinking             string             `json:"thinking,omitempty"`
+	Activities           []ActivityItem     `json:"activities,omitempty"`
+	ProgressText         string             `json:"progressText,omitempty"`
+	ProgressChat         *chatmsg.Message   `json:"progressChat,omitempty"`
+	Delegates            []DelegateItem     `json:"delegates,omitempty"`
+	Notices              []string           `json:"notices,omitempty"`
+	PRLinks              []string           `json:"prLinks,omitempty"`
+	ResultText           string             `json:"resultText,omitempty"`
+	ResultChat           *chatmsg.Message   `json:"resultChat,omitempty"`
+	CreatedAt            time.Time          `json:"createdAt"`
+	UpdatedAt            time.Time          `json:"updatedAt"`
+	EnvelopeCount        int                `json:"envelopeCount"`
+	EnvelopeCountsByKind map[string]int     `json:"envelopeCountsByKind,omitempty"`
+	promptTS             time.Time          `json:"-"`
+	lastStatusTS         time.Time          `json:"-"`
+	lastProgressTS       time.Time          `json:"-"`
+	lastResultTS         time.Time          `json:"-"`
+	thinkingChunks       []timestampedChunk `json:"-"`
+	progressChunks       []timestampedChunk `json:"-"`
+	resultChunks         []timestampedChunk `json:"-"`
 }
 
 // TopicSnapshot holds the latest envelope and parsed summary/data for a topic subject.
@@ -331,6 +384,9 @@ type BusSession struct {
 	lastReportedSteps map[string]int
 	prevReportedActs  map[string]int
 	lastReportedActs  map[string]int
+	streamBootSeq     map[string]uint64
+	backfilledTasks   map[string]bool
+	backfillMu        sync.Mutex
 	// stepProgressPath, when set, persists the per-task step cursor across process restarts.
 	stepProgressPath string
 }
@@ -404,6 +460,8 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 		watchedTasks:      make(map[string]int),
 		foregroundTasks:   make(map[string]time.Time),
 		lastReportedSteps: make(map[string]int),
+		streamBootSeq:     make(map[string]uint64),
+		backfilledTasks:   make(map[string]bool),
 	}
 
 	if err := s.startSubscriptions(); err != nil {
@@ -535,7 +593,13 @@ func (s *BusSession) bootstrapStreams(ctx context.Context, streams []string) (un
 			DeliverPolicy:     jetstream.DeliverAllPolicy,
 			InactiveThreshold: orderedConsumerIdleThreshold,
 		}
-		if streamName == streamTasks {
+		s.mu.RLock()
+		lastSeq := s.streamBootSeq[streamName]
+		s.mu.RUnlock()
+		if lastSeq > 0 {
+			cfg.DeliverPolicy = jetstream.DeliverByStartSequencePolicy
+			cfg.OptStartSeq = lastSeq + 1
+		} else if streamName == streamTasks {
 			start := time.Now().Add(-bootstrapTasksLookback)
 			cfg.DeliverPolicy = jetstream.DeliverByStartTimePolicy
 			cfg.OptStartTime = &start
@@ -567,6 +631,16 @@ func (s *BusSession) bootstrapStreams(ctx context.Context, streams []string) (un
 			for msg := range msgs.Messages() {
 				gotAny = true
 				fetched++
+				if meta, mErr := msg.Metadata(); mErr == nil && meta != nil && meta.Sequence.Stream > 0 {
+					s.mu.Lock()
+					if s.streamBootSeq == nil {
+						s.streamBootSeq = make(map[string]uint64)
+					}
+					if meta.Sequence.Stream > s.streamBootSeq[streamName] {
+						s.streamBootSeq[streamName] = meta.Sequence.Stream
+					}
+					s.mu.Unlock()
+				}
 				s.ingestA2AMessage(msg.Subject(), msg.Data(), false)
 			}
 			if !gotAny || msgs.Error() != nil {
@@ -692,6 +766,17 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			text := joinMessageText(msg.Parts)
 			if rec.PromptText == "" {
 				rec.PromptText = text
+				rec.promptTS = env.TS
+				if childID := extractWakeChildTaskID(text); childID != "" {
+					rec.WakeFromChildTaskID = childID
+				}
+			} else if !env.TS.IsZero() && !rec.promptTS.IsZero() && env.TS.Before(rec.promptTS) {
+				if rec.PromptText != "" {
+					rec.SteerTurns = append([]string{rec.PromptText}, rec.SteerTurns...)
+					rec.SteerTimestamps = append([]time.Time{rec.promptTS}, rec.SteerTimestamps...)
+				}
+				rec.PromptText = text
+				rec.promptTS = env.TS
 				if childID := extractWakeChildTaskID(text); childID != "" {
 					rec.WakeFromChildTaskID = childID
 				}
@@ -705,10 +790,20 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 		if json.Unmarshal(env.Payload, &st) == nil {
 			prevTerminal := rec.Terminal
 			prevState := rec.State
-			rec.State = st.Status.State
-			rec.Terminal = st.Final || st.Status.State.Terminal()
-			if st.Status.Message != nil {
-				rec.StatusText = joinMessageText(st.Status.Message.Parts)
+			newTerminal := st.Final || st.Status.State.Terminal()
+			isOlder := !rec.lastStatusTS.IsZero() && !env.TS.IsZero() && env.TS.Before(rec.lastStatusTS)
+			if (!prevTerminal || newTerminal) && (!isOlder || newTerminal) &&
+				!(st.Status.State == lib.StateSubmitted && (prevState == lib.StateWorking || prevState == lib.StateInputRequired || prevTerminal)) {
+				rec.State = st.Status.State
+				rec.Terminal = prevTerminal || newTerminal
+				if !env.TS.IsZero() && (rec.lastStatusTS.IsZero() || env.TS.After(rec.lastStatusTS)) {
+					rec.lastStatusTS = env.TS
+				}
+				if st.Status.Message != nil {
+					if msgTxt := joinMessageText(st.Status.Message.Parts); msgTxt != "" || !isOlder {
+						rec.StatusText = msgTxt
+					}
+				}
 			}
 			if isLive && s.bootstrapped && !watched {
 				if rec.Terminal && !prevTerminal {
@@ -765,15 +860,14 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			chatMsg := extractChatMessage(art.Parts)
 			switch art.Name {
 			case lib.ArtifactThinking:
-				if au.Append && rec.Thinking != "" && text != "" {
-					if !strings.HasSuffix(rec.Thinking, "\n") && !strings.HasPrefix(text, "\n") {
-						rec.Thinking += "\n"
-					}
-					rec.Thinking += text
-				} else if au.Append {
-					rec.Thinking += text
-				} else {
-					rec.Thinking = text
+				if text != "" || !au.Append {
+					rec.thinkingChunks = append(rec.thinkingChunks, timestampedChunk{
+						ts:     env.TS,
+						seq:    rec.EnvelopeCount,
+						append: au.Append,
+						text:   text,
+					})
+					rec.Thinking = foldTimestampedChunks(rec.thinkingChunks, "\n")
 				}
 			case lib.ArtifactActivity:
 				for _, p := range art.Parts {
@@ -784,17 +878,25 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 						raw = p.Text
 					}
 					if item, ok := parseActivityItem(raw); ok {
+						if item.At == "" && !env.TS.IsZero() {
+							item.At = env.TS.UTC().Format(time.RFC3339Nano)
+						}
 						rec.Activities = upsertActivityItem(rec.Activities, item)
 					}
 				}
 			case lib.ArtifactProgress:
-				if au.Append {
-					rec.ProgressText += text
-				} else {
-					rec.ProgressText = text
+				if text != "" || !au.Append {
+					rec.progressChunks = append(rec.progressChunks, timestampedChunk{
+						ts:     env.TS,
+						seq:    rec.EnvelopeCount,
+						append: au.Append,
+						text:   text,
+					})
+					rec.ProgressText = foldTimestampedChunks(rec.progressChunks, "\n")
 				}
-				if chatMsg != nil {
+				if chatMsg != nil && (rec.lastProgressTS.IsZero() || !env.TS.Before(rec.lastProgressTS)) {
 					rec.ProgressChat = chatMsg
+					rec.lastProgressTS = env.TS
 				}
 			case lib.ArtifactDelegate:
 				var del DelegateItem
@@ -848,13 +950,18 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 					rec.IntermediateTurns = append(rec.IntermediateTurns, text)
 				}
 			case lib.ArtifactResult:
-				if au.Append {
-					rec.ResultText += text
-				} else {
-					rec.ResultText = text
+				if text != "" || !au.Append {
+					rec.resultChunks = append(rec.resultChunks, timestampedChunk{
+						ts:     env.TS,
+						seq:    rec.EnvelopeCount,
+						append: au.Append,
+						text:   text,
+					})
+					rec.ResultText = foldTimestampedChunks(rec.resultChunks, "")
 				}
-				if chatMsg != nil {
+				if chatMsg != nil && (rec.lastResultTS.IsZero() || !env.TS.Before(rec.lastResultTS)) {
 					rec.ResultChat = chatMsg
+					rec.lastResultTS = env.TS
 					for _, lnk := range chatMsg.Links {
 						for _, pr := range ExtractPRReferences(lnk.URL) {
 							if !containsString(rec.PRLinks, pr) {
@@ -1727,6 +1834,7 @@ func (s *BusSession) awaitWakeTask(ctx context.Context, childID string) *TaskRec
 
 // GetTask returns a deep copy of a TaskRecord by task ID.
 func (s *BusSession) GetTask(taskID string) *TaskRecord {
+	s.ensureTaskBackfilled(taskID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rec, ok := s.tasks[taskID]
@@ -1734,6 +1842,71 @@ func (s *BusSession) GetTask(taskID string) *TaskRecord {
 		return nil
 	}
 	return cloneTaskRecord(rec)
+}
+
+func (s *BusSession) ensureTaskBackfilled(taskID string) {
+	taskID = strings.TrimSpace(taskID)
+	if s == nil || s.js == nil || taskID == "" {
+		return
+	}
+	s.mu.RLock()
+	already := s.backfilledTasks[taskID]
+	rec := s.tasks[taskID]
+	complete := rec != nil && rec.Terminal && rec.PromptText != ""
+	s.mu.RUnlock()
+	if already || complete {
+		return
+	}
+	s.backfillMu.Lock()
+	defer s.backfillMu.Unlock()
+	s.mu.RLock()
+	if s.backfilledTasks[taskID] {
+		s.mu.RUnlock()
+		return
+	}
+	s.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cfg := jetstream.OrderedConsumerConfig{
+		FilterSubjects:    []string{subjectTasksPrefix + "*." + taskID + ".>"},
+		DeliverPolicy:     jetstream.DeliverAllPolicy,
+		InactiveThreshold: orderedConsumerIdleThreshold,
+	}
+	cons, err := s.js.OrderedConsumer(ctx, streamTasks, cfg)
+	if err != nil {
+		return
+	}
+	info, infoErr := cons.Info(ctx)
+	if infoErr == nil && info != nil && info.NumPending > 0 {
+		pending := int(info.NumPending)
+		fetched := 0
+		for fetched < pending && ctx.Err() == nil {
+			batch := pending - fetched
+			if batch > orderedFetchBatchSize {
+				batch = orderedFetchBatchSize
+			}
+			msgs, fErr := cons.Fetch(batch, jetstream.FetchMaxWait(orderedFetchMaxWait))
+			if fErr != nil {
+				break
+			}
+			got := false
+			for msg := range msgs.Messages() {
+				got = true
+				fetched++
+				s.ingestA2AMessage(msg.Subject(), msg.Data(), false)
+			}
+			if !got || msgs.Error() != nil {
+				break
+			}
+		}
+	}
+	s.mu.Lock()
+	if s.backfilledTasks == nil {
+		s.backfilledTasks = make(map[string]bool)
+	}
+	s.backfilledTasks[taskID] = true
+	s.mu.Unlock()
 }
 
 // ListTasks returns recent TaskRecords, optionally filtered by conversation or non-terminal state.
@@ -2026,6 +2199,9 @@ func cloneTaskRecord(rec *TaskRecord) *TaskRecord {
 	cp.Delegates = append([]DelegateItem(nil), rec.Delegates...)
 	cp.Notices = append([]string(nil), rec.Notices...)
 	cp.PRLinks = append([]string(nil), rec.PRLinks...)
+	cp.thinkingChunks = append([]timestampedChunk(nil), rec.thinkingChunks...)
+	cp.progressChunks = append([]timestampedChunk(nil), rec.progressChunks...)
+	cp.resultChunks = append([]timestampedChunk(nil), rec.resultChunks...)
 	if rec.EnvelopeCountsByKind != nil {
 		cp.EnvelopeCountsByKind = make(map[string]int, len(rec.EnvelopeCountsByKind))
 		for k, v := range rec.EnvelopeCountsByKind {
@@ -2157,6 +2333,20 @@ func parseActivityItem(raw string) (ActivityItem, bool) {
 	}, true
 }
 
+func parseActivityTimestamp(at string) (time.Time, bool) {
+	at = strings.TrimSpace(at)
+	if at == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, at); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, at); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
 func upsertActivityItem(list []ActivityItem, item ActivityItem) []ActivityItem {
 	replaced := false
 	if item.CallID != "" {
@@ -2172,6 +2362,27 @@ func upsertActivityItem(list []ActivityItem, item ActivityItem) []ActivityItem {
 	if !replaced {
 		item.Index = len(list) + 1
 		list = append(list, item)
+	}
+	if len(list) > 1 {
+		needSort := false
+		for i := 1; i < len(list); i++ {
+			ti, okI := parseActivityTimestamp(list[i].At)
+			tj, okJ := parseActivityTimestamp(list[i-1].At)
+			if okI && okJ && ti.Before(tj) {
+				needSort = true
+				break
+			}
+		}
+		if needSort {
+			sort.SliceStable(list, func(i, j int) bool {
+				ti, okI := parseActivityTimestamp(list[i].At)
+				tj, okJ := parseActivityTimestamp(list[j].At)
+				if okI && okJ && !ti.Equal(tj) {
+					return ti.Before(tj)
+				}
+				return false
+			})
+		}
 	}
 	backfillActivityWorkers(list)
 	return list
@@ -2296,10 +2507,10 @@ func backfillActivityWorkers(list []ActivityItem) {
 func extractCardIDFromPreview(preview string) string {
 	for _, field := range strings.Fields(preview) {
 		if strings.HasPrefix(field, "card_id=") {
-			return strings.Trim(strings.TrimPrefix(field, "card_id="), ",;)")
+			return strings.Trim(strings.TrimPrefix(field, "card_id="), ",;:.)]\"'")
 		}
 		if strings.HasPrefix(field, "t_") {
-			return strings.Trim(field, ",;)")
+			return strings.Trim(field, ",;:.)]\"'")
 		}
 	}
 	return ""

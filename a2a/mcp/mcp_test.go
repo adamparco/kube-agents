@@ -1794,7 +1794,7 @@ func TestNormalAndDebugModeStreamingAndPanels(t *testing.T) {
 	// Verify A1: When a poll times out with no new step (PrevStepCount == ReportedStepCount == 4),
 	// it shows live Kanban card progress + delta activity (c5) and NEVER repeats c1 (`read_file`).
 	waitTitle, waitMD, _ := FormatTurnCustomToolEnvelope(outcome, false)
-	if !strings.Contains(waitTitle, "Specialist checks in progress (1/2 completed, 1 running)") {
+	if !strings.Contains(waitTitle, "Checking kubeagents-system pods on kube-agents-host (1/2 cards done)") {
 		t.Fatalf("unexpected waitTitle: %q", waitTitle)
 	}
 	if strings.Contains(waitMD, "read_file") {
@@ -1822,5 +1822,97 @@ func TestNormalAndDebugModeStreamingAndPanels(t *testing.T) {
 		if !strings.Contains(dbgMD, needle) {
 			t.Errorf("debug mode output missing %q:\n%s", needle, dbgMD)
 		}
+	}
+}
+
+func TestOutOfOrderBootstrapReplayDoesNotCorruptCompletedTask(t *testing.T) {
+	s := &BusSession{
+		tasks:             make(map[string]*TaskRecord),
+		seenEnvelopes:     make(map[string]bool),
+		foregroundTasks:   make(map[string]time.Time),
+		watchedTasks:      make(map[string]int),
+		watchedConvs:      make(map[string]int),
+		lastReportedSteps: make(map[string]int),
+		bootstrapped:      true,
+	}
+	t0 := time.Date(2026, 10, 17, 14, 0, 30, 0, time.UTC)
+	tEnd := t0.Add(514 * time.Second)
+	taskID := "task-24c523717a80ef25"
+	outSubj := "a2a.tasks.platform." + taskID + ".out"
+	inSubj := "a2a.tasks.platform." + taskID + ".in"
+
+	// 1. Live subscription receives the final completion envelopes FIRST (at tEnd = 14:09:04Z).
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-live-act-38", TS: tEnd.Add(-2 * time.Second), TaskID: taskID, ContextID: "ctx-1",
+		Kind: lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: taskID, Append: true,
+			Artifact: lib.Artifact{Name: lib.ArtifactActivity, Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"kanban_complete","input":{"id":"t_9ebe3ccb","result":"Scaled store-v1 to 2 replicas in PR #225"},"callId":"call-38","status":"completed","sessionId":"20261017_140036_e0c3f7","worker":"card:t_9ebe3ccb","durationMs":40,"at":"2026-10-17T14:09:02Z"}`)}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-live-think-end", TS: tEnd.Add(-time.Second), TaskID: taskID, ContextID: "ctx-1",
+		Kind: lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: taskID, Append: true,
+			Artifact: lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Specialist check completed: Increase replica count on a workload (completed — 1/1 cards done).\tOpened PR #225 scaling store-v1 from 1 to 2 replicas."}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-live-res", TS: tEnd, TaskID: taskID, ContextID: "ctx-1",
+		Kind: lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: taskID, Append: false,
+			Artifact: lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "Increased replica count on `store-v1` from 1 to 2 via PR #225."}}},
+		}),
+	}), true)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-live-done", TS: tEnd, TaskID: taskID, ContextID: "ctx-1",
+		Kind:    lib.KindStatusUpdate,
+		Payload: mustJSON(lib.StatusUpdate{TaskID: taskID, Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+	}), true)
+
+	// 2. Background stream bootstrap replays the OLDER start-of-task envelopes AFTER completion (at t0 = 14:00:30Z).
+	s.ingestTaskEnvelope(inSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-boot-msg", TS: t0, TaskID: taskID, ContextID: "ctx-1",
+		Kind:    lib.KindMessage,
+		Payload: mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "increase replica count on a workload"}}}),
+	}), false)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-boot-working", TS: t0.Add(time.Second), TaskID: taskID, ContextID: "ctx-1",
+		Kind:    lib.KindStatusUpdate,
+		Payload: mustJSON(lib.StatusUpdate{TaskID: taskID, Status: lib.TaskStatus{State: lib.StateWorking}, Final: false}),
+	}), false)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-boot-think-1", TS: t0.Add(4 * time.Second), TaskID: taskID, ContextID: "ctx-1",
+		Kind: lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: taskID, Append: false,
+			Artifact: lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Delegating specialist task: Increase replica count on a workload.\tCreating Kanban card."}}},
+		}),
+	}), false)
+	s.ingestTaskEnvelope(outSubj, mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "env-boot-act-1", TS: t0.Add(5 * time.Second), TaskID: taskID, ContextID: "ctx-1",
+		Kind: lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{
+			TaskID: taskID, Append: false,
+			Artifact: lib.Artifact{Name: lib.ArtifactActivity, Parts: []lib.Part{{Kind: "data", Data: json.RawMessage(`{"tool":"kanban_create","input":{"assignee":"platform","title":"Increase replica count on a workload"},"callId":"call-1","status":"completed","resultPreview":"Created task t_9ebe3ccb: Increase replica count on a workload","sessionId":"a2a-ctx-1","worker":"platform","durationMs":22,"at":"2026-10-17T14:00:35Z"}`)}}},
+		}),
+	}), false)
+
+	rec := s.GetTask(taskID)
+	if !rec.Terminal || rec.State != lib.StateCompleted {
+		t.Fatalf("expected task to remain completed/terminal after out-of-order replay, got state=%s terminal=%v", rec.State, rec.Terminal)
+	}
+	if !strings.Contains(rec.Thinking, "Delegating specialist task") || !strings.Contains(rec.Thinking, "Specialist check completed") {
+		t.Fatalf("expected both initial and final thinking steps preserved in chronological order, got:\n%s", rec.Thinking)
+	}
+	if len(rec.Activities) != 2 || rec.Activities[0].Tool != "kanban_create" || rec.Activities[1].Tool != "kanban_complete" {
+		t.Fatalf("expected activities sorted chronologically [kanban_create, kanban_complete], got: %+v", rec.Activities)
+	}
+	cards, doneCount, runningCount, totalCount, _ := extractKanbanCardsFromTask(rec)
+	if totalCount != 1 || doneCount != 1 || runningCount != 0 || cards[0].ID != "t_9ebe3ccb" {
+		t.Fatalf("expected 1 completed card t_9ebe3ccb (no trailing colon duplicate), got total=%d done=%d running=%d cards=%+v",
+			totalCount, doneCount, runningCount, cards)
 	}
 }

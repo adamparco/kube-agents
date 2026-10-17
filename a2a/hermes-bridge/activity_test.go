@@ -1508,4 +1508,42 @@ func TestSessionActivityState_DetailedInputsResultPreviewsAndWorkerAttribution(t
 	if !ok || !strings.HasPrefix(thinkingLine, "Inspecting GKE cluster drift-peer-ap-1.\t") {
 		t.Fatalf("expected resource-qualified thinking line, got %q", thinkingLine)
 	}
+
+	// 4. Kanban worker post_api_request while waitingCard is true: must emit incremental worker
+	// thinking steps (instead of dropping them because d.SessionID != a.sessionID) and bind
+	// session to cardID from top-level cwd (/opt/data/kanban/workspaces/<card_id>).
+	act.waitingCard.Store(true)
+	act.observe(mustDelivery(`{
+		"hook_event_name": "post_api_request",
+		"session_id": "20261017_140036_e0c3f7",
+		"cwd": "/opt/data/kanban/workspaces/t_01",
+		"profile": "platform",
+		"extra": {
+			"finish_reason": "tool_calls",
+			"response": {
+				"finish_reason": "tool_calls",
+				"assistant_message": {
+					"role": "assistant",
+					"content": "<think>Editing deployment manifest to increase replicas from 1 to 2.</think>",
+					"tool_calls": [
+						{
+							"id": "call_patch_1",
+							"type": "function",
+							"function": {
+								"name": "patch",
+								"arguments": "{\"path\":\"/opt/data/kanban/workspaces/t_01/repo/workloads/store-v1/deployment.yaml\"}"
+							}
+						}
+					]
+				}
+			}
+		}
+	}`))
+	workerThinking, ok := act.takeThinking()
+	if !ok || !strings.HasPrefix(workerThinking, "Editing store-v1/deployment.yaml.\tEditing deployment manifest") {
+		t.Fatalf("expected Kanban worker post_api_request thinking step, got ok=%v line=%q", ok, workerThinking)
+	}
+	if !act.hasWorkerSession("20261017_140036_e0c3f7") {
+		t.Fatal("expected worker session to be bound via cwd /kanban/workspaces/t_01")
+	}
 }

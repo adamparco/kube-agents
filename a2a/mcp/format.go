@@ -817,7 +817,7 @@ func collectDeltaActivities(outcome *TurnOutcome) []ActivityItem {
 
 var (
 	kanbanResultIDRe       = regexp.MustCompile(`\bid=([A-Za-z0-9_-]+)`)
-	specialistStepHeaderRe = regexp.MustCompile(`(?i)^Specialist check completed:\s*(.+?)\s*\(([^)—-]+?)\s*[—-]\s*(\d+)/(\d+)\s+cards\s+done\)\.?$`)
+	specialistStepHeaderRe = regexp.MustCompile(`(?i)^Specialist check completed:\s*(.+?)\s*\(([^()—-]+?)\s*[—-]\s*(\d+)/(\d+)\s+cards\s+done\)\.?$`)
 	knownClusterNameRe     = regexp.MustCompile(`\b(drift-peer-[a-z0-9-]+|kube-agents-host|spot-capacity-test|gke-[a-z0-9_-]+)\b`)
 )
 
@@ -1158,6 +1158,16 @@ func describeActivityWaitStep(act ActivityItem, activeAgent string) string {
 			return qualifyWithCluster("Running cluster preflight check", "on", cluster)
 		case strings.Contains(lowerCmd, "/user.md"):
 			return qualifyWithCluster("Reading cluster profile USER.md", "for", cluster)
+		case strings.Contains(lowerCmd, "gh pr create") || strings.Contains(lowerCmd, "gh pr "):
+			return qualifyWithCluster("Opening GitHub Pull Request", "for", cluster)
+		case strings.Contains(lowerCmd, "git commit") || strings.Contains(lowerCmd, "git push"):
+			return qualifyWithCluster("Committing and pushing manifest changes", "for", cluster)
+		case strings.Contains(lowerCmd, "git checkout") || strings.Contains(lowerCmd, "git switch") || strings.Contains(lowerCmd, "git branch"):
+			return qualifyWithCluster("Preparing feature branch in GitOps repository", "for", cluster)
+		case strings.Contains(lowerCmd, "git clone") || strings.Contains(lowerCmd, "git fetch") || strings.Contains(lowerCmd, "git pull"):
+			return qualifyWithCluster("Cloning and syncing GitOps repository", "for", cluster)
+		case strings.Contains(lowerCmd, "git status") || strings.Contains(lowerCmd, "git diff") || strings.Contains(lowerCmd, "git log"):
+			return qualifyWithCluster("Reviewing repository status and manifest diff", "for", cluster)
 		case strings.Contains(lowerCmd, "kubectl top"):
 			return qualifyWithCluster("Checking node and pod resource usage", "on", cluster)
 		case strings.Contains(lowerCmd, "kubectl describe node"):
@@ -1184,6 +1194,24 @@ func describeActivityWaitStep(act ActivityItem, activeAgent string) string {
 			return qualifyWithCluster("Reading "+sp, "on", cluster)
 		}
 		return qualifyWithCluster("Reading file in the workspace", "on", cluster)
+	case toolName == "patch" || toolName == "edit_file" || toolName == "replace_in_file":
+		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
+		if sp := shortActivityPath(p); sp != "" {
+			return qualifyWithCluster("Editing "+sp, "for", cluster)
+		}
+		return qualifyWithCluster("Editing file in the workspace", "for", cluster)
+	case toolName == "write_file" || toolName == "create_file":
+		p := firstNonEmptyArgString(args, "path", "file_path", "filepath")
+		if sp := shortActivityPath(p); sp != "" {
+			return qualifyWithCluster("Writing "+sp, "for", cluster)
+		}
+		return qualifyWithCluster("Writing file in the workspace", "for", cluster)
+	case toolName == "search_files" || toolName == "find_by_name" || toolName == "list_dir" || toolName == "glob":
+		p := firstNonEmptyArgString(args, "path", "pattern", "query")
+		if sp := shortActivityPath(p); sp != "" {
+			return qualifyWithCluster("Inspecting workspace files ("+sp+")", "for", cluster)
+		}
+		return qualifyWithCluster("Inspecting files in the workspace", "for", cluster)
 	case toolName == "mcp__gke__list_node_pools" || toolName == "mcp__gke__get_node_pool":
 		return qualifyWithCluster("Inspecting GKE node pools", "for", cluster)
 	case toolName == "mcp__gke__list_operations":
@@ -1280,10 +1308,21 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 			var thought string
 			var lastDiagAct *ActivityItem
 			for i := len(deltaActs) - 1; i >= 0; i-- {
-				if !strings.HasPrefix(deltaActs[i].Tool, "kanban_") && deltaActs[i].Tool != "tool_search" && deltaActs[i].Tool != "tool_describe" {
+				t := deltaActs[i].Tool
+				if t == "kanban_heartbeat" {
+					args := parseActivityArgMap(deltaActs[i].Input)
+					if note := firstNonEmptyArgString(args, "note", "status", "message"); note != "" && !strings.HasPrefix(note, "<string,") {
+						lastDiagAct = &deltaActs[i]
+						break
+					}
+				}
+				if !strings.HasPrefix(t, "kanban_") && t != "tool_search" && t != "tool_describe" {
 					lastDiagAct = &deltaActs[i]
 					break
 				}
+			}
+			if lastDiagAct == nil && len(deltaActs) > 0 {
+				lastDiagAct = &deltaActs[len(deltaActs)-1]
 			}
 			switch {
 			case lastDiagAct != nil:
@@ -1302,18 +1341,17 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 				}
 			case totalCards > 0 && doneCards < totalCards:
 				currentStep = fmt.Sprintf("Specialist checks in progress (%d/%d completed, %d running)", doneCards, totalCards, runningCards)
+				if outcome.PrimaryTask != nil && len(outcome.PrimaryTask.Activities) > 0 {
+					lastAct := outcome.PrimaryTask.Activities[len(outcome.PrimaryTask.Activities)-1]
+					actStep := strings.TrimSuffix(describeActivityWaitStep(lastAct, activeAgent), ".")
+					if actStep != "" && !strings.HasPrefix(actStep, "Waiting for ") {
+						currentStep = fmt.Sprintf("%s (%d/%d cards done)", actStep, doneCards, totalCards)
+					}
+				}
 				if latestNote != "" {
 					thought = latestNote
 				} else {
 					thought = fmt.Sprintf("Waiting for %d specialist card(s) to finish diagnostics (%d/%d completed).", runningCards, doneCards, totalCards)
-				}
-			case len(deltaActs) > 0:
-				lastAct := deltaActs[len(deltaActs)-1]
-				currentStep = strings.TrimSuffix(describeActivityWaitStep(lastAct, activeAgent), ".")
-				if latestNote != "" {
-					thought = latestNote
-				} else {
-					thought = fmt.Sprintf("Executed %d new tool %s during active step.", len(deltaActs), pluralizeWord(len(deltaActs), "call", "calls"))
 				}
 			default:
 				currentStep = fmt.Sprintf("Waiting for %s to complete active step", activeAgent)

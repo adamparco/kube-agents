@@ -676,8 +676,9 @@ for r in rows:
         run_cols = {c[1] for c in conn.execute("PRAGMA table_info(task_runs)")}
         ws_col = "session_id" if "session_id" in run_cols else ("worker_session_id" if "worker_session_id" in run_cols else "''")
         verd_col = "verdict" if "verdict" in run_cols else "''"
+        meta_col = "metadata" if "metadata" in run_cols else "''"
         run_row = conn.execute(
-            f"SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error, COALESCE({ws_col}, '') AS worker_session_id, COALESCE({verd_col}, '') AS verdict "
+            f"SELECT COALESCE(summary, '') AS summary, COALESCE(error, '') AS error, COALESCE({ws_col}, '') AS worker_session_id, COALESCE({verd_col}, '') AS verdict, COALESCE({meta_col}, '') AS metadata "
             "FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (r["id"],),
         ).fetchone()
@@ -690,6 +691,19 @@ for r in rows:
                 item["worker_session_id"] = run_row["worker_session_id"]
             if run_row["verdict"]:
                 item["verdict"] = run_row["verdict"]
+            if run_row["metadata"]:
+                try:
+                    meta = json.loads(run_row["metadata"])
+                    if isinstance(meta, dict):
+                        if not item.get("worker_session_id") and meta.get("worker_session_id"):
+                            item["worker_session_id"] = str(meta["worker_session_id"])
+                        if not item.get("verdict"):
+                            for vk in ("health_status", "verdict", "status"):
+                                if meta.get(vk):
+                                    item["verdict"] = str(meta[vk])
+                                    break
+                except Exception:
+                    pass
     except Exception:
         pass
     try:
@@ -856,13 +870,20 @@ func inferKanbanCardVerdict(c kanbanCardRow) string {
 	case "blocked", "failed", "gave_up", "canceled", "cancelled":
 		return st
 	}
-	lowerOut := strings.ToLower(formatKanbanCardOutput(c))
+	leadLine := ""
+	for _, line := range strings.Split(formatKanbanCardOutput(c), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			leadLine = strings.ToLower(line)
+			break
+		}
+	}
 	switch {
-	case strings.Contains(lowerOut, "unhealthy") || strings.Contains(lowerOut, "critical"):
+	case strings.Contains(leadLine, "unhealthy") || strings.Contains(leadLine, "critical"):
 		return "unhealthy"
-	case strings.Contains(lowerOut, "degraded") || strings.Contains(lowerOut, "crashloopbackoff") || strings.Contains(lowerOut, "imagepullbackoff") || strings.Contains(lowerOut, "oomkilled"):
+	case strings.Contains(leadLine, "is degraded") || strings.Contains(leadLine, "status: degraded") || strings.HasPrefix(leadLine, "degraded"):
 		return "degraded"
-	case strings.Contains(lowerOut, "healthy") || strings.Contains(lowerOut, "all nodes ready"):
+	case strings.Contains(leadLine, "healthy") || strings.Contains(leadLine, "all nodes ready"):
 		return "healthy"
 	}
 	if st != "" {

@@ -392,6 +392,8 @@ type hookDelivery struct {
 	// SessionID is the hermes session the call ran in, top-level in the
 	// payload; the door attributes an API-executor delivery by it.
 	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd"`
+	Profile   string `json:"profile"`
 	Extra     struct {
 		ToolCallID       string          `json:"tool_call_id"`
 		DurationMs       json.Number     `json:"duration_ms"`
@@ -423,6 +425,8 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Timestamp = lenientString(top["timestamp"])
 	d.DeliveryID = lenientString(top["delivery_id"])
 	d.SessionID = lenientString(top["session_id"])
+	d.Cwd = lenientString(top["cwd"])
+	d.Profile = lenientString(top["profile"])
 	var extra map[string]json.RawMessage
 	if raw, ok := top["extra"]; ok {
 		_ = json.Unmarshal(raw, &extra)
@@ -668,10 +672,20 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	switch d.Event {
 	case hookPostAPIRequest:
 		a.apiCalls++
-		if a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID {
+		if a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID && !a.waitingCard.Load() {
 			return ActivityEntry{}, false
 		}
+		isWorker := a.sessionID != "" && d.SessionID != "" && d.SessionID != a.sessionID
+		if isWorker {
+			a.observeWorkerHookContextLocked(d)
+		}
 		cand := formatAPIRequestThinkingWithMode(d, a.apiCalls, a.calls, a.sessionID != "")
+		if (isWorker || a.cardsFiled.Load()) && cand == "Synthesizing findings into final response." {
+			cand = ""
+		}
+		if isWorker && cand != "" {
+			cand = a.qualifyWorkerThinkingLocked(d.SessionID, cand)
+		}
 		if cand != "" && cand != a.prevThinking {
 			a.lastThinking = cand
 			a.prevThinking = cand
@@ -685,6 +699,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		var sessID, worker string
 		if a.sessionID != "" {
 			inp = redactInputDetailed(d.ToolName, d.ToolInput)
+			a.observeWorkerHookContextLocked(d)
 			a.observeCardBindingLocked(d.SessionID, d.ToolName, d.ToolInput, "")
 			sessID = capRunes(d.SessionID, activityCallIDCap)
 			worker = a.workerLabelLocked(d.SessionID, d.ToolName, d.ToolInput, "")
@@ -743,6 +758,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
 		if a.sessionID != "" {
+			a.observeWorkerHookContextLocked(d)
 			resPreview, errMsg, createdCardID := summarizeToolResult(d.ToolName, status, d.Extra.ErrorMessage, d.Extra.Result)
 			a.observeCardBindingLocked(d.SessionID, d.ToolName, rawToolInput, createdCardID)
 			e.SessionID = capRunes(d.SessionID, activityCallIDCap)
@@ -792,6 +808,94 @@ func (a *activityState) SyncKanbanCardDetails(cardID, title, assignee, workerSes
 		a.sessionCards[workerSessionID] = cardID
 		a.claimedSessions[workerSessionID] = true
 	}
+}
+
+func extractKanbanCardIDFromCwd(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	const marker = "/kanban/workspaces/"
+	idx := strings.Index(cwd, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := cwd[idx+len(marker):]
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		rest = rest[:slash]
+	}
+	return strings.TrimSpace(rest)
+}
+
+func (a *activityState) observeWorkerHookContextLocked(d hookDelivery) {
+	sessID := strings.TrimSpace(d.SessionID)
+	if sessID == "" || sessID == a.sessionID || strings.HasPrefix(sessID, apiSessionIDPrefix) {
+		return
+	}
+	if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+		a.sessionCards[sessID] = cid
+		a.claimedSessions[sessID] = true
+		return
+	}
+	if prof := strings.ToLower(strings.TrimSpace(d.Profile)); prof != "" && prof != "platform" && a.sessionCards[sessID] == "" {
+		if cid := a.cardAssignees[prof]; cid != "" {
+			a.sessionCards[sessID] = cid
+			a.claimedSessions[sessID] = true
+			return
+		}
+		for k, cid := range a.cardAssignees {
+			if k != "" && cid != "" && (strings.Contains(prof, k) || strings.Contains(k, prof)) {
+				a.sessionCards[sessID] = cid
+				a.claimedSessions[sessID] = true
+				return
+			}
+		}
+	}
+}
+
+func (a *activityState) qualifyWorkerThinkingLocked(sessionID, cand string) string {
+	if len(a.cardTitles) <= 1 {
+		return cand
+	}
+	cid := a.sessionCards[strings.TrimSpace(sessionID)]
+	title := strings.TrimSpace(a.cardTitles[cid])
+	if title == "" {
+		return cand
+	}
+	lowerTitle := strings.ToLower(title)
+	lines := strings.Split(cand, "\n")
+	for i, line := range lines {
+		head := line
+		tail := ""
+		if tab := strings.IndexByte(line, '\t'); tab >= 0 {
+			head = line[:tab]
+			tail = line[tab:]
+		}
+		headTrim := strings.TrimSpace(head)
+		if headTrim == "" || strings.Contains(strings.ToLower(headTrim), lowerTitle) {
+			continue
+		}
+		headNoDot := strings.TrimSuffix(headTrim, ".")
+		lines[i] = headNoDot + " (" + title + ")." + tail
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (a *activityState) hasCardID(cardID string) bool {
+	if a == nil || cardID == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cardTitles[cardID] != "" {
+		return true
+	}
+	for _, cid := range a.cardAssignees {
+		if cid == cardID {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *activityState) observeCardBindingLocked(sessionID, toolName string, rawInput json.RawMessage, createdCardID string) {
@@ -2490,10 +2594,26 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 				return r
 			}
 		}
+		if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+			for _, r := range waiting {
+				if a := r.act.Load(); a != nil && a.hasCardID(cid) {
+					a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
+					return r
+				}
+			}
+		}
 		for _, r := range waiting {
 			if a := r.act.Load(); a != nil && a.matchesWorkerPayload(body) {
 				a.claimWorkerSession(d.SessionID)
+				if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+					a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
+				}
 				return r
+			}
+		}
+		if cid := extractKanbanCardIDFromCwd(d.Cwd); cid != "" {
+			if a := waiting[0].act.Load(); a != nil {
+				a.SyncKanbanCardDetails(cid, "", d.Profile, d.SessionID)
 			}
 		}
 		return waiting[0]
