@@ -1460,3 +1460,112 @@ func mustJSON(v any) json.RawMessage {
 	}
 	return json.RawMessage(bytes.TrimSpace(buf.Bytes()))
 }
+
+// TestKanbanCardTasksLinkToForegroundTaskAndStreamAsSteps reproduces the 2026-10-16 "check the fresh
+// health of all my clusters" session: the platform agent fanned out 15 task-card-* specialist tasks
+// in the same conversation. Before the fix they (a) fired 15 task_completed push events that were
+// piggybacked onto a STREAMING_STEP_CONTINUE frame (12KB), (b) were invisible as progress, and (c)
+// a steer reset the step cursor so all 18 steps re-streamed as duplicates.
+func TestKanbanCardTasksLinkToForegroundTaskAndStreamAsSteps(t *testing.T) {
+	var pushed []PushEvent
+	s := &BusSession{
+		tasks:             make(map[string]*TaskRecord),
+		seenEnvelopes:     make(map[string]bool),
+		foregroundTasks:   make(map[string]time.Time),
+		watchedTasks:      make(map[string]int),
+		watchedConvs:      make(map[string]int),
+		lastReportedSteps: make(map[string]int),
+		bootstrapped:      true,
+		onPushEvent:       func(ev PushEvent) { pushed = append(pushed, ev) },
+	}
+	now := time.Now().UTC()
+	conv := "console:jetski-tok"
+
+	// Foreground platform task, being polled by task_control(get) (foreground lease, no conv watch).
+	s.ingestTaskEnvelope("a2a.tasks.platform.task-fg.in", mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "fg-1", TS: now, TaskID: "task-fg", ContextID: "ctx-fg",
+		Kind:      lib.KindMessage,
+		Authority: mustJSON(map[string]any{"audience": map[string]any{"conversation": conv}}),
+		Payload:   mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "check the fresh health of all my clusters"}}}),
+	}), true)
+	s.ingestTaskEnvelope("a2a.tasks.platform.task-fg.out", mustJSON(lib.Envelope{
+		Protocol: lib.Protocol, EnvelopeID: "fg-2", TS: now.Add(time.Second), TaskID: "task-fg", ContextID: "ctx-fg",
+		Kind:    lib.KindArtifactUpdate,
+		Payload: mustJSON(lib.ArtifactUpdate{TaskID: "task-fg", Artifact: lib.Artifact{Name: lib.ArtifactThinking, Parts: []lib.Part{{Kind: "text", Text: "Running kanban_create.\nWaiting for specialist agent tasks to complete."}}}}),
+	}), true)
+	s.markForegroundStepTask("task-fg", false)
+
+	// Two Kanban card tasks in the same conversation, no authority.via / delegatedFrom link.
+	for i, name := range []string{"drift-peer-std-9", "ap-ap-deploy-test"} {
+		id := fmt.Sprintf("task-card-t-%d", i)
+		base := now.Add(time.Duration(10+i) * time.Second)
+		s.ingestTaskEnvelope("a2a.tasks.platform."+id+".in", mustJSON(lib.Envelope{
+			Protocol: lib.Protocol, EnvelopeID: id + "-1", TS: base, TaskID: id, ContextID: "ctx-fg",
+			Kind:      lib.KindMessage,
+			Authority: mustJSON(map[string]any{"audience": map[string]any{"conversation": conv}}),
+			Payload:   mustJSON(lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: "Live health check for cluster " + name}}}),
+		}), true)
+		s.ingestTaskEnvelope("a2a.tasks.platform."+id+".out", mustJSON(lib.Envelope{
+			Protocol: lib.Protocol, EnvelopeID: id + "-2", TS: base.Add(20 * time.Second), TaskID: id, ContextID: "ctx-fg",
+			Kind:    lib.KindArtifactUpdate,
+			Payload: mustJSON(lib.ArtifactUpdate{TaskID: id, Artifact: lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "**Cluster `" + name + "` is healthy.**\n\nLive checks: 2/2 nodes Ready, 0 pods pending."}}}}),
+		}), true)
+		s.ingestTaskEnvelope("a2a.tasks.platform."+id+".out", mustJSON(lib.Envelope{
+			Protocol: lib.Protocol, EnvelopeID: id + "-3", TS: base.Add(21 * time.Second), TaskID: id, ContextID: "ctx-fg",
+			Kind:    lib.KindStatusUpdate,
+			Payload: mustJSON(lib.StatusUpdate{TaskID: id, Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true}),
+		}), true)
+	}
+
+	if got := s.GetTask("task-card-t-0").CardParentTaskID; got != "task-fg" {
+		t.Fatalf("card task not linked to foreground task: CardParentTaskID=%q", got)
+	}
+	if len(pushed) != 0 {
+		t.Errorf("card completions must not fire push events while the parent is in the foreground; got %d: %+v", len(pushed), pushed)
+	}
+
+	outcome := s.BuildTaskOutcome("task-fg", "default", "jetski-tok", "check the fresh health of all my clusters", true)
+	if len(outcome.CardTasks) != 2 {
+		t.Fatalf("expected 2 card tasks on outcome, got %d", len(outcome.CardTasks))
+	}
+	steps := CollectOutcomeSteps(outcome)
+	joined := strings.Join(steps, "\n")
+	for _, want := range []string{
+		"Specialist check completed: Cluster `drift-peer-std-9` is healthy.",
+		"Specialist check completed: Cluster `ap-ap-deploy-test` is healthy.",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("card progress missing from steps; want %q in:\n%s", want, joined)
+		}
+	}
+	details := CollectOutcomeStepDetails(outcome)
+	var cardMD string
+	for _, d := range details {
+		if strings.HasPrefix(d.Title, "Specialist check completed: Cluster `drift-peer-std-9`") {
+			cardMD = FormatStepDetailMarkdown(d, 30, true)
+		}
+	}
+	if !strings.Contains(cardMD, "(task `task-card-t-0`)") || !strings.Contains(cardMD, "2/2 nodes Ready") {
+		t.Errorf("expanded card step should carry card task id and result thought:\n%s", cardMD)
+	}
+
+	// STREAMING_STEP_CONTINUE frame with no new step must say so and report card progress.
+	s.recordStepProgress("task-fg", len(steps), len(steps))
+	outcome = s.BuildTaskOutcome("task-fg", "default", "jetski-tok", "", true)
+	_, _, llm := FormatTurnCustomToolEnvelope(outcome, false)
+	for _, want := range []string{streamingStepContinuePrefix, "No new step since the last poll", "Specialist cards: 2/2 completed", "Do NOT call `list`, `steer`"} {
+		if !strings.Contains(llm, want) {
+			t.Errorf("no-new-step frame missing %q:\n%s", want, llm)
+		}
+	}
+
+	// Piggyback is bounded.
+	var many []PushEvent
+	for i := 0; i < 15; i++ {
+		many = append(many, PushEvent{Kind: eventKindTaskCompleted, Title: fmt.Sprintf("card %d", i), Summary: strings.Repeat("x", 900)})
+	}
+	md := FormatPushEventsMarkdownBounded(many, maxPiggybackEvents, piggybackSummaryMaxChars)
+	if strings.Count(md, "task_completed") != maxPiggybackEvents || !strings.Contains(md, "+ 9 earlier events omitted") || len(md) > 4000 {
+		t.Errorf("bounded piggyback not bounded (len=%d, events=%d):\n%s", len(md), strings.Count(md, "task_completed"), md)
+	}
+}

@@ -175,22 +175,27 @@ func FormatBusStatusMarkdown(rep BusStatusReport, conv ConversationEntry, push P
 }
 
 var (
-	legacyStepPrefixRe     = regexp.MustCompile(`^Step\s+\d+:\s*`)
-	legacyPlanPrefixRe     = regexp.MustCompile(`(?i)^Planning\s*&\s*executing\s+\d+\s+tool\s+call\(s\)\s*[—-]\s*`)
-	legacyActionPrefixRe   = regexp.MustCompile(`^→\s*Action:\s*`)
-	legacySynthPrefixRe    = regexp.MustCompile(`(?i)^Synthesizing findings from \d+ completed tool call\(s\) into final response\.?$`)
-	legacyKeyBracketSufRe  = regexp.MustCompile(`\s*\[[A-Za-z0-9_,\s-]+\]$`)
-	kanbanProgressDoneRe   = regexp.MustCompile(`(?i)\b(\d+/\d+)\s+done\b`)
-	kanbanStillRunningRe   = regexp.MustCompile(`(?i)\b(still running|wait \d+\s*s|re-check|heartbeating)\b`)
-	preflightDiagRe        = regexp.MustCompile(`(?i)\bpreflight\b.*\bdiagnostics\b`)
-	nodePoolInspectRe      = regexp.MustCompile(`(?i)\bnode\s*pools?\b.*\b(pods?|nodes?|events?)\b`)
+	legacyStepPrefixRe        = regexp.MustCompile(`^Step\s+\d+:\s*`)
+	legacyPlanPrefixRe        = regexp.MustCompile(`(?i)^Planning\s*&\s*executing\s+\d+\s+tool\s+call\(s\)\s*[—-]\s*`)
+	legacyActionPrefixRe      = regexp.MustCompile(`^→\s*Action:\s*`)
+	legacySynthPrefixRe       = regexp.MustCompile(`(?i)^Synthesizing findings from \d+ completed tool call\(s\) into final response\.?$`)
+	legacyKeyBracketSufRe     = regexp.MustCompile(`\s*\[[A-Za-z0-9_,\s-]+\]$`)
+	kanbanProgressDoneRe      = regexp.MustCompile(`(?i)\b(\d+/\d+)\s+done\b`)
+	kanbanStillRunningRe      = regexp.MustCompile(`(?i)\b(still running|wait \d+\s*s|re-check|heartbeating)\b`)
+	preflightDiagRe           = regexp.MustCompile(`(?i)\bpreflight\b.*\bdiagnostics\b`)
+	nodePoolInspectRe         = regexp.MustCompile(`(?i)\bnode\s*pools?\b.*\b(pods?|nodes?|events?)\b`)
 	conversationalStartRe     = regexp.MustCompile(`(?i)^(let's |let me |now |i will |i'll |i've |i have |first[, ]|next[, ]|okay[, ]|ok[, .]|all \d+ |both |delegating )`)
 	shapedStringPlaceholderRe = regexp.MustCompile(`^<string,\s*(\d+)\s*chars>$`)
 )
 
 const (
 	synthFinalStepTitle = "Synthesizing findings into final response."
-	maxStepActivitiesShown = 6
+	// streamingStepContinuePrefix marks an intermediate (task still running) tool result frame.
+	streamingStepContinuePrefix = "STREAMING_STEP_CONTINUE:"
+	maxStepActivitiesShown      = 6
+	cardHeadlineMaxChars        = 64
+	cardThoughtMaxChars         = 400
+	mergedThoughtMaxChars       = 420
 )
 
 // StepDetail holds the clean high-level action title and the expandable details
@@ -316,8 +321,8 @@ func CollectOutcomeStepDetails(outcome *TurnOutcome) []StepDetail {
 				}
 				if rawDetails[i].Thought == "" && sd.Thought != "" {
 					rawDetails[i].Thought = sd.Thought
-				} else if sd.Thought != "" && !strings.Contains(rawDetails[i].Thought, sd.Thought) {
-					rawDetails[i].Thought += " " + sd.Thought
+				} else if sd.Thought != "" {
+					rawDetails[i].Thought = mergeThoughts(rawDetails[i].Thought, sd.Thought)
 				}
 				if rawDetails[i].Agent == "" && sd.Agent != "" {
 					rawDetails[i].Agent = sd.Agent
@@ -342,6 +347,13 @@ func CollectOutcomeStepDetails(outcome *TurnOutcome) []StepDetail {
 	}
 
 	for _, sd := range collectRecStepDetails(outcome.PrimaryTask) {
+		appendDetail(sd)
+	}
+	primaryID := ""
+	if outcome.PrimaryTask != nil {
+		primaryID = outcome.PrimaryTask.TaskID
+	}
+	for _, sd := range collectCardStepDetails(outcome.CardTasks, primaryID) {
 		appendDetail(sd)
 	}
 	for idx, d := range outcome.PrimaryTaskDelegates() {
@@ -369,6 +381,9 @@ func CollectOutcomeStepDetails(outcome *TurnOutcome) []StepDetail {
 		for _, sd := range collectRecStepDetails(child) {
 			appendDetail(sd)
 		}
+		for _, sd := range collectCardStepDetails(outcome.CardTasks, child.TaskID) {
+			appendDetail(sd)
+		}
 	}
 	for _, sd := range collectRecStepDetails(outcome.WakeTask) {
 		appendDetail(sd)
@@ -391,6 +406,103 @@ func CollectOutcomeStepDetails(outcome *TurnOutcome) []StepDetail {
 		filtered = append(filtered, sd)
 	}
 	return filtered
+}
+
+// collectCardStepDetails renders Kanban specialist card tasks fanned out by parentID as steps:
+// one row per card, titled by the card's result headline (or prompt while still running), with the
+// card's result text as the expandable Thought so long platform fan-outs show real progress instead
+// of a silent multi-minute "waiting" gap.
+func collectCardStepDetails(cards []*TaskRecord, parentID string) []StepDetail {
+	if parentID == "" {
+		return nil
+	}
+	var out []StepDetail
+	for _, card := range cards {
+		if card == nil || card.CardParentTaskID != parentID {
+			continue
+		}
+		headline := cardHeadline(card)
+		var title, thought string
+		switch {
+		case card.Terminal && (card.State == lib.StateFailed || card.State == lib.StateRejected || card.State == lib.StateCanceled):
+			title = fmt.Sprintf("Specialist check %s: %s.", card.State, headline)
+			thought = firstNonEmptyStr(card.StatusText, card.ResultText, card.ProgressText)
+		case card.Terminal:
+			title = fmt.Sprintf("Specialist check completed: %s.", headline)
+			thought = firstNonEmptyStr(card.ResultText, card.ProgressText, card.StatusText)
+		default:
+			title = fmt.Sprintf("Specialist check running: %s.", headline)
+			thought = firstNonEmptyStr(card.ProgressText, card.PromptText)
+		}
+		thought = strings.ReplaceAll(thought, "**", "")
+		thought = truncateText(strings.Join(strings.Fields(thought), " "), cardThoughtMaxChars)
+		out = append(out, StepDetail{
+			Title:      title,
+			Thought:    thought,
+			Agent:      card.Addressee,
+			TaskID:     card.TaskID,
+			Activities: append([]ActivityItem(nil), card.Activities...),
+		})
+	}
+	return out
+}
+
+func cardHeadline(card *TaskRecord) string {
+	if card.ResultChat != nil && strings.TrimSpace(card.ResultChat.Headline) != "" {
+		return cleanCardHeadline(card.ResultChat.Headline)
+	}
+	if card.ProgressChat != nil && strings.TrimSpace(card.ProgressChat.Headline) != "" {
+		return cleanCardHeadline(card.ProgressChat.Headline)
+	}
+	for _, cand := range []string{card.ResultText, card.PromptText, card.ProgressText} {
+		for _, line := range strings.Split(cand, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				return cleanCardHeadline(line)
+			}
+		}
+	}
+	return card.TaskID
+}
+
+func cleanCardHeadline(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "*_#> ")
+	s = strings.ReplaceAll(s, "**", "")
+	// Keep the verdict, drop the elaboration: "X is healthy — 1/1 node Ready, ..." -> "X is healthy".
+	for _, sep := range []string{" — ", " - ", ": ", "; "} {
+		if idx := strings.Index(s, sep); idx > 12 {
+			s = s[:idx]
+			break
+		}
+	}
+	s = strings.TrimSuffix(strings.TrimSpace(s), ".")
+	return truncateText(s, cardHeadlineMaxChars)
+}
+
+// mergeThoughts appends a new thought to an existing one for a deduplicated step, bounded so a
+// step that absorbs many in-process worker thoughts (platform fan-outs run card workers in the same
+// hermes session) keeps only the most recent reasoning instead of growing without limit.
+func mergeThoughts(existing, added string) string {
+	added = strings.TrimSpace(added)
+	if added == "" {
+		return existing
+	}
+	if existing == "" {
+		return added
+	}
+	if strings.Contains(existing, added) {
+		return existing
+	}
+	merged := existing + " " + added
+	if len(merged) <= mergedThoughtMaxChars {
+		return merged
+	}
+	tail := merged[len(merged)-mergedThoughtMaxChars:]
+	if idx := strings.Index(tail, ". "); idx >= 0 && idx < mergedThoughtMaxChars/2 {
+		tail = tail[idx+2:]
+	}
+	return "… " + tail
 }
 
 func collectRecStepDetails(rec *TaskRecord) []StepDetail {
@@ -587,6 +699,10 @@ func toolNameToStepTitle(toolName string) string {
 		return "Communicating over the A2A bus."
 	case strings.HasPrefix(toolName, "mcp__developer_knowledge__"):
 		return "Searching documentation in Developer Knowledge."
+	case toolName == "web_search":
+		return "Searching the web."
+	case toolName == "web_extract" || toolName == "web_fetch" || toolName == "read_url_content":
+		return "Reading web page content."
 	default:
 		return fmt.Sprintf("Running %s.", toolName)
 	}
@@ -598,6 +714,19 @@ func (o *TurnOutcome) PrimaryTaskDelegates() []DelegateItem {
 		return nil
 	}
 	return o.PrimaryTask.Delegates
+}
+
+func countCardProgress(cards []*TaskRecord) (done int, total int) {
+	for _, c := range cards {
+		if c == nil {
+			continue
+		}
+		total++
+		if c.Terminal {
+			done++
+		}
+	}
+	return done, total
 }
 
 // FormatTurnCustomToolEnvelope builds the Jetski _custom_tool_result fields (title, markdown, result)
@@ -692,12 +821,17 @@ func FormatTurnCustomToolEnvelope(outcome *TurnOutcome, debug bool) (title strin
 		}
 
 		var llm strings.Builder
-		fmt.Fprintf(&llm, "STREAMING_STEP_CONTINUE: Task `%s` is actively running on `%s` (%ds elapsed, %d %s recorded).\n",
-			outcome.PrimaryTask.TaskID, activeAgent, sec, len(visibleDetails), pluralizeStep(len(visibleDetails)))
+		fmt.Fprintf(&llm, "%s Task `%s` is actively running on `%s` (%ds elapsed, %d %s recorded).\n",
+			streamingStepContinuePrefix, outcome.PrimaryTask.TaskID, activeAgent, sec, len(visibleDetails), pluralizeStep(len(visibleDetails)))
 		if len(deltaDetails) > 0 {
 			fmt.Fprintf(&llm, "Latest step: %s\n", deltaDetails[len(deltaDetails)-1].Title)
+		} else {
+			llm.WriteString("No new step since the last poll: the remote agent is still inside a long-running step (remote tool calls, specialist fan-outs, and web lookups routinely take several minutes). This is normal and is NOT a stall.\n")
 		}
-		fmt.Fprintf(&llm, "\nNEXT ACTION REQUIRED: Immediately call `mcp_kube-agents_task_control` with `action: \"get\"`, `task_id: %q`, and `toolSummary: %q` to stream the next step. Do NOT output any assistant text before calling `task_control` so that all progress steps stay in a single collapsible list.\n",
+		if done, total := countCardProgress(outcome.CardTasks); total > 0 {
+			fmt.Fprintf(&llm, "Specialist cards: %d/%d completed.\n", done, total)
+		}
+		fmt.Fprintf(&llm, "\nNEXT ACTION REQUIRED: Immediately call `mcp_kube-agents_task_control` with `action: \"get\"`, `task_id: %q`, and `toolSummary: %q` to stream the next step. Do NOT output any assistant text before calling `task_control` so that all progress steps stay in a single collapsible list. Do NOT call `list`, `steer`, `stop`, `poll_events`, `manage_session`, or read any files while this loop is active unless the user explicitly asks; just keep polling `get` until a final answer (no STREAMING_STEP_CONTINUE prefix) is returned.\n",
 			outcome.PrimaryTask.TaskID, truncateText(nextSummaryHint, 48))
 
 		return title, stepMD, strings.TrimSpace(llm.String())
@@ -1324,6 +1458,10 @@ func cleanSingleThinkingLine(line string) string {
 		line = "Communicating over the A2A bus."
 	case strings.HasPrefix(line, "Running mcp__developer_knowledge__"):
 		line = "Searching documentation in Developer Knowledge."
+	case line == "Running web_search.":
+		line = "Searching the web."
+	case line == "Running web_extract." || line == "Running web_fetch." || line == "Running read_url_content.":
+		line = "Reading web page content."
 	case line == "Running tool_search.":
 		line = "Searching available tools."
 	case line == "Running tool_describe.":

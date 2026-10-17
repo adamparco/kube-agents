@@ -12,20 +12,23 @@ import (
 )
 
 const (
-	pushDebounceWindow  = 500 * time.Millisecond
-	pushSendTimeout     = 10 * time.Second
-	agentAPICmdSendMsg  = "send-message"
-	agentAPIFlagTitle   = "--title=Kube-Agents Push Notification"
-	pushWakeupHeader    = "🔔 **[Kube-Agents Live Push Notification]**\nThe remote `kube-agents` deployment pushed the following asynchronous event(s) over the A2A JetStream bus:\n\n"
-	piggybackHeader     = "\n\n---\n### 📬 Pending Kube-Agents Push Events\n"
-	hookInjectHeader    = "🔔 **[Kube-Agents Pending Push Events]**\nThe following asynchronous event(s) arrived from `kube-agents` on the A2A JetStream bus:\n\n"
-	emptyJSONResponse   = "{}\n"
-	iconDefaultPush     = "📩"
-	iconProactiveNotify = "📣"
-	iconTaskCompleted   = "✅"
-	iconTaskFailed      = "❌"
-	iconInputRequired   = "❓"
-	iconNoticePR        = "🔀"
+	pushDebounceWindow       = 500 * time.Millisecond
+	pushSendTimeout          = 10 * time.Second
+	agentAPICmdSendMsg       = "send-message"
+	agentAPIFlagTitle        = "--title=Kube-Agents Push Notification"
+	pushWakeupHeader         = "🔔 **[Kube-Agents Live Push Notification]**\nThe remote `kube-agents` deployment pushed the following asynchronous event(s) over the A2A JetStream bus:\n\n"
+	piggybackHeader          = "\n\n---\n### 📬 Pending Kube-Agents Push Events\n"
+	hookInjectHeader         = "🔔 **[Kube-Agents Pending Push Events]**\nThe following asynchronous event(s) arrived from `kube-agents` on the A2A JetStream bus:\n\n"
+	emptyJSONResponse        = "{}\n"
+	iconDefaultPush          = "📩"
+	iconProactiveNotify      = "📣"
+	iconTaskCompleted        = "✅"
+	iconTaskFailed           = "❌"
+	iconInputRequired        = "❓"
+	iconNoticePR             = "🔀"
+	maxPiggybackEvents       = 6
+	piggybackSummaryMaxChars = 280
+	maxWakeupEvents          = 12
 )
 
 // PushDispatcher coordinates storing asynchronous bus events and waking up
@@ -92,6 +95,8 @@ func (d *PushDispatcher) DispatchedCount() int {
 
 // DrainAndFormatPiggyback drains any unread events from the store and formats
 // them as a piggybacked Markdown section to append to an MCP tool response.
+// The section is bounded (maxPiggybackEvents / piggybackSummaryMaxChars) so a
+// burst of events can never dwarf the tool result it rides on.
 func (d *PushDispatcher) DrainAndFormatPiggyback() string {
 	if d.store == nil {
 		return ""
@@ -100,7 +105,41 @@ func (d *PushDispatcher) DrainAndFormatPiggyback() string {
 	if err != nil || len(events) == 0 {
 		return ""
 	}
-	return piggybackHeader + FormatPushEventsMarkdown(events)
+	return piggybackHeader + FormatPushEventsMarkdownBounded(events, maxPiggybackEvents, piggybackSummaryMaxChars)
+}
+
+// FormatPushEventsMarkdownBounded renders at most maxEvents events (newest last), truncating each
+// summary to maxSummaryChars and ending with a "+N more" line for the remainder.
+func FormatPushEventsMarkdownBounded(events []PushEvent, maxEvents int, maxSummaryChars int) string {
+	if len(events) == 0 {
+		return ""
+	}
+	shown := events
+	omitted := 0
+	if maxEvents > 0 && len(events) > maxEvents {
+		omitted = len(events) - maxEvents
+		shown = events[len(events)-maxEvents:]
+	}
+	bounded := make([]PushEvent, 0, len(shown))
+	for _, ev := range shown {
+		cp := ev
+		if maxSummaryChars > 0 {
+			cp.Summary = truncateText(strings.Join(strings.Fields(cp.Summary), " "), maxSummaryChars)
+		}
+		bounded = append(bounded, cp)
+	}
+	out := FormatPushEventsMarkdown(bounded)
+	if omitted > 0 {
+		out += fmt.Sprintf("\n*(+ %d earlier event%s omitted; call `poll_events` with `peek_only: true` to review the full queue history)*\n", omitted, pluralSuffix(omitted))
+	}
+	return out
+}
+
+func pluralSuffix(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func (d *PushDispatcher) loop(ctx context.Context) {
@@ -146,7 +185,7 @@ func (d *PushDispatcher) tryReactiveWakeup(ctx context.Context) {
 		return
 	}
 
-	body := pushWakeupHeader + FormatPushEventsMarkdown(pending)
+	body := pushWakeupHeader + FormatPushEventsMarkdownBounded(pending, maxWakeupEvents, pushSummaryMaxChars)
 	sendCtx, cancel := context.WithTimeout(ctx, pushSendTimeout)
 	defer cancel()
 

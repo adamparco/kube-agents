@@ -44,6 +44,8 @@ const (
 	topicClassJournal            = "journal"
 	defaultNotifyTitle           = "Proactive Kube-Agents Notification"
 	pushSummaryMaxChars          = 600
+	cardTaskIDPrefix             = "task-card-"
+	cardParentSkew               = 5 * time.Second
 	ellipsisSuffix               = "..."
 	consoleConvPrefix            = "console:"
 	consoleFrameKindText         = "text"
@@ -176,31 +178,35 @@ type DelegateItem struct {
 
 // TaskRecord holds the folded state and rich streaming artifacts of a task on TASKS.
 type TaskRecord struct {
-	TaskID              string           `json:"taskId"`
-	ContextID           string           `json:"contextId"`
-	CorrelationID       string           `json:"correlationId,omitempty"`
-	Addressee           string           `json:"addressee"`
-	Conversation        string           `json:"conversation,omitempty"`
-	DelegatedFromTaskID string           `json:"delegatedFromTaskId,omitempty"`
-	WakeFromChildTaskID string           `json:"wakeFromChildTaskId,omitempty"`
-	State               lib.TaskState    `json:"state"`
-	Terminal            bool             `json:"terminal"`
-	StatusText          string           `json:"statusText,omitempty"`
-	PromptText          string           `json:"promptText,omitempty"`
-	SteerTurns          []string         `json:"steerTurns,omitempty"`
-	IntermediateTurns   []string         `json:"intermediateTurns,omitempty"`
-	Thinking            string           `json:"thinking,omitempty"`
-	Activities          []ActivityItem   `json:"activities,omitempty"`
-	ProgressText        string           `json:"progressText,omitempty"`
-	ProgressChat        *chatmsg.Message `json:"progressChat,omitempty"`
-	Delegates           []DelegateItem   `json:"delegates,omitempty"`
-	Notices             []string         `json:"notices,omitempty"`
-	PRLinks             []string         `json:"prLinks,omitempty"`
-	ResultText          string           `json:"resultText,omitempty"`
-	ResultChat          *chatmsg.Message `json:"resultChat,omitempty"`
-	CreatedAt           time.Time        `json:"createdAt"`
-	UpdatedAt           time.Time        `json:"updatedAt"`
-	EnvelopeCount       int              `json:"envelopeCount"`
+	TaskID              string `json:"taskId"`
+	ContextID           string `json:"contextId"`
+	CorrelationID       string `json:"correlationId,omitempty"`
+	Addressee           string `json:"addressee"`
+	Conversation        string `json:"conversation,omitempty"`
+	DelegatedFromTaskID string `json:"delegatedFromTaskId,omitempty"`
+	WakeFromChildTaskID string `json:"wakeFromChildTaskId,omitempty"`
+	// CardParentTaskID links a Kanban specialist card task (task-card-*) spawned by the platform
+	// agent to the foreground task that was running in the same conversation when the card was
+	// created, so card progress renders as steps of that task instead of as unrelated push events.
+	CardParentTaskID  string           `json:"cardParentTaskId,omitempty"`
+	State             lib.TaskState    `json:"state"`
+	Terminal          bool             `json:"terminal"`
+	StatusText        string           `json:"statusText,omitempty"`
+	PromptText        string           `json:"promptText,omitempty"`
+	SteerTurns        []string         `json:"steerTurns,omitempty"`
+	IntermediateTurns []string         `json:"intermediateTurns,omitempty"`
+	Thinking          string           `json:"thinking,omitempty"`
+	Activities        []ActivityItem   `json:"activities,omitempty"`
+	ProgressText      string           `json:"progressText,omitempty"`
+	ProgressChat      *chatmsg.Message `json:"progressChat,omitempty"`
+	Delegates         []DelegateItem   `json:"delegates,omitempty"`
+	Notices           []string         `json:"notices,omitempty"`
+	PRLinks           []string         `json:"prLinks,omitempty"`
+	ResultText        string           `json:"resultText,omitempty"`
+	ResultChat        *chatmsg.Message `json:"resultChat,omitempty"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	UpdatedAt         time.Time        `json:"updatedAt"`
+	EnvelopeCount     int              `json:"envelopeCount"`
 }
 
 // TopicSnapshot holds the latest envelope and parsed summary/data for a topic subject.
@@ -260,9 +266,12 @@ type TurnOutcome struct {
 	PrimaryTask       *TaskRecord       `json:"primaryTask,omitempty"`
 	ChildTasks        []*TaskRecord     `json:"childTasks,omitempty"`
 	WakeTask          *TaskRecord       `json:"wakeTask,omitempty"`
-	TimedOut          bool              `json:"timedOut"`
-	PrevStepCount     int               `json:"prevStepCount,omitempty"`
-	ReportedStepCount int               `json:"reportedStepCount,omitempty"`
+	// CardTasks are Kanban specialist card tasks (task-card-*) the platform agent fanned out while
+	// working on PrimaryTask (or its delegated child); their progress is surfaced as steps.
+	CardTasks         []*TaskRecord `json:"cardTasks,omitempty"`
+	TimedOut          bool          `json:"timedOut"`
+	PrevStepCount     int           `json:"prevStepCount,omitempty"`
+	ReportedStepCount int           `json:"reportedStepCount,omitempty"`
 }
 
 type authorityWire struct {
@@ -360,16 +369,16 @@ func ConnectBusSession(ctx context.Context, runner CommandRunner, prof Deploymen
 	}
 
 	s := &BusSession{
-		profile:       prof,
-		natsURL:       natsURL,
-		tunnel:        tunnel,
-		nc:            nc,
-		js:            js,
-		onPushEvent:   onPushEvent,
-		tasks:         make(map[string]*TaskRecord),
-		seenEnvelopes: make(map[string]bool),
-		topics:        make(map[string]TopicSnapshot),
-		agentCards:    make(map[string]map[string]any),
+		profile:           prof,
+		natsURL:           natsURL,
+		tunnel:            tunnel,
+		nc:                nc,
+		js:                js,
+		onPushEvent:       onPushEvent,
+		tasks:             make(map[string]*TaskRecord),
+		seenEnvelopes:     make(map[string]bool),
+		topics:            make(map[string]TopicSnapshot),
+		agentCards:        make(map[string]map[string]any),
 		watchedConvs:      make(map[string]int),
 		watchedTasks:      make(map[string]int),
 		foregroundTasks:   make(map[string]time.Time),
@@ -577,9 +586,12 @@ func (s *BusSession) ingestTaskEnvelope(subject string, data []byte, isLive bool
 			}
 		}
 	}
+	if rec.CardParentTaskID == "" && strings.HasPrefix(rec.TaskID, cardTaskIDPrefix) {
+		rec.CardParentTaskID = s.findCardParentLocked(rec)
+	}
 
 	var pushToFire *PushEvent
-	watched := s.isWatchedLocked(rec.Conversation, rec.TaskID, rec.DelegatedFromTaskID)
+	watched := s.isWatchedLocked(rec.Conversation, rec.TaskID, firstNonEmptyStr(rec.DelegatedFromTaskID, rec.CardParentTaskID))
 
 	switch env.Kind {
 	case lib.KindMessage:
@@ -779,6 +791,19 @@ func (s *BusSession) isWatchedLocked(conv, taskID, parentTaskID string) bool {
 	}
 	if parentTaskID != "" && s.watchedTasks[parentTaskID] > 0 {
 		return true
+	}
+	// A card's parent may itself be a delegated child of the foreground task: walk one more hop.
+	if parentTaskID != "" {
+		if parent, ok := s.tasks[parentTaskID]; ok {
+			if gp := firstNonEmptyStr(parent.DelegatedFromTaskID, parent.CardParentTaskID); gp != "" && s.watchedTasks[gp] > 0 {
+				return true
+			}
+			if gp := firstNonEmptyStr(parent.DelegatedFromTaskID, parent.CardParentTaskID); gp != "" && s.foregroundTasks != nil {
+				if exp, ok := s.foregroundTasks[gp]; ok && time.Now().Before(exp) {
+					return true
+				}
+			}
+		}
 	}
 	now := time.Now()
 	if taskID != "" && s.foregroundTasks != nil {
@@ -1065,7 +1090,12 @@ func (s *BusSession) SendTurnWithOptions(ctx context.Context, store *ConfigStore
 		return outcome, err
 	}
 
-	s.resetStepProgress(primaryID)
+	// A brand-new task starts its step cursor at 0. A steer/follow-up absorbed by an already
+	// running task (primaryID existed in the baseline) must keep its cursor, otherwise every step
+	// already shown in Jetski would be re-streamed as a duplicate row.
+	if _, existed := baselineTasks[primaryID]; !existed {
+		s.resetStepProgress(primaryID)
+	}
 	timedOut := s.WaitForTaskStepOrSettlement(turnCtx, primaryID, streamSteps)
 	built := s.BuildTaskOutcome(primaryID, conv.Alias, conv.Token, text, timedOut)
 	built.ConsoleNotices = append(preNotices, s.consoleNoticesSince(conv.Token, noticeCursor)...)
@@ -1099,11 +1129,14 @@ func (s *BusSession) BuildTaskOutcome(primaryID string, convAlias string, convTo
 	}
 	children := s.findChildTasks(primaryID)
 	outcome.ChildTasks = children
+	childIDs := make([]string, 0, len(children))
 	for _, child := range children {
+		childIDs = append(childIDs, child.TaskID)
 		if wake := s.findWakeTask(child.TaskID); wake != nil {
 			outcome.WakeTask = wake
 		}
 	}
+	outcome.CardTasks = s.findCardTasks(primaryID, childIDs...)
 	return outcome
 }
 
@@ -1666,6 +1699,57 @@ func (s *BusSession) findWakeTask(childID string) *TaskRecord {
 		}
 	}
 	return nil
+}
+
+// findCardParentLocked picks the foreground task a freshly-seen Kanban card task belongs to: the
+// most recently updated non-terminal, non-card task in the same conversation (or context) that was
+// created before the card. Caller must hold s.mu.
+func (s *BusSession) findCardParentLocked(card *TaskRecord) string {
+	var best *TaskRecord
+	for _, other := range s.tasks {
+		if other == card || other.Terminal || strings.HasPrefix(other.TaskID, cardTaskIDPrefix) {
+			continue
+		}
+		sameConv := card.Conversation != "" && other.Conversation == card.Conversation
+		sameCtx := card.ContextID != "" && other.ContextID == card.ContextID
+		if !sameConv && !sameCtx {
+			continue
+		}
+		if !card.CreatedAt.IsZero() && !other.CreatedAt.IsZero() && other.CreatedAt.After(card.CreatedAt.Add(cardParentSkew)) {
+			continue
+		}
+		if best == nil || other.UpdatedAt.After(best.UpdatedAt) {
+			best = other
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.TaskID
+}
+
+// findCardTasks returns Kanban card tasks linked to parentID (or to any of its delegated children),
+// oldest first.
+func (s *BusSession) findCardTasks(parentID string, childIDs ...string) []*TaskRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	want := map[string]bool{parentID: true}
+	for _, id := range childIDs {
+		want[id] = true
+	}
+	var out []*TaskRecord
+	for _, rec := range s.tasks {
+		if rec.CardParentTaskID != "" && want[rec.CardParentTaskID] {
+			out = append(out, cloneTaskRecord(rec))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
 }
 
 func (s *BusSession) consoleNoticeCursor() int {

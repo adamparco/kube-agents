@@ -409,7 +409,10 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 	}
 
-	if name != toolPollEvents && s.dispatcher != nil {
+	// Piggyback pending push events, except (a) on poll_events, which reports them itself, and
+	// (b) on intermediate STREAMING_STEP_CONTINUE frames, where a burst of unrelated events would
+	// bloat the frame and derail the model's polling loop; they are delivered on the final frame.
+	if name != toolPollEvents && s.dispatcher != nil && !strings.HasPrefix(text, streamingStepContinuePrefix) {
 		if piggyback := s.dispatcher.DrainAndFormatPiggyback(); piggyback != "" {
 			text += piggyback
 			if customMarkdown != "" {
