@@ -629,6 +629,13 @@ const (
 	kanbanMaxEmptyPolls       = 3
 	kanbanOutOfTurnWindowSecs = 7200
 	hermesVenvPythonPath      = "/opt/hermes/.venv/bin/python3"
+
+	// Card synthesis (synthesizeCardAnswer).
+	cardAnswerSubstantiveChars = 600             // a model answer at least this long already synthesized its cards
+	cardSynthesisInputCap      = 120 << 10       // raw card text handed to the synthesis turn
+	cardSynthesisTimeout       = 4 * time.Minute // one extra model turn; falls back on expiry
+	cardTurnArtifactStride     = 1000            // keeps card-dump turn artifact ids clear of real turn numbers
+	cardResultsHeader          = "Specialist card results (raw):\n\n"
 )
 
 const kanbanPollPyScript = `
@@ -938,7 +945,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 						}
 					}
 					if len(parts) > 0 {
-						ackText = strings.Join(parts, "\n\n")
+						ackText = b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, ackText, relevant, parts)
 					}
 					break
 				}
@@ -967,6 +974,102 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	}
 	run.answerHeld = true
 	return ackText, true
+}
+
+// synthesizeCardAnswer turns the settled cards of a console turn into the turn's answer.
+//
+// Before: the raw card results were concatenated and *replaced* the model's answer, so a
+// 16-cluster fan-out delivered a 27 KB wall of per-card reports with no synthesis (the model's own
+// answer at that point is usually a one-liner such as "checking all 16 clusters."). Now the raw
+// results go onto the stream as a turn artifact (visible in debug/transcripts) and, unless the
+// model already wrote a substantive answer, one more API turn on the same session asks it to
+// synthesize them into the final answer. Any failure of that extra turn falls back to the
+// concatenation, never to a failed task.
+func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, sessionID string, turn int, ackText string, cards []kanbanCardRow, parts []string) string {
+	joined := strings.Join(parts, "\n\n")
+	// The raw card results are the evidence; keep them on the stream regardless of what the
+	// answer becomes.
+	b.publishTurnAnswer(run, turn*cardTurnArtifactStride, cardResultsHeader+joined)
+
+	if len(strings.TrimSpace(ackText)) >= cardAnswerSubstantiveChars {
+		// The model waited for its cards and already synthesized; its answer stands.
+		return ackText
+	}
+	if len(joined) > cardSynthesisInputCap {
+		joined = joined[:cardSynthesisInputCap] + "\n\n[... further card results truncated for synthesis ...]"
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "All %d specialist card(s) you filed for this request have now completed. Their results are below. ", len(cards))
+	sb.WriteString("Write the final answer to the user's original request as a synthesis: lead with the overall verdict, ")
+	sb.WriteString("then a compact per-item table (one row per card/cluster) with status and the one key fact, then only the ")
+	sb.WriteString("findings that need action with concrete next steps. Do not paste the raw reports; keep it under about ")
+	sb.WriteString("400 words unless the user explicitly asked for full detail. Do not run more tools or file more cards.\n\n")
+	for i, c := range cards {
+		title := strings.TrimSpace(c.Title)
+		if title == "" {
+			title = c.ID
+		}
+		fmt.Fprintf(&sb, "### Card %d: %s (%s)\n%s\n\n", i+1, title, strings.TrimSpace(c.Status), strings.TrimSpace(parts[minInt(i, len(parts)-1)]))
+	}
+	synth, ok := b.apiSynthesisTurn(run, taskCtx, sessionID, sb.String(), turn)
+	if !ok || strings.TrimSpace(synth) == "" {
+		return joined
+	}
+	return synth
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// apiSynthesisTurn posts one extra, non-steer turn to the session and returns its answer. It is
+// deliberately soft: no finalize on any failure (the caller falls back), because the task already
+// has a deliverable and this turn only improves it.
+func (b *Bridge) apiSynthesisTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, turn int) (string, bool) {
+	body, err := json.Marshal(apiChatRequest{
+		Model:    b.cfg.APIModel,
+		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
+	})
+	if err != nil {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(taskCtx, cardSynthesisTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.APIURL, bytes.NewReader(body))
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
+	req.Header.Set(apiSessionKeyHeader, sessionID)
+	req.Header.Set(apiSessionIDHeader, sessionID)
+	req.Header.Set(apiIdempotencyHeader, fmt.Sprintf("%s/synth-%d", run.origin.TaskID, turn))
+
+	resp, err := b.sendAPI(ctx, req, body)
+	if err != nil {
+		b.cfg.Logger.Warn("card synthesis turn failed; delivering raw card results", "task", run.origin.TaskID, "err", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode > 299 || len(raw) > apiResponseCap {
+		b.cfg.Logger.Warn("card synthesis turn refused; delivering raw card results",
+			"task", run.origin.TaskID, "status", resp.StatusCode, "err", err)
+		return "", false
+	}
+	var out apiChatResponse
+	if json.Unmarshal(raw, &out) != nil || len(out.Choices) == 0 || apiTurnFailed(&out) {
+		return "", false
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.state != stateRunning {
+		return "", false
+	}
+	return out.Choices[0].Message.Content, true
 }
 
 func sanitizeKanbanTaskToken(cardID string) string {
