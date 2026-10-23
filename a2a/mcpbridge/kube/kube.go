@@ -1,8 +1,8 @@
 // Package kube is the Kubernetes-facing side of the kube-agents MCP bridge:
-// it discovers deployments from the local kubeconfig, reads their credentials
-// Secret, and opens an in-process SPDY port-forward to the a2a-gateway MCP
-// listener. It implements mcpbridge.ClusterAccess so the bridge core stays
-// free of k8s.io dependencies.
+// it discovers deployments from the local kubeconfig, reads their
+// <agent>-a2a-mcp-token Secret when connecting, and opens an in-process SPDY
+// port-forward to the <agent>-a2a-mcp HTTP listener. It implements
+// mcpbridge.ClusterAccess so the bridge core stays free of k8s.io dependencies.
 package kube
 
 import (
@@ -20,8 +20,8 @@ func New() mcpbridge.ClusterAccess {
 }
 
 // DiscoverDeployments implements mcpbridge.ClusterAccess.
-func (Access) DiscoverDeployments(ctx context.Context, kubeContextFilter string, includeCredentials bool) ([]mcpbridge.DeploymentProfile, error) {
-	return DiscoverDeployments(ctx, kubeContextFilter, includeCredentials)
+func (Access) DiscoverDeployments(ctx context.Context, kubeContextFilter string) ([]mcpbridge.DeploymentProfile, error) {
+	return DiscoverDeployments(ctx, kubeContextFilter)
 }
 
 // PopulateDeploymentCredentials implements mcpbridge.ClusterAccess.

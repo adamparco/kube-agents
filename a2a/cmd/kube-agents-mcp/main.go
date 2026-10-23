@@ -1,11 +1,10 @@
-// Command kube-agents-mcp is the workstation-side kube-agents bridge for
-// Antigravity: it serves the Model Context Protocol over stdio and forwards
-// tool calls to the in-cluster MCP server on a2a-gateway, which fronts the
-// kube-agents A2A v2 (next) JetStream message bus.
+// Command kube-agents-mcp is the workstation-side Model Context Protocol (MCP)
+// stdio bridge for kube-agents: it serves MCP over stdio and forwards tool
+// calls to the in-cluster a2a-mcp server, which fronts the kube-agents A2A v2
+// (next) JetStream message bus.
 //
-// Run with --hook as an Antigravity SessionStart/PreInvocation lifecycle hook,
-// with --version to print the version, or without arguments as a stdio MCP
-// server. See mcpbridge.RunCLI for the remaining flags.
+// Run with --version to print the version, or without arguments as a stdio MCP
+// server. See mcpbridge.RunCLI for the supported flags.
 package main
 
 import (

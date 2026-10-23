@@ -17,36 +17,21 @@ import (
 )
 
 const (
-	configDirRelPath         = ".config/kube-agents"
-	configFileName           = "mcp-config.json"
-	pendingEventsFileName    = "pending-events.json"
-	stepProgressFileName     = "step-progress.json"
-	activeConvFileName       = "active_conversation.json"
-	prCacheDirRelPath        = ".cache/kube-agents/prs"
-	dirPermMode              = 0o700
-	filePermMode             = 0o600
-	defaultConvAlias         = "default"
-	defaultConvTokenPrefix   = "agy-"
-	randomTokenBytes         = 6
-	defaultAgentAPIRelPath   = ".gemini/antigravity/bin/agentapi"
-	lastUsedCoalesceWindow   = 5 * time.Second
-	envConfigPath            = "KUBE_AGENTS_MCP_CONFIG"
-	envAGYConversationID     = "ANTIGRAVITY_CONVERSATION_ID"
-	envAgentAPIPath          = "KUBE_AGENTS_AGY_AGENTAPI_PATH"
-	maxStoredEvents          = 200
-	maxConsoleTokenLen       = 64
-	tempFileSuffix           = ".tmp"
-	lockFileSuffix           = ".lock"
-	defaultConvDescription   = "Default Antigravity conversation"
-	agyAliasPrefix           = "agy-"
-	agyAliasIDChars          = 8
-	consoleConvPrefix        = "console:"
-	pushSummaryMaxChars      = 600
-	eventKindProactiveNotify = "proactive_notify"
-	eventKindTaskCompleted   = "task_completed"
-	eventKindTaskFailed      = "task_failed"
-	eventKindInputRequired   = "input_required"
-	eventKindNoticePR        = "notice_pr"
+	configDirRelPath       = ".config/kube-agents"
+	configFileName         = "mcp-config.json"
+	prCacheDirRelPath      = ".cache/kube-agents/prs"
+	DirPermMode            = 0o700
+	FilePermMode           = 0o600
+	DefaultConvAlias       = "default"
+	defaultConvTokenPrefix = "conv-"
+	randomTokenBytes       = 6
+	lastUsedCoalesceWindow = 5 * time.Second
+	envConfigPath          = "KUBE_AGENTS_MCP_CONFIG"
+	maxConsoleTokenLen     = 64
+	tempFileSuffix         = ".tmp"
+	lockFileSuffix         = ".lock"
+	defaultConvDescription = "Default console conversation"
+	ConsoleConvPrefix      = "console:"
 )
 
 var (
@@ -67,6 +52,8 @@ type SessionPodInfo struct {
 
 // DeploymentProfile stores connection and cluster metadata for a discovered
 // or manually registered kube-agents deployment.
+//
+// MCPToken is held in memory only (json:"-") and is never persisted to disk.
 type DeploymentProfile struct {
 	Name                     string           `json:"name"`
 	KubeContext              string           `json:"kubeContext,omitempty"`
@@ -87,13 +74,11 @@ type DeploymentProfile struct {
 	Location                 string           `json:"location,omitempty"`
 	GitHubRepo               string           `json:"githubRepo,omitempty"`
 	ChatPlatform             string           `json:"chatPlatform,omitempty"`
-	NATSService              string           `json:"natsService,omitempty"`
-	NATSPort                 int              `json:"natsPort,omitempty"`
-	DirectNATSURL            string           `json:"directNatsUrl,omitempty"`
-	CredsObjectName          string           `json:"credsObjectName,omitempty"`
-	BusUser                  string           `json:"busUser,omitempty"`
-	BusAuthValue             string           `json:"busAuthValue,omitempty"`
-	ObserverAuthValue        string           `json:"observerAuthValue,omitempty"`
+	MCPService               string           `json:"mcpService,omitempty"`
+	MCPPort                  int              `json:"mcpPort,omitempty"`
+	DirectMCPURL             string           `json:"directMcpUrl,omitempty"`
+	TokenSecretName          string           `json:"tokenSecretName,omitempty"`
+	MCPToken                 string           `json:"-"`
 	Ready                    bool             `json:"ready"`
 	StatusMessage            string           `json:"statusMessage,omitempty"`
 	AgentProfiles            []string         `json:"agentProfiles,omitempty"`
@@ -109,40 +94,29 @@ type DeploymentProfile struct {
 
 // ConversationEntry tracks a named console conversation token and its mode.
 type ConversationEntry struct {
-	Alias             string `json:"alias"`
-	Token             string `json:"token"`
-	SessionMode       bool   `json:"sessionMode"`
-	SessionTerminated bool   `json:"sessionTerminated,omitempty"`
-	Description       string `json:"description,omitempty"`
-	AGYConversationID string `json:"agyConversationId,omitempty"`
-	// ParentAGYConversationID links a subagent-owned conversation to its root coordinator
-	// Antigravity conversation so both project onto the same unified Swarm board.
-	ParentAGYConversationID string `json:"parentAgyConversationId,omitempty"`
-	// SubagentRole stores the human-readable role from the Antigravity subagent descriptor.
-	SubagentRole string `json:"subagentRole,omitempty"`
-	// SessionWorkerID caches the remote s-<id> worker addressee observed on TASKS for this conversation.
-	SessionWorkerID string `json:"sessionWorkerId,omitempty"`
-	// AutoBound marks a conversation the server minted on its own to back an Antigravity conversation
-	// (as opposed to one a user or agent created by name), so housekeeping can expire it more
-	// aggressively without inferring that from how its alias happens to be spelled.
-	AutoBound bool `json:"autoBound,omitempty"`
-	// DebugMode scopes kube-agents debug output (tool tables, timings, ids) to this conversation,
-	// so one user turning it on does not change what every other concurrent conversation sees.
-	DebugMode bool `json:"debugMode,omitempty"`
-	// Disconnected records that the user explicitly disconnected this conversation from the cluster
-	// via the Swarm UI Overview tab, keeping it in Not-Connected mode until reconnected.
-	Disconnected bool      `json:"disconnected,omitempty"`
-	CreatedAt    time.Time `json:"createdAt"`
-	LastUsedAt   time.Time `json:"lastUsedAt"`
+	Alias                   string    `json:"alias"`
+	Token                   string    `json:"token"`
+	SessionMode             bool      `json:"sessionMode"`
+	SessionTerminated       bool      `json:"sessionTerminated,omitempty"`
+	Description             string    `json:"description,omitempty"`
+	HostConversationID      string    `json:"hostConversationId,omitempty"`
+	ParentHostConversationID string   `json:"parentHostConversationId,omitempty"`
+	SubagentRole            string    `json:"subagentRole,omitempty"`
+	SessionWorkerID         string    `json:"sessionWorkerId,omitempty"`
+	AutoBound               bool      `json:"autoBound,omitempty"`
+	DebugMode               bool      `json:"debugMode,omitempty"`
+	Disconnected            bool      `json:"disconnected,omitempty"`
+	CreatedAt               time.Time `json:"createdAt"`
+	LastUsedAt              time.Time `json:"lastUsedAt"`
 }
 
-// PushConfig configures bi-directional event push into Antigravity.
+// PushConfig configures optional host push notification routing.
 type PushConfig struct {
-	Enabled               bool      `json:"enabled"`
-	AGYConversationID     string    `json:"agyConversationId,omitempty"`
-	KnownAGYConversations []string  `json:"knownAgyConversations,omitempty"`
-	AgentAPIPath          string    `json:"agentApiPath,omitempty"`
-	UpdatedAt             time.Time `json:"updatedAt,omitempty"`
+	Enabled                bool      `json:"enabled"`
+	HostConversationID     string    `json:"hostConversationId,omitempty"`
+	KnownHostConversations []string  `json:"knownHostConversations,omitempty"`
+	NotifyCommandPath      string    `json:"notifyCommandPath,omitempty"`
+	UpdatedAt              time.Time `json:"updatedAt,omitempty"`
 }
 
 // PersistentConfig is the on-disk schema stored in ~/.config/kube-agents/mcp-config.json.
@@ -156,30 +130,16 @@ type PersistentConfig struct {
 	Push               PushConfig                   `json:"push"`
 }
 
-// ActiveConversationState is written by Antigravity hooks or MCP tools to
-// ~/.config/kube-agents/active_conversation.json so the MCP server knows
-// which Antigravity conversation ID to wake via agentapi.
-type ActiveConversationState struct {
-	AGYConversationID string    `json:"agyConversationId"`
-	UpdatedAt         time.Time `json:"updatedAt"`
-}
-
-// ConfigStore manages thread-safe access and atomic persistence for
-// PersistentConfig and pending push events.
-// ConfigStore is the on-disk state every kube-agents MCP process on this machine shares:
-// deployments and their cached bus credentials, console conversations and their Antigravity
-// bindings, push settings, and the pending push-event queue. Several processes read and
-// write it at once (one MCP server per Antigravity conversation, plus each `--hook` run), so every
-// method re-reads the file when another process changed it, and every mutation holds an
-// exclusive file lock across its read-modify-write; saves are atomic renames.
+// ConfigStore manages thread-safe access and atomic persistence for PersistentConfig.
+// Several processes may read and write it at once, so every method re-reads the file
+// when another process changed it, and every mutation holds an exclusive file lock
+// across its read-modify-write; saves are atomic renames.
 type ConfigStore struct {
-	mu         sync.Mutex
-	path       string
-	eventsPath string
-	convPath   string
-	lockPath   string
-	cfg        PersistentConfig
-	loaded     fileStamp
+	mu       sync.Mutex
+	path     string
+	lockPath string
+	cfg      PersistentConfig
+	loaded   fileStamp
 }
 
 // fileStamp identifies one on-disk version of the config file.
@@ -196,16 +156,6 @@ func stampOf(path string) fileStamp {
 	return fileStamp{modTime: info.ModTime(), size: info.Size()}
 }
 
-// defaultAgentAPIPath returns the Antigravity-installed agentapi binary for the current user
-// (~/.gemini/antigravity/bin/agentapi), or "" when the home directory cannot be resolved.
-func defaultAgentAPIPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	return filepath.Join(home, defaultAgentAPIRelPath)
-}
-
 // NewConfigStore loads or initializes a ConfigStore at configPath.
 // If configPath is empty, it uses KUBE_AGENTS_MCP_CONFIG or ~/.config/kube-agents/mcp-config.json.
 func NewConfigStore(configPath string) (*ConfigStore, error) {
@@ -220,16 +170,14 @@ func NewConfigStore(configPath string) (*ConfigStore, error) {
 		configPath = filepath.Join(home, configDirRelPath, configFileName)
 	}
 	baseDir := filepath.Dir(configPath)
-	if err := os.MkdirAll(baseDir, dirPermMode); err != nil {
+	if err := os.MkdirAll(baseDir, DirPermMode); err != nil {
 		return nil, fmt.Errorf("creating config dir %s: %w", baseDir, err)
 	}
 	s := &ConfigStore{
-		path:       configPath,
-		eventsPath: filepath.Join(baseDir, pendingEventsFileName),
-		convPath:   filepath.Join(baseDir, activeConvFileName),
-		lockPath:   configPath + lockFileSuffix,
+		path:     configPath,
+		lockPath: configPath + lockFileSuffix,
 	}
-	unlock, lockErr := lockFile(s.lockPath)
+	unlock, lockErr := LockFile(s.lockPath)
 	if lockErr == nil {
 		defer unlock()
 	}
@@ -239,12 +187,33 @@ func NewConfigStore(configPath string) (*ConfigStore, error) {
 	return s, nil
 }
 
-// lockForUpdate serializes a read-modify-write of the store against the other processes
-// sharing it and against this process's other goroutines, and brings the in-memory state up
-// to date first. The returned func releases both locks.
+// WithReadLock runs fn under the store's read lock after refreshing in-memory state if needed.
+func (s *ConfigStore) WithReadLock(fn func(cfg *PersistentConfig)) {
+	if s == nil || fn == nil {
+		return
+	}
+	defer s.lockForRead()()
+	fn(&s.cfg)
+}
+
+// WithUpdateLock runs fn under the store's cross-process update lock after refreshing in-memory
+// state, and atomically saves the config if fn returns true.
+func (s *ConfigStore) WithUpdateLock(fn func(cfg *PersistentConfig) bool) error {
+	if s == nil || fn == nil {
+		return nil
+	}
+	defer s.lockForUpdate()()
+	if fn(&s.cfg) {
+		return s.saveLocked()
+	}
+	return nil
+}
+
+// lockForUpdate serializes a read-modify-write of the store against other processes
+// and goroutines, and brings the in-memory state up to date first.
 func (s *ConfigStore) lockForUpdate() func() {
 	s.mu.Lock()
-	unlock, err := lockFile(s.lockPath)
+	unlock, err := LockFile(s.lockPath)
 	s.refreshLocked()
 	return func() {
 		if err == nil {
@@ -263,8 +232,7 @@ func (s *ConfigStore) lockForRead() func() {
 }
 
 // refreshLocked re-reads the config file when another process has written it since this
-// process last loaded or saved it. A missing or unreadable file leaves the in-memory state
-// as is; the next save rewrites it.
+// process last loaded or saved it.
 func (s *ConfigStore) refreshLocked() {
 	stamp := stampOf(s.path)
 	if stamp == s.loaded || stamp == (fileStamp{}) {
@@ -307,16 +275,16 @@ func (s *ConfigStore) loadLocked() error {
 		s.cfg.Conversations = make(map[string]ConversationEntry)
 	}
 	if len(s.cfg.Conversations) == 0 {
-		token := mintConversationToken()
+		token := MintConversationToken()
 		now := time.Now().UTC()
-		s.cfg.Conversations[defaultConvAlias] = ConversationEntry{
-			Alias:       defaultConvAlias,
+		s.cfg.Conversations[DefaultConvAlias] = ConversationEntry{
+			Alias:       DefaultConvAlias,
 			Token:       token,
 			Description: defaultConvDescription,
 			CreatedAt:   now,
 			LastUsedAt:  now,
 		}
-		s.cfg.ActiveConversation = defaultConvAlias
+		s.cfg.ActiveConversation = DefaultConvAlias
 		dirty = true
 	}
 	if s.cfg.ActiveConversation == "" {
@@ -326,20 +294,7 @@ func (s *ConfigStore) loadLocked() error {
 			break
 		}
 	}
-	if s.healActiveConversationLocked() {
-		dirty = true
-	}
-	if s.cfg.Push.AgentAPIPath == "" {
-		if envPath := strings.TrimSpace(os.Getenv(envAgentAPIPath)); envPath != "" {
-			s.cfg.Push.AgentAPIPath = envPath
-		} else {
-			s.cfg.Push.AgentAPIPath = defaultAgentAPIPath()
-		}
-		dirty = true
-	}
-	if envConv := strings.TrimSpace(os.Getenv(envAGYConversationID)); envConv != "" && s.cfg.Push.AGYConversationID == "" {
-		s.cfg.Push.AGYConversationID = envConv
-		s.cfg.Push.Enabled = true
+	if HealActiveConversationLocked(&s.cfg) {
 		dirty = true
 	}
 	if !dirty {
@@ -353,8 +308,7 @@ func (s *ConfigStore) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
 	}
-	if err := writeFileAtomic(s.path, data); err != nil {
-		// Every caller treats a save as best effort; the failure is said once, here.
+	if err := WriteFileAtomic(s.path, data); err != nil {
 		slog.Warn("kube-agents-mcp: config save failed", "path", s.path, "err", err)
 		return err
 	}
@@ -362,9 +316,10 @@ func (s *ConfigStore) saveLocked() error {
 	return nil
 }
 
-func writeFileAtomic(path string, data []byte) error {
+// WriteFileAtomic atomically writes data to path via a temp file in the same directory.
+func WriteFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, dirPermMode); err != nil {
+	if err := os.MkdirAll(dir, DirPermMode); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".*"+tempFileSuffix)
@@ -377,13 +332,11 @@ func writeFileAtomic(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := f.Chmod(filePermMode); err != nil {
+	if err := f.Chmod(FilePermMode); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
 	}
-	// Flush to stable storage before the rename publishes the file: a crash between the two
-	// must leave the previous complete version, never an empty or truncated one.
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
@@ -400,17 +353,17 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-// writeFileAtomicIfChanged atomically writes data to path only when the file does not exist
-// or its current contents differ from data, avoiding redundant temp-file creation, fsync,
-// and rename churn on hot sync paths.
-func writeFileAtomicIfChanged(path string, data []byte) error {
+// WriteFileAtomicIfChanged atomically writes data to path only when the file does not exist
+// or its current contents differ from data.
+func WriteFileAtomicIfChanged(path string, data []byte) error {
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
 		return nil
 	}
-	return writeFileAtomic(path, data)
+	return WriteFileAtomic(path, data)
 }
 
-func mintConversationToken() string {
+// MintConversationToken returns a new random console conversation token.
+func MintConversationToken() string {
 	buf := make([]byte, randomTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return fmt.Sprintf("%s%d", defaultConvTokenPrefix, time.Now().UnixNano())
@@ -423,14 +376,9 @@ func (s *ConfigStore) Path() string {
 	return s.path
 }
 
-// EventsPath returns the filesystem path of the pending push events file.
-func (s *ConfigStore) EventsPath() string {
-	return s.eventsPath
-}
-
-// StepProgressPath returns the filesystem path of the persisted per-task step cursor file.
-func (s *ConfigStore) StepProgressPath() string {
-	return filepath.Join(filepath.Dir(s.eventsPath), stepProgressFileName)
+// LockPath returns the filesystem path of the config lock file.
+func (s *ConfigStore) LockPath() string {
+	return s.lockPath
 }
 
 // Snapshot returns a deep copy of the current configuration.
@@ -448,32 +396,105 @@ func (s *ConfigStore) Snapshot() PersistentConfig {
 	for k, v := range s.cfg.Conversations {
 		out.Conversations[k] = v
 	}
+	out.Push.KnownHostConversations = append([]string(nil), s.cfg.Push.KnownHostConversations...)
 	return out
 }
 
-// UpsertDeployments merges discovered or configured deployments into the store,
-// preserving existing cached credentials if the new profile does not overwrite them.
+func sameKubeDeploymentIdentity(a, b DeploymentProfile) bool {
+	return a.KubeContext != "" &&
+		a.KubeContext == b.KubeContext &&
+		a.Namespace == b.Namespace &&
+		a.PlatformAgentName != "" &&
+		a.PlatformAgentName == b.PlatformAgentName
+}
+
+// resolveDeploymentKeyLocked determines the canonical map key for p in s.cfg.Deployments,
+// preserving any existing key for the same (KubeContext, Namespace, PlatformAgentName) and
+// disambiguating cross-context collisions as "<kubeContext>/<name>".
+func (s *ConfigStore) resolveDeploymentKeyLocked(p DeploymentProfile, batch []DeploymentProfile) string {
+	baseName := strings.TrimSpace(p.Name)
+	if baseName == "" {
+		return ""
+	}
+	// Check if this exact kube deployment already exists in the store under any key.
+	existingKey := ""
+	if p.KubeContext != "" && p.PlatformAgentName != "" {
+		for k, existing := range s.cfg.Deployments {
+			if sameKubeDeploymentIdentity(existing, p) {
+				existingKey = k
+				break
+			}
+		}
+	}
+	// Check whether another deployment in the current batch or in the store shares baseName
+	// from a different kubeconfig context.
+	collides := false
+	if p.KubeContext != "" {
+		for _, other := range batch {
+			if other.Name == "" || other.IsContextProbeFailure() {
+				continue
+			}
+			if other.Name == baseName && other.KubeContext != "" && !sameKubeDeploymentIdentity(other, p) {
+				collides = true
+				break
+			}
+		}
+		if !collides {
+			if existing, ok := s.cfg.Deployments[baseName]; ok && existing.KubeContext != "" && !sameKubeDeploymentIdentity(existing, p) {
+				collides = true
+			}
+		}
+	}
+	if collides {
+		disambiguated := p.KubeContext
+		if !strings.HasPrefix(baseName, p.KubeContext+"/") {
+			disambiguated = p.KubeContext + "/" + baseName
+		} else {
+			disambiguated = baseName
+		}
+		// If this deployment was previously stored under bare baseName before the collision
+		// appeared, migrate its key to the disambiguated name.
+		if existingKey == baseName && disambiguated != baseName {
+			if prev, ok := s.cfg.Deployments[baseName]; ok && sameKubeDeploymentIdentity(prev, p) {
+				prev.Name = disambiguated
+				s.cfg.Deployments[disambiguated] = prev
+				delete(s.cfg.Deployments, baseName)
+				if s.cfg.ActiveDeployment == baseName {
+					s.cfg.ActiveDeployment = disambiguated
+				}
+			}
+		}
+		return disambiguated
+	}
+	if existingKey != "" {
+		return existingKey
+	}
+	return baseName
+}
+
+// UpsertDeployments merges discovered or configured deployments into the store.
+// ContextProbeFailure entries describe no deployment and are skipped.
 func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 	defer s.lockForUpdate()()
 	for _, p := range profiles {
-		if p.Name == "" {
+		if p.Name == "" || p.IsContextProbeFailure() {
 			continue
 		}
-		if existing, ok := s.cfg.Deployments[p.Name]; ok {
-			if p.BusAuthValue == "" {
-				p.BusAuthValue = existing.BusAuthValue
+		key := s.resolveDeploymentKeyLocked(p, profiles)
+		p.Name = key
+		if existing, ok := s.cfg.Deployments[key]; ok {
+			if p.DirectMCPURL == "" {
+				p.DirectMCPURL = existing.DirectMCPURL
 			}
-			if p.ObserverAuthValue == "" {
-				p.ObserverAuthValue = existing.ObserverAuthValue
+			if p.MCPService == "" {
+				p.MCPService = existing.MCPService
 			}
-			if p.BusUser == "" {
-				p.BusUser = existing.BusUser
+			if p.MCPPort == 0 {
+				p.MCPPort = existing.MCPPort
 			}
-			if p.DirectNATSURL == "" {
-				p.DirectNATSURL = existing.DirectNATSURL
+			if p.TokenSecretName == "" {
+				p.TokenSecretName = existing.TokenSecretName
 			}
-			// A fresh discovery is authoritative for the fleet profile list (an empty list means
-			// the cluster has no interactive profiles); other upserts keep the cached list.
 			freshDiscovery := !p.LastDiscoveredAt.IsZero() && p.LastDiscoveredAt.After(existing.LastDiscoveredAt)
 			if len(p.AgentProfiles) == 0 && len(existing.AgentProfiles) > 0 && !freshDiscovery {
 				p.AgentProfiles = append([]string(nil), existing.AgentProfiles...)
@@ -504,9 +525,11 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 				p.RemediationsMerged = existing.RemediationsMerged
 			}
 		}
-		s.cfg.Deployments[p.Name] = p
+		// Never persist in-memory tokens on the stored profile copy.
+		p.MCPToken = ""
+		s.cfg.Deployments[key] = p
 		if s.cfg.ActiveDeployment == "" && p.Ready {
-			s.cfg.ActiveDeployment = p.Name
+			s.cfg.ActiveDeployment = key
 		}
 	}
 	if s.cfg.ActiveDeployment != "" {
@@ -525,30 +548,59 @@ func (s *ConfigStore) UpsertDeployments(profiles []DeploymentProfile) error {
 	return s.saveLocked()
 }
 
-// SyncDiscoveredDeployments replaces stale kubeconfig-backed deployments that are no longer
-// present in discovered (preserving manually configured DirectNATSURL entries) and merges
-// the newly discovered profiles.
+// SyncDiscoveredDeployments merges a full kubeconfig scan into the store: it upserts the
+// discovered profiles and removes kubeconfig-backed profiles the scan no longer lists
+// (manually configured DirectMCPURL entries are always preserved).
+//
+// A profile is pruned only when its kubeconfig context was actually scanned (or is no longer
+// in the kubeconfig at all). A context the scan could not reach — reported by
+// DiscoverDeployments as a ContextProbeFailure entry — keeps its saved profiles, marked Not
+// Ready with the failure, so an expired credential or a VPN hiccup never deletes a saved
+// deployment or the user's active selection.
 func (s *ConfigStore) SyncDiscoveredDeployments(discovered []DeploymentProfile) error {
 	if s == nil {
 		return nil
 	}
-	seen := make(map[string]bool, len(discovered))
+	seenByName := make(map[string]bool, len(discovered))
+	unscanned := make(map[string]string)
 	for _, p := range discovered {
-		if p.Name != "" {
-			seen[p.Name] = true
+		switch {
+		case p.IsContextProbeFailure():
+			unscanned[p.KubeContext] = p.StatusMessage
+		case p.Name != "":
+			seenByName[p.Name] = true
 		}
+	}
+	wasDiscovered := func(name string, existing DeploymentProfile) bool {
+		if seenByName[name] {
+			return true
+		}
+		for _, d := range discovered {
+			if !d.IsContextProbeFailure() && sameKubeDeploymentIdentity(existing, d) {
+				return true
+			}
+		}
+		return false
 	}
 	func() {
 		defer s.lockForUpdate()()
 		changed := false
 		for name, existing := range s.cfg.Deployments {
-			if existing.KubeContext != "" && existing.DirectNATSURL == "" && !seen[name] {
-				delete(s.cfg.Deployments, name)
-				if s.cfg.ActiveDeployment == name {
-					s.cfg.ActiveDeployment = ""
-				}
-				changed = true
+			if existing.KubeContext == "" || existing.DirectMCPURL != "" || wasDiscovered(name, existing) {
+				continue
 			}
+			if reason, failed := unscanned[existing.KubeContext]; failed {
+				existing.Ready = false
+				existing.StatusMessage = fmt.Sprintf("kubeconfig context %q could not be scanned: %s (keeping the profile from the last successful scan)", existing.KubeContext, FirstNonEmptyStr(reason, "unknown error"))
+				s.cfg.Deployments[name] = existing
+				changed = true
+				continue
+			}
+			delete(s.cfg.Deployments, name)
+			if s.cfg.ActiveDeployment == name {
+				s.cfg.ActiveDeployment = ""
+			}
+			changed = true
 		}
 		if changed {
 			_ = s.saveLocked()
@@ -557,37 +609,19 @@ func (s *ConfigStore) SyncDiscoveredDeployments(discovered []DeploymentProfile) 
 	return s.UpsertDeployments(discovered)
 }
 
-func (s *ConfigStore) markDeploymentConnectedLocked(name string, p DeploymentProfile) DeploymentProfile {
-	p.LastConnectedAt = time.Now().UTC()
-	s.cfg.Deployments[name] = p
-	s.cfg.ActiveDeployment = name
-	s.cfg.Disconnected = false
-	if s.cfg.ActiveConversation != "" {
-		if entry, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && entry.Disconnected {
-			entry.Disconnected = false
-			s.cfg.Conversations[s.cfg.ActiveConversation] = entry
-		}
-	}
-	_ = s.saveLocked()
-	return p
-}
-
-// SetActiveDeployment selects a deployment by name, kubeContext, or clusterName
-// and marks it as the active deployment.
-func (s *ConfigStore) SetActiveDeployment(selector string) (DeploymentProfile, error) {
-	defer s.lockForUpdate()()
+func (s *ConfigStore) findDeploymentLocked(selector string) (string, DeploymentProfile, error) {
 	if selector == "" {
 		selector = s.cfg.ActiveDeployment
 	}
 	if selector == "" && len(s.cfg.Deployments) == 0 {
-		return DeploymentProfile{}, errNoDeploymentsSaved
+		return "", DeploymentProfile{}, errNoDeploymentsSaved
 	}
 	if p, ok := s.cfg.Deployments[selector]; ok {
-		return s.markDeploymentConnectedLocked(selector, p), nil
+		return selector, p, nil
 	}
 	for name, p := range s.cfg.Deployments {
 		if p.KubeContext == selector || p.ClusterName == selector || p.PlatformAgentName == selector || p.ProjectID == selector {
-			return s.markDeploymentConnectedLocked(name, p), nil
+			return name, p, nil
 		}
 	}
 	lowerSel := strings.ToLower(strings.TrimSpace(selector))
@@ -599,11 +633,60 @@ func (s *ConfigStore) SetActiveDeployment(selector string) (DeploymentProfile, e
 				strings.Contains(strings.ToLower(p.ProjectID), lowerSel) ||
 				strings.Contains(strings.ToLower(p.PlatformAgentName), lowerSel) ||
 				strings.Contains(strings.ToLower(p.GitHubRepo), lowerSel) {
-				return s.markDeploymentConnectedLocked(name, p), nil
+				return name, p, nil
 			}
 		}
 	}
-	return DeploymentProfile{}, fmt.Errorf("%w: %q", errDeploymentNotFound, selector)
+	return "", DeploymentProfile{}, fmt.Errorf("%w: %q", errDeploymentNotFound, selector)
+}
+
+func (s *ConfigStore) markDeploymentConnectedLocked(name string, p DeploymentProfile) DeploymentProfile {
+	token := p.MCPToken
+	p.LastConnectedAt = time.Now().UTC()
+	p.MCPToken = ""
+	s.cfg.Deployments[name] = p
+	s.cfg.ActiveDeployment = name
+	s.cfg.Disconnected = false
+	if s.cfg.ActiveConversation != "" {
+		if entry, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && entry.Disconnected {
+			entry.Disconnected = false
+			s.cfg.Conversations[s.cfg.ActiveConversation] = entry
+		}
+	}
+	_ = s.saveLocked()
+	p.MCPToken = token
+	return p
+}
+
+// SelectDeployment resolves a deployment by name, kubeContext, clusterName, projectId,
+// platformAgentName, or githubRepo without mutating LastConnectedAt or ActiveDeployment.
+func (s *ConfigStore) SelectDeployment(selector string) (DeploymentProfile, error) {
+	defer s.lockForRead()()
+	_, p, err := s.findDeploymentLocked(selector)
+	return p, err
+}
+
+// MarkDeploymentConnected stamps LastConnectedAt, sets ActiveDeployment, and clears
+// Disconnected after a live connection to prof has succeeded.
+func (s *ConfigStore) MarkDeploymentConnected(prof DeploymentProfile) (DeploymentProfile, error) {
+	defer s.lockForUpdate()()
+	key := s.resolveDeploymentKeyLocked(prof, nil)
+	if key == "" {
+		return DeploymentProfile{}, errNoDeploymentsSaved
+	}
+	prof.Name = key
+	return s.markDeploymentConnectedLocked(key, prof), nil
+}
+
+// SetActiveDeployment selects a deployment by name, kubeContext, or clusterName
+// and marks it as the active connected deployment.
+func (s *ConfigStore) SetActiveDeployment(selector string) (DeploymentProfile, error) {
+	defer s.lockForUpdate()()
+	name, p, err := s.findDeploymentLocked(selector)
+	if err != nil {
+		return DeploymentProfile{}, err
+	}
+	return s.markDeploymentConnectedLocked(name, p), nil
 }
 
 // ActiveDeployment returns the currently selected DeploymentProfile, if any.
@@ -624,13 +707,13 @@ func (s *ConfigStore) ActiveConversation() ConversationEntry {
 	}
 	now := time.Now().UTC()
 	entry := ConversationEntry{
-		Alias:      defaultConvAlias,
-		Token:      mintConversationToken(),
+		Alias:      DefaultConvAlias,
+		Token:      MintConversationToken(),
 		CreatedAt:  now,
 		LastUsedAt: now,
 	}
-	s.cfg.Conversations[defaultConvAlias] = entry
-	s.cfg.ActiveConversation = defaultConvAlias
+	s.cfg.Conversations[DefaultConvAlias] = entry
+	s.cfg.ActiveConversation = DefaultConvAlias
 	_ = s.saveLocked()
 	return entry
 }
@@ -641,7 +724,7 @@ func (s *ConfigStore) LookupConversation(aliasOrToken string) (ConversationEntry
 	if s == nil {
 		return ConversationEntry{}, false
 	}
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), consoleConvPrefix)
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	if target == "" {
 		return ConversationEntry{}, false
 	}
@@ -650,7 +733,7 @@ func (s *ConfigStore) LookupConversation(aliasOrToken string) (ConversationEntry
 		return c, true
 	}
 	for _, c := range s.cfg.Conversations {
-		if c.Token == target || strings.TrimSpace(c.AGYConversationID) == target {
+		if c.Token == target || strings.TrimSpace(c.HostConversationID) == target {
 			return c, true
 		}
 	}
@@ -667,11 +750,11 @@ func (s *ConfigStore) EnsureConversation(aliasOrToken string, forceNew bool, des
 func (s *ConfigStore) EnsureConversationWithOptions(aliasOrToken string, forceNew bool, description string, activate bool) (ConversationEntry, error) {
 	defer s.lockForUpdate()()
 	now := time.Now().UTC()
-	alias := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), consoleConvPrefix)
+	alias := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	if alias == "" {
 		alias = s.cfg.ActiveConversation
 		if alias == "" {
-			alias = defaultConvAlias
+			alias = DefaultConvAlias
 		}
 	}
 	if !forceNew {
@@ -684,8 +767,8 @@ func (s *ConfigStore) EnsureConversationWithOptions(aliasOrToken string, forceNe
 			}
 		}
 	}
-	token := mintConversationToken()
-	if !forceNew && isValidConsoleToken(alias) && alias != defaultConvAlias {
+	token := MintConversationToken()
+	if !forceNew && IsValidConsoleToken(alias) && alias != DefaultConvAlias {
 		token = alias
 	}
 	entry := ConversationEntry{
@@ -702,14 +785,15 @@ func (s *ConfigStore) EnsureConversationWithOptions(aliasOrToken string, forceNe
 	return entry, s.saveLocked()
 }
 
-func isDedicatedSubagentConversation(c ConversationEntry) bool {
-	return isSessionSubagentEntry(c)
+// IsDedicatedSubagentConversation reports whether c represents a child subagent conversation.
+func IsDedicatedSubagentConversation(c ConversationEntry) bool {
+	if strings.TrimSpace(c.ParentHostConversationID) != "" || strings.TrimSpace(c.SubagentRole) != "" {
+		return true
+	}
+	alias := strings.TrimSpace(c.Alias)
+	return strings.HasPrefix(alias, "session-") || strings.HasPrefix(alias, "s-") || strings.HasPrefix(alias, "chat-")
 }
 
-// touchExistingConversationLocked records a use of an existing conversation. LastUsedAt is
-// only persisted when it moved by more than lastUsedCoalesceWindow (it drives ordering and
-// pruning, not auditing), so a burst of calls on one conversation costs one config write
-// instead of one per call; description and activation changes always persist.
 func (s *ConfigStore) touchExistingConversationLocked(key string, existing ConversationEntry, now time.Time, description string, activate bool) (ConversationEntry, error) {
 	changed := false
 	if now.Sub(existing.LastUsedAt) >= lastUsedCoalesceWindow || existing.LastUsedAt.After(now) {
@@ -720,7 +804,7 @@ func (s *ConfigStore) touchExistingConversationLocked(key string, existing Conve
 		existing.Description = description
 		changed = true
 	}
-	if activate && !isDedicatedSubagentConversation(existing) && s.cfg.ActiveConversation != key {
+	if activate && !IsDedicatedSubagentConversation(existing) && s.cfg.ActiveConversation != key {
 		s.cfg.ActiveConversation = key
 		changed = true
 	}
@@ -731,29 +815,32 @@ func (s *ConfigStore) touchExistingConversationLocked(key string, existing Conve
 	return existing, s.saveLocked()
 }
 
-func (s *ConfigStore) healActiveConversationLocked() bool {
-	cur, hasCur := s.cfg.Conversations[s.cfg.ActiveConversation]
-	if hasCur && !isDedicatedSubagentConversation(cur) && (strings.TrimSpace(cur.AGYConversationID) != "" || s.cfg.ActiveConversation != defaultConvAlias || strings.TrimSpace(s.cfg.Push.AGYConversationID) == "") {
+// HealActiveConversationLocked ensures cfg.ActiveConversation points to a non-subagent
+// conversation entry when available.
+func HealActiveConversationLocked(cfg *PersistentConfig) bool {
+	if cfg == nil {
 		return false
 	}
-	pushID := strings.TrimSpace(s.cfg.Push.AGYConversationID)
+	cur, hasCur := cfg.Conversations[cfg.ActiveConversation]
+	if hasCur && !IsDedicatedSubagentConversation(cur) && (strings.TrimSpace(cur.HostConversationID) != "" || cfg.ActiveConversation != DefaultConvAlias || strings.TrimSpace(cfg.Push.HostConversationID) == "") {
+		return false
+	}
+	pushID := strings.TrimSpace(cfg.Push.HostConversationID)
 	if pushID != "" {
-		for alias, entry := range s.cfg.Conversations {
-			if strings.TrimSpace(entry.AGYConversationID) == pushID && !isDedicatedSubagentConversation(entry) {
-				if s.cfg.ActiveConversation != alias {
-					s.cfg.ActiveConversation = alias
+		for alias, entry := range cfg.Conversations {
+			if strings.TrimSpace(entry.HostConversationID) == pushID && !IsDedicatedSubagentConversation(entry) {
+				if cfg.ActiveConversation != alias {
+					cfg.ActiveConversation = alias
 					return true
 				}
 				return false
 			}
 		}
 	}
-	// Prefer the most recently used non-subagent conversation bound to a real Antigravity conversation ID
-	// before falling back to an unbound "default" entry.
 	var bestBoundAlias string
 	var bestBoundTime time.Time
-	for alias, entry := range s.cfg.Conversations {
-		if isDedicatedSubagentConversation(entry) || entry.SessionTerminated || strings.TrimSpace(entry.AGYConversationID) == "" {
+	for alias, entry := range cfg.Conversations {
+		if IsDedicatedSubagentConversation(entry) || entry.SessionTerminated || strings.TrimSpace(entry.HostConversationID) == "" {
 			continue
 		}
 		if bestBoundAlias == "" || entry.LastUsedAt.After(bestBoundTime) || (entry.LastUsedAt.Equal(bestBoundTime) && alias < bestBoundAlias) {
@@ -762,23 +849,23 @@ func (s *ConfigStore) healActiveConversationLocked() bool {
 		}
 	}
 	if bestBoundAlias != "" {
-		if s.cfg.ActiveConversation != bestBoundAlias {
-			s.cfg.ActiveConversation = bestBoundAlias
+		if cfg.ActiveConversation != bestBoundAlias {
+			cfg.ActiveConversation = bestBoundAlias
 			return true
 		}
 		return false
 	}
-	if def, ok := s.cfg.Conversations[defaultConvAlias]; ok && !isDedicatedSubagentConversation(def) {
-		if s.cfg.ActiveConversation != defaultConvAlias {
-			s.cfg.ActiveConversation = defaultConvAlias
+	if def, ok := cfg.Conversations[DefaultConvAlias]; ok && !IsDedicatedSubagentConversation(def) {
+		if cfg.ActiveConversation != DefaultConvAlias {
+			cfg.ActiveConversation = DefaultConvAlias
 			return true
 		}
 		return false
 	}
-	for alias, entry := range s.cfg.Conversations {
-		if !isDedicatedSubagentConversation(entry) {
-			if s.cfg.ActiveConversation != alias {
-				s.cfg.ActiveConversation = alias
+	for alias, entry := range cfg.Conversations {
+		if !IsDedicatedSubagentConversation(entry) {
+			if cfg.ActiveConversation != alias {
+				cfg.ActiveConversation = alias
 				return true
 			}
 			return false
@@ -787,171 +874,10 @@ func (s *ConfigStore) healActiveConversationLocked() bool {
 	return false
 }
 
-// PruneStaleConversations garbage-collects dead Antigravity conversation bindings, unbound agy-<short>
-// shell entries, and expired non-session test entries when <brainDir>/../conversations exists on disk.
-func (s *ConfigStore) PruneStaleConversations(brainDir string) bool {
-	if s == nil {
-		return false
-	}
-	bDir := strings.TrimSpace(brainDir)
-	if bDir == "" {
-		return false
-	}
-	convDir := filepath.Join(filepath.Dir(filepath.Clean(bDir)), "conversations")
-	if st, err := os.Stat(convDir); err != nil || !st.IsDir() {
-		return false
-	}
-	defer s.lockForUpdate()()
-	changed := false
-	now := time.Now().UTC()
-
-	pushID := strings.TrimSpace(s.cfg.Push.AGYConversationID)
-	if pushID != "" && !IsAGYConversationAlive(bDir, pushID) {
-		s.cfg.Push.AGYConversationID = ""
-		pushID = ""
-		changed = true
-	}
-
-	if s.healActiveConversationLocked() {
-		changed = true
-	}
-
-	for alias, entry := range s.cfg.Conversations {
-		cid := strings.TrimSpace(entry.AGYConversationID)
-		pid := strings.TrimSpace(entry.ParentAGYConversationID)
-		if cid != "" && !IsAGYConversationAlive(bDir, cid) {
-			if alias == defaultConvAlias {
-				entry.AGYConversationID = ""
-				s.cfg.Conversations[alias] = entry
-			} else {
-				delete(s.cfg.Conversations, alias)
-			}
-			removeSubagentDescriptorsOnDisk(bDir, cid)
-			changed = true
-			continue
-		}
-		if cid == "" && pid != "" && !IsAGYConversationAlive(bDir, pid) && alias != defaultConvAlias {
-			delete(s.cfg.Conversations, alias)
-			changed = true
-			continue
-		}
-		if alias == defaultConvAlias || alias == s.cfg.ActiveConversation {
-			continue
-		}
-		if pushID != "" && cid == pushID {
-			continue
-		}
-		age := time.Duration(0)
-		if !entry.LastUsedAt.IsZero() {
-			age = now.Sub(entry.LastUsedAt)
-		}
-		if entry.SessionMode {
-			// Keep dedicated /session subagents and conversations with a bound sessionWorkerId;
-			// prune stale auto-bound agy-* entries that never spawned a worker pod.
-			if !isDedicatedSubagentConversation(entry) && strings.TrimSpace(entry.SessionWorkerID) == "" && age > 6*time.Hour {
-				delete(s.cfg.Conversations, alias)
-				if cid != "" {
-					removeSubagentDescriptorsOnDisk(bDir, cid)
-				}
-				changed = true
-			}
-			continue
-		}
-		if entry.SessionTerminated && age > 15*time.Minute {
-			delete(s.cfg.Conversations, alias)
-			if cid != "" {
-				removeSubagentDescriptorsOnDisk(bDir, cid)
-			}
-			changed = true
-			continue
-		}
-		if cid == "" && age > time.Hour {
-			delete(s.cfg.Conversations, alias)
-			changed = true
-			continue
-		}
-		if entry.AutoBound {
-			if cid == "" || age > 6*time.Hour {
-				delete(s.cfg.Conversations, alias)
-				if cid != "" {
-					removeSubagentDescriptorsOnDisk(bDir, cid)
-				}
-				changed = true
-			}
-			continue
-		}
-		if age > 24*time.Hour {
-			delete(s.cfg.Conversations, alias)
-			if cid != "" {
-				removeSubagentDescriptorsOnDisk(bDir, cid)
-			}
-			changed = true
-		}
-	}
-
-	if s.healActiveConversationLocked() {
-		changed = true
-	}
-	if strings.TrimSpace(s.cfg.Push.AGYConversationID) == "" {
-		if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && !isDedicatedSubagentConversation(active) {
-			if activeCID := strings.TrimSpace(active.AGYConversationID); activeCID != "" && IsAGYConversationAlive(bDir, activeCID) {
-				s.cfg.Push.AGYConversationID = activeCID
-				pushID = activeCID
-				changed = true
-			}
-		}
-	}
-
-	referencedIDs := make(map[string]bool)
-	if pushID != "" && IsAGYConversationAlive(bDir, pushID) {
-		referencedIDs[pushID] = true
-	}
-	for _, entry := range s.cfg.Conversations {
-		if cid := strings.TrimSpace(entry.AGYConversationID); cid != "" && IsAGYConversationAlive(bDir, cid) {
-			referencedIDs[cid] = true
-		}
-		if pid := strings.TrimSpace(entry.ParentAGYConversationID); pid != "" && IsAGYConversationAlive(bDir, pid) {
-			referencedIDs[pid] = true
-		}
-	}
-	if len(s.cfg.Push.KnownAGYConversations) > 0 {
-		kept := make([]string, 0, len(referencedIDs))
-		seen := make(map[string]bool, len(referencedIDs))
-		for _, id := range s.cfg.Push.KnownAGYConversations {
-			trimmed := strings.TrimSpace(id)
-			if trimmed != "" && referencedIDs[trimmed] && !seen[trimmed] {
-				seen[trimmed] = true
-				kept = append(kept, trimmed)
-			} else {
-				changed = true
-			}
-		}
-		if changed {
-			s.cfg.Push.KnownAGYConversations = kept
-		}
-	}
-
-	if changed {
-		if trimmedPush := strings.TrimSpace(s.cfg.Push.AGYConversationID); trimmedPush != "" {
-			s.cfg.Push.UpdatedAt = now
-			if stateData, err := json.MarshalIndent(ActiveConversationState{
-				AGYConversationID: trimmedPush,
-				UpdatedAt:         now,
-			}, "", "  "); err == nil {
-				_ = writeFileAtomicIfChanged(s.convPath, stateData)
-			}
-		} else {
-			_ = os.Remove(s.convPath)
-		}
-		_ = s.saveLocked()
-	}
-	return changed
-}
-
 // SetConversationSessionMode records whether /session mode is active on the conversation.
 func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMode bool) (ConversationEntry, error) {
 	defer s.lockForUpdate()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	if target == "" {
 		target = s.cfg.ActiveConversation
 	}
@@ -972,31 +898,30 @@ func (s *ConfigStore) SetConversationSessionMode(aliasOrToken string, sessionMod
 	return ConversationEntry{}, fmt.Errorf("conversation %q not found", target)
 }
 
-// DeleteConversation removes a conversation entry by alias, console token, or swarm member name
-// (e.g. "session-soak-sess-1" -> "soak-sess-1"). Returns the deleted entry and true if found.
+// DeleteConversation removes a conversation entry by alias, console token, or session member name.
 func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry, bool) {
 	if s == nil {
 		return ConversationEntry{}, false
 	}
 	defer s.lockForUpdate()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), consoleConvPrefix)
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	if target == "" {
 		return ConversationEntry{}, false
 	}
 	trimmedSessionPrefix := strings.TrimPrefix(target, "session-")
 	for alias, entry := range s.cfg.Conversations {
-		roleSlug := sanitizeMemberName(entry.SubagentRole)
+		roleSlug := SanitizeAliasSlug(entry.SubagentRole)
 		if alias == target ||
 			entry.Token == target ||
-			strings.TrimSpace(entry.AGYConversationID) == target ||
+			strings.TrimSpace(entry.HostConversationID) == target ||
 			strings.TrimSpace(entry.SessionWorkerID) == target ||
 			(trimmedSessionPrefix != target && alias == trimmedSessionPrefix) ||
-			sanitizeMemberName(alias) == target ||
-			"session-"+sanitizeMemberName(alias) == target ||
+			SanitizeAliasSlug(alias) == target ||
+			"session-"+SanitizeAliasSlug(alias) == target ||
 			(roleSlug != "" && (roleSlug == target || "session-"+roleSlug == target || roleSlug == trimmedSessionPrefix)) {
 			delete(s.cfg.Conversations, alias)
-			s.removeEntrySessionPodsLocked(entry)
-			s.healActiveConversationLocked()
+			RemoveEntrySessionPodsLocked(&s.cfg, entry)
+			HealActiveConversationLocked(&s.cfg)
 			_ = s.saveLocked()
 			return entry, true
 		}
@@ -1004,56 +929,25 @@ func (s *ConfigStore) DeleteConversation(aliasOrToken string) (ConversationEntry
 	return ConversationEntry{}, false
 }
 
-// ClearKilledSessions deletes all terminated or inactive non-active conversation entries
-// that do not have a live session pod in activePodTokens. Returns the removed entries.
-func (s *ConfigStore) ClearKilledSessions(activePodTokens map[string]bool) []ConversationEntry {
-	if s == nil {
-		return nil
+// RemoveEntrySessionPodsLocked removes any cached ActiveSessionPods matching entry from cfg.Deployments.
+func RemoveEntrySessionPodsLocked(cfg *PersistentConfig, entry ConversationEntry) {
+	if cfg == nil {
+		return
 	}
-	defer s.lockForUpdate()()
-	pushID := strings.TrimSpace(s.cfg.Push.AGYConversationID)
-	var removed []ConversationEntry
-	for alias, entry := range s.cfg.Conversations {
-		if alias == defaultConvAlias || alias == s.cfg.ActiveConversation {
-			continue
-		}
-		if pushID != "" && strings.TrimSpace(entry.AGYConversationID) == pushID && !isDedicatedSubagentConversation(entry) {
-			continue
-		}
-		if activePodTokens != nil && activePodTokens[entry.Token] {
-			continue
-		}
-		if entry.SessionMode && !entry.SessionTerminated {
-			continue
-		}
-		if entry.SessionTerminated || !entry.SessionMode {
-			removed = append(removed, entry)
-			s.removeEntrySessionPodsLocked(entry)
-			delete(s.cfg.Conversations, alias)
-		}
-	}
-	if len(removed) > 0 {
-		s.healActiveConversationLocked()
-		_ = s.saveLocked()
-	}
-	return removed
-}
-
-func (s *ConfigStore) removeEntrySessionPodsLocked(entry ConversationEntry) {
 	token := strings.TrimSpace(entry.Token)
 	wid := strings.TrimSpace(entry.SessionWorkerID)
 	if token == "" && wid == "" {
 		return
 	}
-	for depName, prof := range s.cfg.Deployments {
+	for depName, prof := range cfg.Deployments {
 		if len(prof.ActiveSessionPods) == 0 {
 			continue
 		}
 		kept := make([]SessionPodInfo, 0, len(prof.ActiveSessionPods))
 		changed := false
 		for _, pod := range prof.ActiveSessionPods {
-			podTok := strings.TrimPrefix(strings.TrimSpace(pod.SessionKey), consoleConvPrefix)
-			podAddr := firstNonEmptyStr(strings.TrimSpace(pod.Addressee), strings.TrimSpace(pod.Name))
+			podTok := strings.TrimPrefix(strings.TrimSpace(pod.SessionKey), ConsoleConvPrefix)
+			podAddr := FirstNonEmptyStr(strings.TrimSpace(pod.Addressee), strings.TrimSpace(pod.Name))
 			if (token != "" && podTok == token) || (wid != "" && (podAddr == wid || strings.TrimSpace(pod.Name) == wid)) {
 				changed = true
 				continue
@@ -1062,7 +956,7 @@ func (s *ConfigStore) removeEntrySessionPodsLocked(entry ConversationEntry) {
 		}
 		if changed {
 			prof.ActiveSessionPods = kept
-			s.cfg.Deployments[depName] = prof
+			cfg.Deployments[depName] = prof
 		}
 	}
 }
@@ -1073,7 +967,7 @@ func (s *ConfigStore) SetConversationSessionWorkerID(aliasOrToken, workerID stri
 	if s == nil {
 		return
 	}
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	wid := strings.TrimSpace(workerID)
 	if target == "" || wid == "" {
 		return
@@ -1085,106 +979,6 @@ func (s *ConfigStore) SetConversationSessionWorkerID(aliasOrToken, workerID stri
 				return
 			}
 			entry.SessionWorkerID = wid
-			s.cfg.Conversations[alias] = entry
-			_ = s.saveLocked()
-			return
-		}
-	}
-}
-
-// SetConversationDisconnected marks the conversation bound to cidOrAlias (and global default
-// overview state) as disconnected (or connected when disconnected is false) so the Swarm UI
-// stays in Not-Connected mode until explicitly reconnected.
-func (s *ConfigStore) SetConversationDisconnected(cidOrAlias string, disconnected bool) {
-	if s == nil {
-		return
-	}
-	target := strings.TrimPrefix(strings.TrimSpace(cidOrAlias), "console:")
-	if target == defaultDisconnectedSwarmID {
-		target = ""
-	}
-	defer s.lockForUpdate()()
-	changed := false
-	if s.cfg.Disconnected != disconnected {
-		s.cfg.Disconnected = disconnected
-		changed = true
-	}
-	for alias, entry := range s.cfg.Conversations {
-		match := false
-		if target != "" && (alias == target || entry.Token == target || strings.TrimSpace(entry.AGYConversationID) == target) {
-			match = true
-		}
-		if alias == s.cfg.ActiveConversation || alias == defaultConvAlias {
-			match = true
-		}
-		if match && entry.Disconnected != disconnected {
-			entry.Disconnected = disconnected
-			s.cfg.Conversations[alias] = entry
-			changed = true
-		}
-	}
-	if changed {
-		_ = s.saveLocked()
-	}
-}
-
-// IsConversationDisconnected returns true when global Disconnected is set or the root
-// conversation's bound entry has Disconnected set.
-func (s *ConfigStore) IsConversationDisconnected(rootID string) bool {
-	if s == nil {
-		return false
-	}
-	target := strings.TrimSpace(rootID)
-	defer s.lockForRead()()
-	if s.cfg.Disconnected {
-		return true
-	}
-	if target == "" || target == defaultDisconnectedSwarmID {
-		return false
-	}
-	for _, entry := range s.cfg.Conversations {
-		if strings.TrimSpace(entry.AGYConversationID) == target && strings.TrimSpace(entry.ParentAGYConversationID) == "" && entry.Disconnected {
-			return true
-		}
-	}
-	return false
-}
-
-// IsDefaultOverviewConnected reports whether the default Swarm Overview should render in
-// Connected mode (i.e. an active deployment has been connected and has not been disconnected).
-func (s *ConfigStore) IsDefaultOverviewConnected(rootID string) bool {
-	if s == nil || s.IsConversationDisconnected(rootID) {
-		return false
-	}
-	activeDep, ok := s.ActiveDeployment()
-	if !ok {
-		return false
-	}
-	return !activeDep.LastConnectedAt.IsZero() || activeDep.Ready
-}
-
-// SetConversationParentAGYID updates the parent/root coordinator Antigravity conversation UUID
-// (and optional role) for a subagent-owned console conversation.
-func (s *ConfigStore) SetConversationParentAGYID(aliasOrToken, parentAGYID, role string) {
-	if s == nil {
-		return
-	}
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
-	pid := strings.TrimSpace(parentAGYID)
-	r := strings.TrimSpace(role)
-	if target == "" || pid == "" {
-		return
-	}
-	defer s.lockForUpdate()()
-	for alias, entry := range s.cfg.Conversations {
-		if alias == target || entry.Token == target {
-			if entry.ParentAGYConversationID == pid && (r == "" || entry.SubagentRole == r) {
-				return
-			}
-			entry.ParentAGYConversationID = pid
-			if r != "" && entry.SubagentRole == "" {
-				entry.SubagentRole = r
-			}
 			s.cfg.Conversations[alias] = entry
 			_ = s.saveLocked()
 			return
@@ -1209,13 +1003,13 @@ func (s *ConfigStore) SetDebugMode(enabled bool) error {
 }
 
 // DebugModeFor reports whether debug output is on for a conversation: its own flag, or the global
-// default (kept for non-Antigravity callers and backwards compatibility).
+// default.
 func (s *ConfigStore) DebugModeFor(aliasOrToken string) bool {
 	if s == nil {
 		return false
 	}
 	defer s.lockForRead()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	for alias, entry := range s.cfg.Conversations {
 		if alias == target || entry.Token == target {
 			return entry.DebugMode || s.cfg.DebugMode
@@ -1227,7 +1021,7 @@ func (s *ConfigStore) DebugModeFor(aliasOrToken string) bool {
 // SetConversationDebugMode sets the per-conversation debug flag.
 func (s *ConfigStore) SetConversationDebugMode(aliasOrToken string, enabled bool) error {
 	defer s.lockForUpdate()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
+	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), ConsoleConvPrefix)
 	for alias, entry := range s.cfg.Conversations {
 		if alias == target || entry.Token == target {
 			entry.DebugMode = enabled
@@ -1238,375 +1032,54 @@ func (s *ConfigStore) SetConversationDebugMode(aliasOrToken string, enabled bool
 	return fmt.Errorf("conversation %q not found", target)
 }
 
-// BindConversationAGYID associates a console conversation (by alias or token) with an Antigravity conversation UUID.
-func (s *ConfigStore) BindConversationAGYID(aliasOrToken, agyConvID string) {
-	trimmedID := strings.TrimSpace(agyConvID)
-	if trimmedID == "" {
-		return
-	}
-	s.BindConversationWithLineage(aliasOrToken, ConversationLineage{
-		ConversationID:     trimmedID,
-		RootConversationID: trimmedID,
-	})
-}
-
-// BindConversationWithLineage associates a console conversation with an Antigravity conversation and
-// records its parent/root lineage if it belongs to a child subagent.
-func (s *ConfigStore) BindConversationWithLineage(aliasOrToken string, lineage ConversationLineage) {
-	trimmedID := strings.TrimSpace(lineage.ConversationID)
-	if trimmedID == "" {
+// MergeRemoteConversations merges a conversation map (and optional active conversation alias)
+// synced from the remote MCP server or local bridge into this ConfigStore.
+func (s *ConfigStore) MergeRemoteConversations(convs map[string]ConversationEntry, activeAlias string) {
+	if s == nil || (len(convs) == 0 && strings.TrimSpace(activeAlias) == "") {
 		return
 	}
 	defer s.lockForUpdate()()
-	target := strings.TrimPrefix(strings.TrimSpace(aliasOrToken), "console:")
-	if target == "" {
-		target = s.cfg.ActiveConversation
-	}
-	isActiveTarget := target == s.cfg.ActiveConversation
-	if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok {
-		if target == active.Token || active.AGYConversationID == "" || active.AGYConversationID == trimmedID {
-			isActiveTarget = true
-		}
-	}
-	if !lineage.IsSubagent && (isActiveTarget || s.cfg.Push.AGYConversationID == "") {
-		s.cfg.Push.AGYConversationID = trimmedID
-	} else if s.cfg.Push.AGYConversationID == "" && lineage.RootConversationID != "" {
-		s.cfg.Push.AGYConversationID = lineage.RootConversationID
-	}
-	s.cfg.Push.Enabled = true
-	s.addKnownAGYConvLocked(trimmedID)
-	if lineage.RootConversationID != "" {
-		s.addKnownAGYConvLocked(lineage.RootConversationID)
-	}
-	subagentAlreadyHasOwnEntry := false
-	if lineage.IsSubagent {
-		for alias, entry := range s.cfg.Conversations {
-			if alias != target && entry.Token != target && strings.TrimSpace(entry.AGYConversationID) == trimmedID {
-				subagentAlreadyHasOwnEntry = true
-				break
-			}
-		}
-	}
-	boundAlias := ""
-	for alias, entry := range s.cfg.Conversations {
-		if alias != target && entry.Token != target {
-			continue
-		}
-		existingCID := strings.TrimSpace(entry.AGYConversationID)
-		if lineage.IsSubagent {
-			if existingCID != "" && existingCID != trimmedID {
-				continue
-			}
-			if existingCID == "" && (subagentAlreadyHasOwnEntry || strings.TrimSpace(entry.SessionWorkerID) != "" || entry.SessionTerminated) {
-				continue
-			}
-		} else if isDedicatedSubagentConversation(entry) || entry.SessionMode || strings.TrimSpace(entry.SessionWorkerID) != "" {
-			continue
-		}
-		entry.AGYConversationID = trimmedID
-		if lineage.IsSubagent {
-			entry.ParentAGYConversationID = firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID, entry.ParentAGYConversationID)
-			if lineage.SubagentRole != "" {
-				entry.SubagentRole = lineage.SubagentRole
-			}
-		}
-		s.cfg.Conversations[alias] = entry
-		boundAlias = alias
-		break
-	}
-	if boundAlias != "" {
-		for alias, entry := range s.cfg.Conversations {
-			if alias != boundAlias && entry.AGYConversationID == trimmedID {
-				// An Antigravity conversation maps to exactly one console conversation at a time: switching
-				// (manage_session new/switch, or an explicit `conversation` arg) moves the binding.
-				entry.AGYConversationID = ""
-				s.cfg.Conversations[alias] = entry
-			}
-		}
-	}
-	_ = s.saveLocked()
-}
-
-// EnsureConversationForSubagent resolves or creates the isolated console conversation owned by a
-// child subagent (lineage.IsSubagent). A subagent never steals an existing ConversationEntry owned
-// by another subagent or an already-active/historical /session worker, and once bound to its own
-// entry it stays on that entry across connect_deployment, session_on, and send_message calls.
-func (s *ConfigStore) EnsureConversationForSubagent(
-	lineage ConversationLineage,
-	requestedAlias string,
-	forceNew bool,
-	description string,
-) (ConversationEntry, error) {
-	id := strings.TrimSpace(lineage.ConversationID)
-	if id == "" {
-		return s.EnsureConversationWithOptions(requestedAlias, forceNew, description, false)
-	}
-	defer s.lockForUpdate()()
-	now := time.Now().UTC()
-	if s.cfg.Push.AGYConversationID == "" && lineage.RootConversationID != "" {
-		s.cfg.Push.AGYConversationID = lineage.RootConversationID
-	}
-	s.cfg.Push.Enabled = true
-	s.addKnownAGYConvLocked(id)
-	if lineage.RootConversationID != "" {
-		s.addKnownAGYConvLocked(lineage.RootConversationID)
-	}
-
-	reqClean := strings.TrimPrefix(strings.TrimSpace(requestedAlias), consoleConvPrefix)
-	short := id
-	if len(short) > agyAliasIDChars {
-		short = short[:agyAliasIDChars]
-	}
-
-	if !forceNew {
-		for ownAlias, ownEntry := range s.cfg.Conversations {
-			if strings.TrimSpace(ownEntry.AGYConversationID) != id {
-				continue
-			}
-			ownEntry.LastUsedAt = now
-			parent := firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID, ownEntry.ParentAGYConversationID)
-			if parent != "" {
-				ownEntry.ParentAGYConversationID = parent
-			}
-			if lineage.SubagentRole != "" && ownEntry.SubagentRole == "" {
-				ownEntry.SubagentRole = lineage.SubagentRole
-			}
-			if description != "" && (ownEntry.Description == "" ||
-				strings.HasPrefix(ownEntry.Description, "Auto-bound to Antigravity conversation ") ||
-				strings.Contains(ownEntry.Description, "(Antigravity subagent ")) {
-				ownEntry.Description = description
-			}
-			if reqClean != "" &&
-				ownAlias == "session-"+short &&
-				!ownEntry.SessionMode &&
-				strings.TrimSpace(ownEntry.SessionWorkerID) == "" {
-				betterAlias := s.deriveConversationAliasWithHintLocked(lineage, reqClean)
-				if betterAlias != "" && betterAlias != ownAlias {
-					delete(s.cfg.Conversations, ownAlias)
-					ownAlias = betterAlias
-					ownEntry.Alias = betterAlias
-				}
-			}
-			s.cfg.Conversations[ownAlias] = ownEntry
-			return ownEntry, s.saveLocked()
-		}
-
-		if reqClean != "" && reqClean != defaultConvAlias && reqClean != s.cfg.ActiveConversation {
-			if existing, ok := s.cfg.Conversations[reqClean]; ok {
-				if strings.TrimSpace(existing.AGYConversationID) == "" &&
-					!existing.SessionMode &&
-					strings.TrimSpace(existing.SessionWorkerID) == "" &&
-					!existing.SessionTerminated {
-					existing.AGYConversationID = id
-					existing.ParentAGYConversationID = firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID, existing.ParentAGYConversationID)
-					if lineage.SubagentRole != "" {
-						existing.SubagentRole = lineage.SubagentRole
-					}
-					if description != "" {
-						existing.Description = description
-					}
-					existing.LastUsedAt = now
-					s.cfg.Conversations[reqClean] = existing
-					return existing, s.saveLocked()
-				}
-			}
-		}
-	}
-
-	alias := s.deriveConversationAliasWithHintLocked(lineage, reqClean)
-	desc := strings.TrimSpace(description)
-	if desc == "" {
-		if lineage.SubagentRole != "" {
-			desc = lineage.SubagentRole + " (Antigravity subagent " + id + ")"
-		} else {
-			desc = "Auto-bound to Antigravity conversation " + id
-		}
-	}
-	entry := ConversationEntry{
-		Alias:                   alias,
-		Token:                   mintConversationToken(),
-		Description:             desc,
-		AGYConversationID:       id,
-		ParentAGYConversationID: firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID),
-		SubagentRole:            lineage.SubagentRole,
-		AutoBound:               reqClean == "",
-		CreatedAt:               now,
-		LastUsedAt:              now,
-	}
-	s.cfg.Conversations[alias] = entry
-	return entry, s.saveLocked()
-}
-
-// ConversationForAGY returns the console conversation that belongs to an Antigravity conversation.
-func (s *ConfigStore) ConversationForAGY(agyConvID string) ConversationEntry {
-	id := strings.TrimSpace(agyConvID)
-	if id == "" {
-		return s.ActiveConversation()
-	}
-	return s.ConversationForAGYWithLineage(ConversationLineage{
-		ConversationID:     id,
-		RootConversationID: id,
-	})
-}
-
-// ConversationForAGYWithLineage returns the console conversation that belongs to an Antigravity
-// conversation (or subagent), isolating child subagents onto their own console token without
-// stealing the root coordinator's default conversation or active pointer.
-func (s *ConfigStore) ConversationForAGYWithLineage(lineage ConversationLineage) ConversationEntry {
-	return s.ConversationForAGYWithOptions(lineage, true)
-}
-
-// ConversationForAGYWithOptions returns (or mints) the console conversation bound to an Antigravity
-// conversation or subagent. When activate is false (e.g. a concurrent secondary Antigravity window
-// while another live root coordinator owns the primary Swarm board), it isolates the caller onto
-// its own ConversationEntry without overwriting ActiveConversation or Push.AGYConversationID.
-func (s *ConfigStore) ConversationForAGYWithOptions(lineage ConversationLineage, activate bool) ConversationEntry {
-	id := strings.TrimSpace(lineage.ConversationID)
-	if id == "" {
-		return s.ActiveConversation()
-	}
-	unlock := s.lockForUpdate()
-	now := time.Now().UTC()
 	changed := false
-	setPushID := func(v string) {
-		if s.cfg.Push.AGYConversationID != v {
-			s.cfg.Push.AGYConversationID = v
+	for alias, entry := range convs {
+		if strings.TrimSpace(alias) == "" {
+			continue
+		}
+		if entry.Alias == "" {
+			entry.Alias = alias
+		}
+		existing, ok := s.cfg.Conversations[alias]
+		if !ok ||
+			existing.Token != entry.Token ||
+			existing.SessionMode != entry.SessionMode ||
+			existing.SessionTerminated != entry.SessionTerminated ||
+			existing.SessionWorkerID != entry.SessionWorkerID ||
+			existing.HostConversationID != entry.HostConversationID ||
+			existing.ParentHostConversationID != entry.ParentHostConversationID ||
+			existing.SubagentRole != entry.SubagentRole ||
+			existing.DebugMode != entry.DebugMode {
+			if ok {
+				if entry.SessionWorkerID == "" && existing.SessionWorkerID != "" {
+					entry.SessionWorkerID = existing.SessionWorkerID
+				}
+				entry.Disconnected = existing.Disconnected
+			}
+			s.cfg.Conversations[alias] = entry
 			changed = true
 		}
 	}
-	if !lineage.IsSubagent && (activate || s.cfg.Push.AGYConversationID == "") {
-		setPushID(id)
-	} else if s.cfg.Push.AGYConversationID == "" && lineage.RootConversationID != "" {
-		setPushID(lineage.RootConversationID)
-	}
-	if !s.cfg.Push.Enabled {
-		s.cfg.Push.Enabled = true
-		changed = true
-	}
-	knownBefore := len(s.cfg.Push.KnownAGYConversations)
-	s.addKnownAGYConvLocked(id)
-	if lineage.RootConversationID != "" {
-		s.addKnownAGYConvLocked(lineage.RootConversationID)
-	}
-	if len(s.cfg.Push.KnownAGYConversations) != knownBefore {
-		changed = true
-	}
-	for alias, entry := range s.cfg.Conversations {
-		if entry.AGYConversationID == id {
-			if now.Sub(entry.LastUsedAt) >= lastUsedCoalesceWindow || entry.LastUsedAt.After(now) {
-				entry.LastUsedAt = now
-				changed = true
-			}
-			if lineage.IsSubagent {
-				parent := firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID, entry.ParentAGYConversationID)
-				if parent != entry.ParentAGYConversationID {
-					entry.ParentAGYConversationID = parent
-					changed = true
-				}
-				if lineage.SubagentRole != "" && lineage.SubagentRole != entry.SubagentRole {
-					entry.SubagentRole = lineage.SubagentRole
-					changed = true
-				}
-			}
-			s.cfg.Conversations[alias] = entry
-			if !lineage.IsSubagent && activate && s.cfg.ActiveConversation != alias {
-				s.cfg.ActiveConversation = alias
-				changed = true
-			}
-			if changed {
-				_ = s.saveLocked()
-			}
-			unlock()
-			return entry
+	if act := strings.TrimSpace(activeAlias); act != "" {
+		if _, ok := s.cfg.Conversations[act]; ok && s.cfg.ActiveConversation != act {
+			s.cfg.ActiveConversation = act
+			changed = true
 		}
 	}
-	if !lineage.IsSubagent && activate {
-		if active, ok := s.cfg.Conversations[s.cfg.ActiveConversation]; ok && active.AGYConversationID == "" {
-			active.AGYConversationID = id
-			active.LastUsedAt = now
-			s.cfg.Conversations[s.cfg.ActiveConversation] = active
-			_ = s.saveLocked()
-			unlock()
-			return active
-		}
+	if changed {
+		_ = s.saveLocked()
 	}
-
-	alias := s.deriveConversationAliasLocked(lineage)
-	desc := "Auto-bound to Antigravity conversation " + id
-	if lineage.IsSubagent && lineage.SubagentRole != "" {
-		desc = lineage.SubagentRole + " (Antigravity subagent " + id + ")"
-	}
-	entry := ConversationEntry{
-		Alias:             alias,
-		Token:             mintConversationToken(),
-		Description:       desc,
-		AGYConversationID: id,
-		AutoBound:         true,
-		CreatedAt:         now,
-		LastUsedAt:        now,
-	}
-	if lineage.IsSubagent {
-		entry.ParentAGYConversationID = firstNonEmptyStr(lineage.RootConversationID, lineage.ParentConversationID)
-		entry.SubagentRole = lineage.SubagentRole
-	}
-	s.cfg.Conversations[alias] = entry
-	if !lineage.IsSubagent && activate {
-		s.cfg.ActiveConversation = alias
-	}
-	_ = s.saveLocked()
-	unlock()
-	return entry
 }
 
-func (s *ConfigStore) deriveConversationAliasLocked(lineage ConversationLineage) string {
-	return s.deriveConversationAliasWithHintLocked(lineage, "")
-}
-
-func (s *ConfigStore) deriveConversationAliasWithHintLocked(lineage ConversationLineage, aliasHint string) string {
-	short := lineage.ConversationID
-	if len(short) > agyAliasIDChars {
-		short = short[:agyAliasIDChars]
-	}
-	if lineage.IsSubagent {
-		slug := sanitizeAliasSlug(aliasHint)
-		if slug == "" || slug == "session" || slug == defaultConvAlias {
-			slug = sanitizeAliasSlug(lineage.SubagentRole)
-		}
-		if slug != "" && slug != "session" && slug != defaultConvAlias {
-			candidate := "session-" + slug
-			if strings.HasPrefix(slug, "session-") || strings.HasPrefix(slug, "s-") {
-				candidate = slug
-			}
-			if _, exists := s.cfg.Conversations[candidate]; !exists {
-				return candidate
-			}
-			for i := 2; i < 100; i++ {
-				numbered := fmt.Sprintf("%s-%d", candidate, i)
-				if _, exists := s.cfg.Conversations[numbered]; !exists {
-					return numbered
-				}
-			}
-			withShort := candidate + "-" + short[:minInt(4, len(short))]
-			if _, exists := s.cfg.Conversations[withShort]; !exists {
-				return withShort
-			}
-		}
-		base := "session-" + short
-		if _, exists := s.cfg.Conversations[base]; !exists {
-			return base
-		}
-		for i := 2; i < 100; i++ {
-			numbered := fmt.Sprintf("%s-%d", base, i)
-			if _, exists := s.cfg.Conversations[numbered]; !exists {
-				return numbered
-			}
-		}
-		return base
-	}
-	return agyAliasPrefix + short
-}
-
-func sanitizeAliasSlug(raw string) string {
+// SanitizeAliasSlug normalizes a conversation or role label into a lowercase slug.
+func SanitizeAliasSlug(raw string) string {
 	lower := strings.ToLower(strings.TrimSpace(raw))
 	if lower == "" {
 		return ""
@@ -1634,14 +1107,8 @@ func sanitizeAliasSlug(raw string) string {
 	return res
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func isValidConsoleToken(token string) bool {
+// IsValidConsoleToken reports whether token is a safe console conversation token.
+func IsValidConsoleToken(token string) bool {
 	if len(token) == 0 || len(token) > maxConsoleTokenLen {
 		return false
 	}
@@ -1654,53 +1121,8 @@ func isValidConsoleToken(token string) bool {
 	return true
 }
 
-// MergeRemoteConversations merges a conversation map (and optional active conversation alias)
-// synced from the remote gateway or local bridge into this ConfigStore.
-func (s *ConfigStore) MergeRemoteConversations(convs map[string]ConversationEntry, activeAlias string) {
-	if s == nil || (len(convs) == 0 && strings.TrimSpace(activeAlias) == "") {
-		return
-	}
-	defer s.lockForUpdate()()
-	changed := false
-	for alias, entry := range convs {
-		if strings.TrimSpace(alias) == "" {
-			continue
-		}
-		if entry.Alias == "" {
-			entry.Alias = alias
-		}
-		existing, ok := s.cfg.Conversations[alias]
-		if !ok ||
-			existing.Token != entry.Token ||
-			existing.SessionMode != entry.SessionMode ||
-			existing.SessionTerminated != entry.SessionTerminated ||
-			existing.SessionWorkerID != entry.SessionWorkerID ||
-			existing.AGYConversationID != entry.AGYConversationID ||
-			existing.ParentAGYConversationID != entry.ParentAGYConversationID ||
-			existing.SubagentRole != entry.SubagentRole ||
-			existing.DebugMode != entry.DebugMode {
-			if ok {
-				if entry.SessionWorkerID == "" && existing.SessionWorkerID != "" {
-					entry.SessionWorkerID = existing.SessionWorkerID
-				}
-				entry.Disconnected = existing.Disconnected
-			}
-			s.cfg.Conversations[alias] = entry
-			changed = true
-		}
-	}
-	if act := strings.TrimSpace(activeAlias); act != "" {
-		if _, ok := s.cfg.Conversations[act]; ok && s.cfg.ActiveConversation != act {
-			s.cfg.ActiveConversation = act
-			changed = true
-		}
-	}
-	if changed {
-		_ = s.saveLocked()
-	}
-}
-
-func firstNonEmptyStr(vals ...string) string {
+// FirstNonEmptyStr returns the first string in vals with non-empty trimmed content.
+func FirstNonEmptyStr(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
 			return v
@@ -1709,7 +1131,8 @@ func firstNonEmptyStr(vals ...string) string {
 	return ""
 }
 
-func truncateText(s string, maxChars int) string {
+// TruncateText truncates s to at most maxChars runes, appending an ellipsis when truncated.
+func TruncateText(s string, maxChars int) string {
 	s = strings.TrimSpace(s)
 	runes := []rune(s)
 	if len(runes) <= maxChars || maxChars <= 3 {

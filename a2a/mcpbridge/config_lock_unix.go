@@ -7,12 +7,11 @@ import (
 	"syscall"
 )
 
-// lockFile takes an exclusive advisory lock on path (creating it), so the
-// read-modify-write of the config and event files is serialized across the
-// processes that share them: every Antigravity conversation's MCP server and each
-// `kube-agents-mcp --hook` run. The returned func releases it.
-func lockFile(path string) (func(), error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, filePermMode)
+// LockFile takes an exclusive advisory lock on path (creating it), so the
+// read-modify-write of shared state files is serialized across processes.
+// The returned func releases it.
+func LockFile(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, FilePermMode)
 	if err != nil {
 		return nil, err
 	}

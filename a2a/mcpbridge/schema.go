@@ -15,18 +15,21 @@ func (s *Server) readResource(ctx context.Context, uri string) (string, error) {
 	case resourceURITopics:
 		return s.handleReadTopics(ctx, nil)
 	case resourceURITasks:
-		txt, _, _, err := s.handleTaskControl(ctx, nil)
+		txt, _, _, err := s.handleTaskControl(ctx, json.RawMessage(`{"action":"list"}`))
 		return txt, err
 	case resourceURIEvents:
-		raw, _ := json.Marshal(map[string]any{"peek_only": true})
-		return s.handlePollEvents(ctx, raw)
+		if s.host != nil {
+			raw, _ := json.Marshal(map[string]any{"peek_only": true})
+			return s.host.HandlePollEvents(ctx, s, raw)
+		}
+		return "", fmt.Errorf("unknown resource URI %q", uri)
 	default:
 		return "", fmt.Errorf("unknown resource URI %q", uri)
 	}
 }
 
 func (s *Server) resourceDefinitions() []Resource {
-	return []Resource{
+	defs := []Resource{
 		{
 			URI:         resourceURIStatus,
 			Name:        "Kube-Agents Bus & Connection Status",
@@ -51,19 +54,22 @@ func (s *Server) resourceDefinitions() []Resource {
 			Description: "Recent and in-flight tasks on the TASKS JetStream stream.",
 			MIMEType:    mimeTypeMarkdown,
 		},
-		{
+	}
+	if s.host != nil {
+		defs = append(defs, Resource{
 			URI:         resourceURIEvents,
 			Name:        "Pending Push Events",
 			Description: "Unread asynchronous push notifications and task events from kube-agents.",
 			MIMEType:    mimeTypeMarkdown,
-		},
+		})
 	}
+	return defs
 }
 
 func (s *Server) toolDefinitions() []ToolDefinition {
-	return []ToolDefinition{
+	defs := []ToolDefinition{
 		{
-			Name:        toolDiscoverDeployments,
+			Name:        ToolDiscoverDeployments,
 			Description: "Discover remote kube-agents deployments across Kubernetes contexts in ~/.kube/config and list saved deployment profiles.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -72,16 +78,12 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 						"type":        "string",
 						"description": "Optional specific kubeconfig context to probe. Omit to probe all contexts in parallel.",
 					},
-					"include_credentials": map[string]any{
-						"type":        "boolean",
-						"description": "Whether to pre-fetch and cache NATS bus credentials during discovery.",
-					},
 				},
 			},
 		},
 		{
-			Name:        toolConnectDeployment,
-			Description: "Connect or switch to a remote kube-agents deployment (by name, cluster name, kubeconfig context, or direct NATS URL). Automatically manages port-forwarding, credentials, JetStream stream bootstrap, and real-time push subscriptions.",
+			Name:        ToolConnectDeployment,
+			Description: "Connect or switch to a remote kube-agents deployment (by name, cluster name, or kubeconfig context). Automatically manages the in-process port-forward to the in-cluster a2a-mcp listener and bearer token authentication.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -97,35 +99,19 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 						"type":        "string",
 						"description": "Optional Kubernetes namespace (default: kubeagents-system).",
 					},
-					"direct_nats_url": map[string]any{
-						"type":        "string",
-						"description": "Optional direct a2a-gateway MCP URL (e.g. http://127.0.0.1:8089) to bypass the in-process port-forward.",
-					},
-					"bus_user": map[string]any{
-						"type":        "string",
-						"description": "Optional NATS bus user (default: console).",
-					},
-					"bus_auth_value": map[string]any{
-						"type":        "string",
-						"description": "Optional bearer/console password for the gateway MCP endpoint when using direct_nats_url.",
-					},
-					"agy_conversation_id": map[string]any{
-						"type":        "string",
-						"description": "Optional active Antigravity conversation UUID to bind for real-time agentapi push notifications.",
-					},
 				},
 			},
 		},
 		{
-			Name:        toolConnectionStatus,
-			Description: "Inspect the current kube-agents connection, A2A v2 JetStream stream capacities (TASKS, DIRECTORY, TOPICS-STATE, TOPICS-JOURNAL), durable consumer health, registered agent cards, and active session/push state.",
+			Name:        ToolConnectionStatus,
+			Description: "Inspect the current kube-agents connection, A2A v2 JetStream stream capacities (TASKS, DIRECTORY, TOPICS-STATE, TOPICS-JOURNAL), durable consumer health, registered agent cards, and active session state.",
 			InputSchema: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
 		{
-			Name:        toolSendMessage,
+			Name:        ToolSendMessage,
 			Description: "Send a prompt, question, task, or command to kube-agents over the A2A v2 JetStream bus and stream back thinking, tool activity timelines, progress plans, delegations (session -> platform -> wake), notices, PR links, and structured kube-agents.chat/v1 results.",
 			InputSchema: map[string]any{
 				"type":     "object",
@@ -146,11 +132,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 					},
 					"wait_timeout_seconds": map[string]any{
 						"type":        "integer",
-						"description": "Seconds to wait for task completion while live-streaming thinking & tool progress before returning a snapshot (default: 150). Background push remains armed if the task continues running.",
-					},
-					"agy_conversation_id": map[string]any{
-						"type":        "string",
-						"description": "Optional active Antigravity conversation UUID to bind for real-time agentapi push notifications.",
+						"description": "Seconds to wait for task completion while live-streaming thinking & tool progress before returning a snapshot (default: 150).",
 					},
 					"debug": map[string]any{
 						"type":        "boolean",
@@ -160,7 +142,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name:        toolManageSession,
+			Name:        ToolManageSession,
 			Description: "Manage kube-agents conversations and persistent /session worker pods: list conversations, create a new conversation, switch conversations, toggle /session worker mode on/off, delete a conversation/session, clear all killed/terminated sessions, toggle debug mode on/off, or view the conversation transcript.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -186,7 +168,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name:        toolTaskControl,
+			Name:        ToolTaskControl,
 			Description: "Inspect or control tasks on the TASKS JetStream stream: get a task's full folded state (thinking, tool activities, progress, delegation chain, result), list recent/active tasks, trigger gateway status replay, steer an in-flight task, or stop/cancel a running task.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -228,7 +210,7 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name:        toolReadTopics,
+			Name:        ToolReadTopics,
 			Description: "Read standing blackboard topics from TOPICS-STATE and TOPICS-JOURNAL (e.g. upgrade-readiness, blueprint, annotations) or DIRECTORY agent cards.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -246,8 +228,8 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 			},
 		},
 		{
-			Name:        toolInspectPR,
-			Description: "Fetch a GitHub Pull Request opened or referenced by kube-agents (metadata, changed files, unified diff) and save local .diff and per-file .patch files so Antigravity can open the PR and diffs natively in its viewer.",
+			Name:        ToolInspectPR,
+			Description: "Fetch a GitHub Pull Request opened or referenced by kube-agents (metadata, changed files, unified diff) and save local .diff and per-file .patch files so the PR and diffs can be opened in a local viewer.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"pr"},
@@ -267,26 +249,9 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 				},
 			},
 		},
-		{
-			Name:        toolPollEvents,
-			Description: "Drain pending asynchronous push events received from kube-agents (proactive chat.notify.* alerts/cron/kanban cards, completed background/delegated tasks, PR notices) and/or configure real-time reactive push wakeups via agentapi.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"agy_conversation_id": map[string]any{
-						"type":        "string",
-						"description": "Active Antigravity conversation UUID to register for reactive agentapi push notifications.",
-					},
-					"enable_push": map[string]any{
-						"type":        "boolean",
-						"description": "Enable or disable reactive background wakeup via agentapi send-message.",
-					},
-					"peek_only": map[string]any{
-						"type":        "boolean",
-						"description": "If true, view queued events without marking them drained.",
-					},
-				},
-			},
-		},
 	}
+	if s.host != nil {
+		defs = s.host.AugmentToolSchemas(defs)
+	}
+	return defs
 }

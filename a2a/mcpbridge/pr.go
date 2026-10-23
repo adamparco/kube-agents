@@ -26,7 +26,11 @@ const (
 	githubPRURLPrefix        = "https://github.com/"
 	githubPRURLFormat        = "https://github.com/%s/pull/%d"
 	githubAPIPRFormat        = "%s/repos/%s/pulls/%d"
-	githubAPIPRFilesFormat   = "%s/repos/%s/pulls/%d/files?per_page=100"
+	githubAPIPRFilesFormat   = "%s/repos/%s/pulls/%d/files?per_page=%d"
+	githubAPIPRFilesPerPage  = 100
+	maxPRFilesPages          = 30 // GitHub lists at most 3000 files per pull request
+	linkHeader               = "Link"
+	linkRelNext              = "next"
 	acceptHeader             = "Accept"
 	authHeader               = "Authorization"
 	userAgentHeader          = "User-Agent"
@@ -57,7 +61,10 @@ const (
 	pathSeparatorReplacement = "__"
 	diffHeaderPrefix         = "diff --git "
 	bSidePrefix              = " b/"
+	quotedBSidePrefix        = ` "b/`
 	fileSchemePrefix         = "file://"
+	maxDiffErrorBodyBytes    = 512
+	ghPRDiffHintFormat       = "gh pr diff %d --repo %s"
 )
 
 var (
@@ -77,7 +84,7 @@ type PRFileChange struct {
 }
 
 // PRInspection holds the metadata, changed files, unified diff, and local file paths
-// for opening a pull request natively in Antigravity's code and diff viewers.
+// for opening a pull request in a local code and diff viewer.
 type PRInspection struct {
 	Repo            string         `json:"repo"`
 	Number          int            `json:"number"`
@@ -95,6 +102,10 @@ type PRInspection struct {
 	UnifiedDiff     string         `json:"unifiedDiff,omitempty"`
 	DiffFilePath    string         `json:"diffFilePath"`
 	SummaryFilePath string         `json:"summaryFilePath"`
+	// DiffError explains why UnifiedDiff is empty (HTTP status such as GitHub's 406 for diffs
+	// over 20k lines / 300 files, a transport error, or a failed gh pr diff) so an empty
+	// result is never presented as a complete native diff file.
+	DiffError string `json:"diffError,omitempty"`
 }
 
 // ExtractPRReferences scans text for GitHub PR URLs and owner/repo#number references
@@ -160,7 +171,7 @@ func ParsePRReference(ref string, defaultRepo string) (string, int, error) {
 }
 
 // InspectPullRequest fetches PR metadata and unified diff, writes local diff/patch files
-// for Antigravity's native viewer, and returns the PRInspection.
+// for the native viewer, and returns the PRInspection.
 func InspectPullRequest(
 	ctx context.Context,
 	runner CommandRunner,
@@ -216,34 +227,48 @@ func InspectPullRequest(
 			outputDir = filepath.Join(home, prCacheDirRelPath, fmt.Sprintf("%s-pr-%d", safeRepo, num))
 		}
 	}
-	if err := os.MkdirAll(outputDir, dirPermMode); err != nil {
+	if err := os.MkdirAll(outputDir, DirPermMode); err != nil {
 		return nil, fmt.Errorf("creating PR cache dir %s: %w", outputDir, err)
 	}
 
 	diffPath := filepath.Join(outputDir, fmt.Sprintf(diffFileNameFormat, num))
-	if err := writeFileAtomic(diffPath, []byte(insp.UnifiedDiff)); err != nil {
-		return nil, fmt.Errorf("writing unified diff %s: %w", diffPath, err)
+	if strings.TrimSpace(insp.UnifiedDiff) == "" {
+		// A refused or failed diff download (GitHub answers 406 past 20k lines / 300 files) must
+		// not be advertised as a complete native diff file: leave DiffFilePath unset, drop any
+		// stale pr-N.diff from an earlier inspection, and surface the reason in the summary.
+		_ = os.Remove(diffPath)
+		if insp.DiffError == "" {
+			insp.DiffError = "GitHub returned an empty unified diff"
+		}
+	} else {
+		if err := WriteFileAtomic(diffPath, []byte(insp.UnifiedDiff)); err != nil {
+			return nil, fmt.Errorf("writing unified diff %s: %w", diffPath, err)
+		}
+		insp.DiffFilePath = diffPath
 	}
-	insp.DiffFilePath = diffPath
 
 	perFilePatches := splitUnifiedDiffByFile(insp.UnifiedDiff)
 	filesDir := filepath.Join(outputDir, filesSubdirName)
-	_ = os.MkdirAll(filesDir, dirPermMode)
+	_ = os.MkdirAll(filesDir, DirPermMode)
+	// Write every chunk the diff produced, not only the paths the files listing returned, so a
+	// partial listing never leaves per-file patches unwritten.
+	patchFiles := make(map[string]string, len(perFilePatches))
+	for fPath, patch := range perFilePatches {
+		patchFile := filepath.Join(filesDir, sanitizePatchFilename(fPath))
+		if WriteFileAtomic(patchFile, []byte(patch)) == nil {
+			patchFiles[fPath] = patchFile
+		}
+	}
 	for i := range insp.Files {
-		fPath := insp.Files[i].Path
-		if patch, ok := perFilePatches[fPath]; ok {
-			safeName := sanitizePatchFilename(fPath)
-			patchFile := filepath.Join(filesDir, safeName)
-			if writeFileAtomic(patchFile, []byte(patch)) == nil {
-				insp.Files[i].PatchPath = patchFile
-			}
+		if patchFile, ok := patchFiles[insp.Files[i].Path]; ok {
+			insp.Files[i].PatchPath = patchFile
 		}
 	}
 
 	summaryPath := filepath.Join(outputDir, summaryFileName)
 	insp.SummaryFilePath = summaryPath
 	summaryMD := FormatPRInspectionMarkdown(insp)
-	_ = writeFileAtomic(summaryPath, []byte(summaryMD))
+	_ = WriteFileAtomic(summaryPath, []byte(summaryMD))
 
 	return insp, nil
 }
@@ -343,7 +368,7 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		Title:        payload.Title,
 		State:        state,
 		Author:       payload.User.Login,
-		URL:          firstNonEmptyStr(payload.HTMLURL, fmt.Sprintf(githubPRURLFormat, repo, num)),
+		URL:          FirstNonEmptyStr(payload.HTMLURL, fmt.Sprintf(githubPRURLFormat, repo, num)),
 		HeadRef:      payload.Head.Ref,
 		BaseRef:      payload.Base.Ref,
 		Additions:    payload.Additions,
@@ -352,32 +377,44 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		Body:         payload.Body,
 	}
 
-	filesEndpoint := fmt.Sprintf(githubAPIPRFilesFormat, strings.TrimRight(apiBaseURL, "/"), repo, num)
-	if fReq, fErr := http.NewRequestWithContext(ctx, http.MethodGet, filesEndpoint, nil); fErr == nil {
+	// The files endpoint is paginated: follow rel="next" until exhausted (bounded by
+	// maxPRFilesPages) so a PR with more than one page of changed files lists every file.
+	filesEndpoint := fmt.Sprintf(githubAPIPRFilesFormat, strings.TrimRight(apiBaseURL, "/"), repo, num, githubAPIPRFilesPerPage)
+	for page := 0; filesEndpoint != "" && page < maxPRFilesPages; page++ {
+		fReq, fErr := http.NewRequestWithContext(ctx, http.MethodGet, filesEndpoint, nil)
+		if fErr != nil {
+			break
+		}
 		fReq.Header.Set(acceptHeader, acceptGitHubJSON)
 		fReq.Header.Set(userAgentHeader, userAgentValue)
 		if token != "" {
 			fReq.Header.Set(authHeader, bearerPrefix+token)
 		}
-		if fResp, dErr := http.DefaultClient.Do(fReq); dErr == nil {
-			var fileList []struct {
-				Filename  string `json:"filename"`
-				Additions int    `json:"additions"`
-				Deletions int    `json:"deletions"`
-				Status    string `json:"status"`
-			}
-			if fResp.StatusCode == http.StatusOK && json.NewDecoder(fResp.Body).Decode(&fileList) == nil {
-				for _, f := range fileList {
-					insp.Files = append(insp.Files, PRFileChange{
-						Path:      f.Filename,
-						Additions: f.Additions,
-						Deletions: f.Deletions,
-						Status:    f.Status,
-					})
-				}
-			}
-			_ = fResp.Body.Close()
+		fResp, dErr := http.DefaultClient.Do(fReq)
+		if dErr != nil {
+			break
 		}
+		var fileList []struct {
+			Filename  string `json:"filename"`
+			Additions int    `json:"additions"`
+			Deletions int    `json:"deletions"`
+			Status    string `json:"status"`
+		}
+		pageOK := fResp.StatusCode == http.StatusOK && json.NewDecoder(fResp.Body).Decode(&fileList) == nil
+		nextEndpoint := nextPageURL(fResp.Header.Get(linkHeader), filesEndpoint)
+		_ = fResp.Body.Close()
+		if !pageOK {
+			break
+		}
+		for _, f := range fileList {
+			insp.Files = append(insp.Files, PRFileChange{
+				Path:      f.Filename,
+				Additions: f.Additions,
+				Deletions: f.Deletions,
+				Status:    f.Status,
+			})
+		}
+		filesEndpoint = nextEndpoint
 	}
 
 	diffReq, err := http.NewRequestWithContext(ctx, http.MethodGet, prEndpoint, nil)
@@ -387,15 +424,55 @@ func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int
 		if token != "" {
 			diffReq.Header.Set(authHeader, bearerPrefix+token)
 		}
-		if diffResp, dErr := http.DefaultClient.Do(diffReq); dErr == nil {
-			if diffResp.StatusCode == http.StatusOK {
-				rawDiff, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes))
-				insp.UnifiedDiff = string(rawDiff)
-			}
+		diffResp, dErr := http.DefaultClient.Do(diffReq)
+		switch {
+		case dErr != nil:
+			insp.DiffError = fmt.Sprintf("unified diff download failed: %v", dErr)
+		case diffResp.StatusCode != http.StatusOK:
+			body, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxDiffErrorBodyBytes))
 			_ = diffResp.Body.Close()
+			insp.DiffError = (&githubHTTPError{Endpoint: prEndpoint + " (" + acceptGitHubDiff + ")", StatusCode: diffResp.StatusCode, Body: strings.TrimSpace(string(body))}).Error()
+		default:
+			rawDiff, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes))
+			_ = diffResp.Body.Close()
+			insp.UnifiedDiff = string(rawDiff)
 		}
 	}
 	return insp, nil
+}
+
+// nextPageURL returns the rel="next" target of a GitHub Link header, or "" when there is no
+// further page. Only a target on the same scheme and host as the current request is followed,
+// so the bearer token is never replayed to another origin.
+func nextPageURL(link string, current string) string {
+	cur, err := url.Parse(current)
+	if err != nil {
+		return ""
+	}
+	for _, part := range strings.Split(link, ",") {
+		segs := strings.Split(part, ";")
+		target := strings.TrimSpace(segs[0])
+		if len(segs) < 2 || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		isNext := false
+		for _, param := range segs[1:] {
+			param = strings.TrimSpace(param)
+			if strings.HasPrefix(param, "rel=") && strings.Trim(strings.TrimPrefix(param, "rel="), `"`) == linkRelNext {
+				isNext = true
+				break
+			}
+		}
+		if !isNext {
+			continue
+		}
+		next, pErr := url.Parse(strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">"))
+		if pErr != nil || next.Scheme != cur.Scheme || next.Host != cur.Host {
+			return ""
+		}
+		return next.String()
+	}
+	return ""
 }
 
 func fetchPRViaGHCLI(ctx context.Context, runner CommandRunner, repo string, num int) (*PRInspection, error) {
@@ -430,14 +507,14 @@ func fetchPRViaGHCLI(ctx context.Context, runner CommandRunner, repo string, num
 	if err := json.Unmarshal(out, &ghData); err != nil {
 		return nil, fmt.Errorf("parsing gh pr view output: %w", err)
 	}
-	diffOut, _ := runner(ctx, ghBinary, ghCmdPR, ghSubcmdDiff, numStr, ghFlagRepo, repo)
+	diffOut, dErr := runner(ctx, ghBinary, ghCmdPR, ghSubcmdDiff, numStr, ghFlagRepo, repo)
 	insp := &PRInspection{
 		Repo:         repo,
 		Number:       num,
 		Title:        ghData.Title,
 		State:        ghData.State,
 		Author:       ghData.Author.Login,
-		URL:          firstNonEmptyStr(ghData.URL, fmt.Sprintf(githubPRURLFormat, repo, num)),
+		URL:          FirstNonEmptyStr(ghData.URL, fmt.Sprintf(githubPRURLFormat, repo, num)),
 		HeadRef:      ghData.HeadRefName,
 		BaseRef:      ghData.BaseRefName,
 		Additions:    ghData.Additions,
@@ -445,6 +522,9 @@ func fetchPRViaGHCLI(ctx context.Context, runner CommandRunner, repo string, num
 		ChangedFiles: ghData.ChangedFiles,
 		Body:         ghData.Body,
 		UnifiedDiff:  string(diffOut),
+	}
+	if dErr != nil {
+		insp.DiffError = fmt.Sprintf(ghPRDiffHintFormat+" failed: %v", num, repo, dErr)
 	}
 	for _, f := range ghData.Files {
 		insp.Files = append(insp.Files, PRFileChange{
@@ -496,8 +576,15 @@ func splitUnifiedDiffByFile(diff string) map[string]string {
 	if strings.TrimSpace(diff) == "" {
 		return out
 	}
-	chunks := strings.Split(diff, diffHeaderPrefix)
-	for _, chunk := range chunks {
+	// Anchor the split to line starts: hunk body lines always begin with '+', '-', ' ' or '\',
+	// so a literal "diff --git " inside a patch body (a committed .patch file, a test fixture
+	// embedding a sample diff) must not start a new chunk or truncate the enclosing one.
+	chunks := strings.Split("\n"+diff, "\n"+diffHeaderPrefix)
+	for i := 1; i < len(chunks); i++ {
+		chunk := chunks[i]
+		if i < len(chunks)-1 {
+			chunk += "\n" // re-attach the line terminator consumed by the separator
+		}
 		if strings.TrimSpace(chunk) == "" {
 			continue
 		}
@@ -507,14 +594,27 @@ func splitUnifiedDiffByFile(diff string) map[string]string {
 		if firstLineEnd >= 0 {
 			firstLine = chunk[:firstLineEnd]
 		}
-		if idx := strings.LastIndex(firstLine, bSidePrefix); idx >= 0 {
-			filePath := strings.TrimSpace(firstLine[idx+len(bSidePrefix):])
-			if filePath != "" {
-				out[filePath] = fullChunk
-			}
+		if filePath := diffHeaderBSidePath(firstLine); filePath != "" {
+			out[filePath] = fullChunk
 		}
 	}
 	return out
+}
+
+// diffHeaderBSidePath extracts the post-image path from the remainder of a
+// `diff --git a/<path> b/<path>` header line, tolerating git's C-style quoting
+// (`diff --git "a/p q" "b/p q"`) used for paths with spaces or special characters.
+func diffHeaderBSidePath(firstLine string) string {
+	line := strings.TrimSpace(firstLine)
+	if idx := strings.LastIndex(line, quotedBSidePrefix); idx >= 0 {
+		if unquoted, err := strconv.Unquote(line[idx+1:]); err == nil {
+			return strings.TrimPrefix(unquoted, "b/")
+		}
+	}
+	if idx := strings.LastIndex(line, bSidePrefix); idx >= 0 {
+		return strings.TrimSpace(line[idx+len(bSidePrefix):])
+	}
+	return ""
 }
 
 // sameNameRepo returns defaultRepo when guessed is a different owner/repo with the same repository
@@ -536,7 +636,7 @@ func sameNameRepo(guessed, defaultRepo string) string {
 	return ""
 }
 
-// FormatPRInspectionMarkdown renders a GitHub PR with clickable file:// diff links for Antigravity.
+// FormatPRInspectionMarkdown renders a GitHub PR with clickable file:// diff links.
 func FormatPRInspectionMarkdown(insp *PRInspection) string {
 	if insp == nil {
 		return ""
@@ -544,12 +644,15 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "## 🔀 Pull Request [%s#%d](%s): %s\n\n", insp.Repo, insp.Number, insp.URL, insp.Title)
 	fmt.Fprintf(&sb, "- **State**: `%s` | **Author**: `%s` | **Branch**: `%s` → `%s`\n",
-		insp.State, firstNonEmptyStr(insp.Author, "—"), insp.HeadRef, insp.BaseRef)
+		insp.State, FirstNonEmptyStr(insp.Author, "—"), insp.HeadRef, insp.BaseRef)
 	fmt.Fprintf(&sb, "- **Changes**: `+ %d` / `- %d` across `%d` file(s)\n",
 		insp.Additions, insp.Deletions, insp.ChangedFiles)
 	if insp.DiffFilePath != "" {
-		fmt.Fprintf(&sb, "- **Native Antigravity Unified Diff File**: [%s](%s%s)\n",
+		fmt.Fprintf(&sb, "- **Unified Diff File**: [%s](%s%s)\n",
 			filepath.Base(insp.DiffFilePath), fileSchemePrefix, insp.DiffFilePath)
+	} else if insp.DiffError != "" {
+		fmt.Fprintf(&sb, "- **Unified Diff**: ⚠️ not available — %s. Fetch it locally with `"+ghPRDiffHintFormat+"`.\n",
+			insp.DiffError, insp.Number, insp.Repo)
 	}
 	if insp.SummaryFilePath != "" {
 		fmt.Fprintf(&sb, "- **Local PR Summary Markdown**: [%s](%s%s)\n",
@@ -563,7 +666,7 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 	}
 
 	if len(insp.Files) > 0 {
-		sb.WriteString("### 📂 Changed Files (Click Patch Link to Open in Antigravity Viewer)\n\n")
+		sb.WriteString("### 📂 Changed Files (Click Patch Link to Open in Viewer)\n\n")
 		sb.WriteString("| File | Status | Additions | Deletions | Native Patch Link |\n")
 		sb.WriteString("| :--- | :--- | ---: | ---: | :--- |\n")
 		for _, f := range insp.Files {
@@ -572,7 +675,7 @@ func FormatPRInspectionMarkdown(insp *PRInspection) string {
 				patchLink = fmt.Sprintf("[%s](%s%s)", filepath.Base(f.PatchPath), fileSchemePrefix, f.PatchPath)
 			}
 			fmt.Fprintf(&sb, "| `%s` | `%s` | `+%d` | `-%d` | %s |\n",
-				f.Path, firstNonEmptyStr(f.Status, "modified"), f.Additions, f.Deletions, patchLink)
+				f.Path, FirstNonEmptyStr(f.Status, "modified"), f.Additions, f.Deletions, patchLink)
 		}
 		sb.WriteString("\n")
 	}

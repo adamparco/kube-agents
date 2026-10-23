@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-// CommandRunner abstracts external command execution for local IPC/CLI helpers (agentapi, gh) and testing.
+// CommandRunner abstracts external command execution for local CLI helpers (such as gh) and testing.
 type CommandRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
 // DefaultCommandRunner executes a command with process-group termination on context cancellation.

@@ -3,12 +3,15 @@ package kube
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -23,14 +26,14 @@ import (
 const (
 	contextProbeTimeout      = 10 * time.Second
 	credsFetchTimeout        = 10 * time.Second
-	consoleAuthField         = "console-password"
-	gatewayAuthField         = "gateway-password"
 	k8sConditionReady        = "Ready"
 	k8sStatusTrue            = "True"
 	maxDiscoveryWorkers      = 8
 	crdAbsPathPlatformAgents = "/apis/kubeagents.x-k8s.io/v1alpha1/platformagents"
 	crdAbsPathAgentProfiles  = "/apis/kubeagents.x-k8s.io/v1alpha1/agentprofiles"
 )
+
+var errEmptyMCPToken = errors.New("empty token in Secret")
 
 type k8sPlatformAgentList struct {
 	Items []k8sPlatformAgentItem `json:"items"`
@@ -44,7 +47,6 @@ type k8sPlatformAgentItem struct {
 	} `json:"metadata"`
 	Spec struct {
 		Mode       string `json:"mode"`
-		Version    string `json:"version"`
 		Deployment struct {
 			Tag string `json:"tag"`
 		} `json:"deployment"`
@@ -58,9 +60,8 @@ type k8sPlatformAgentItem struct {
 				GitRepo string `json:"gitRepo"`
 			} `json:"github"`
 			GoogleChat map[string]any `json:"googleChat"`
-			GChat      map[string]any `json:"gchat"`
 			Slack      map[string]any `json:"slack"`
-			Discord    map[string]any `json:"discord"`
+			Teams      map[string]any `json:"teams"`
 		} `json:"integration"`
 	} `json:"spec"`
 	Status struct {
@@ -86,8 +87,6 @@ type k8sAgentProfileList struct {
 			Namespace string `json:"namespace"`
 		} `json:"metadata"`
 		Spec struct {
-			// ClusterRef is set on cluster-scoped specialist profiles only (per the
-			// AgentProfile CRD); interactive session profiles leave it empty.
 			ClusterRef *struct {
 				Cluster   string `json:"cluster"`
 				Location  string `json:"location"`
@@ -132,8 +131,9 @@ func listKubeContextsClientGo(trimmedFilter string) ([]string, error) {
 }
 
 // DiscoverDeployments scans Kubernetes contexts (or a single filtered context) in parallel
-// for PlatformAgent resources and returns discovered DeploymentProfiles.
-func DiscoverDeployments(ctx context.Context, kubeContextFilter string, includeCredentials bool) ([]mcpbridge.DeploymentProfile, error) {
+// for PlatformAgent resources and returns discovered DeploymentProfiles. Discovery is
+// metadata-only and never reads cluster Secrets.
+func DiscoverDeployments(ctx context.Context, kubeContextFilter string) ([]mcpbridge.DeploymentProfile, error) {
 	trimmedFilter := strings.TrimSpace(kubeContextFilter)
 	contexts, err := listKubeContextsClientGo(trimmedFilter)
 	if err != nil {
@@ -145,6 +145,7 @@ func DiscoverDeployments(ctx context.Context, kubeContextFilter string, includeC
 
 	type result struct {
 		profiles []mcpbridge.DeploymentProfile
+		err      error
 	}
 	results := make([]result, len(contexts))
 	sem := make(chan struct{}, maxDiscoveryWorkers)
@@ -157,56 +158,65 @@ func DiscoverDeployments(ctx context.Context, kubeContextFilter string, includeC
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			profiles := probeKubeContext(ctx, kubeCtx, includeCredentials)
-			results[idx] = result{profiles: profiles}
+			profiles, probeErr := probeKubeContext(ctx, kubeCtx)
+			results[idx] = result{profiles: profiles, err: probeErr}
 		}(i, kctx)
 	}
 	wg.Wait()
 
 	var all []mcpbridge.DeploymentProfile
-	nameCounts := make(map[string]int)
-	for _, r := range results {
-		for _, p := range r.profiles {
-			nameCounts[p.Name]++
-			all = append(all, p)
+	var failures []mcpbridge.DeploymentProfile
+	for i, r := range results {
+		if r.err != nil {
+			failures = append(failures, mcpbridge.ContextProbeFailure(contexts[i], r.err))
+			continue
 		}
-	}
-	for i := range all {
-		if nameCounts[all[i].Name] > 1 && all[i].KubeContext != "" {
-			all[i].Name = all[i].KubeContext + "/" + all[i].Name
-		}
+		all = append(all, r.profiles...)
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Ready != all[j].Ready {
 			return all[i].Ready
 		}
-		return all[i].Name < all[j].Name
+		if all[i].Name != all[j].Name {
+			return all[i].Name < all[j].Name
+		}
+		return all[i].KubeContext < all[j].KubeContext
 	})
+	all = append(all, failures...)
+	if len(failures) == len(contexts) {
+		return all, mcpbridge.NewDiscoveryError(failures)
+	}
 	return all, nil
 }
 
-func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bool) []mcpbridge.DeploymentProfile {
+func probeKubeContext(ctx context.Context, kubeCtx string) ([]mcpbridge.DeploymentProfile, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, contextProbeTimeout)
 	defer cancel()
 
 	restCfg, err := restConfigForKubeContext(kubeCtx)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("loading kubeconfig: %w", err)
 	}
 	restCfg.Timeout = contextProbeTimeout
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("creating client: %w", err)
 	}
 	out, err := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathPlatformAgents).DoRaw(probeCtx)
 	if err != nil {
-		return nil
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("listing PlatformAgents: %s", describeAPIError(err, out))
 	}
 	profOut, profErr := clientset.Discovery().RESTClient().Get().AbsPath(crdAbsPathAgentProfiles).DoRaw(probeCtx)
 
 	var paList k8sPlatformAgentList
-	if err := json.Unmarshal(out, &paList); err != nil || len(paList.Items) == 0 {
-		return nil
+	if err := json.Unmarshal(out, &paList); err != nil {
+		return nil, fmt.Errorf("decoding PlatformAgent list: %w", err)
+	}
+	if len(paList.Items) == 0 {
+		return nil, nil
 	}
 
 	profilesByNS := make(map[string][]string)
@@ -214,14 +224,21 @@ func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bo
 		var apList k8sAgentProfileList
 		if json.Unmarshal(profOut, &apList) == nil {
 			for _, item := range apList.Items {
-				// Only interactive (non cluster-scoped) profiles are projected as fleet agents;
-				// the CRD marks cluster specialists structurally through spec.clusterRef.
 				if item.Spec.ClusterRef != nil {
 					continue
 				}
 				profilesByNS[item.Metadata.Namespace] = append(profilesByNS[item.Metadata.Namespace], item.Metadata.Name)
 			}
 		}
+	}
+
+	aliasCounts := make(map[string]int, len(paList.Items))
+	for _, item := range paList.Items {
+		alias := item.Spec.Harness.ClusterName
+		if alias == "" {
+			alias = item.Metadata.Name
+		}
+		aliasCounts[alias]++
 	}
 
 	now := time.Now().UTC()
@@ -232,6 +249,9 @@ func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bo
 		alias := item.Spec.Harness.ClusterName
 		if alias == "" {
 			alias = paName
+		}
+		if aliasCounts[alias] > 1 && ns != "" {
+			alias = ns + "/" + alias
 		}
 		ready := false
 		statusMsg := ""
@@ -244,17 +264,14 @@ func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bo
 		}
 		chatPlat := mcpbridge.ChatPlatformConsoleOnly
 		switch {
-		case len(item.Spec.Integration.GoogleChat) > 0 || len(item.Spec.Integration.GChat) > 0:
+		case len(item.Spec.Integration.GoogleChat) > 0:
 			chatPlat = mcpbridge.ChatPlatformGChat
 		case len(item.Spec.Integration.Slack) > 0:
 			chatPlat = mcpbridge.ChatPlatformSlack
-		case len(item.Spec.Integration.Discord) > 0:
-			chatPlat = mcpbridge.ChatPlatformDiscord
+		case len(item.Spec.Integration.Teams) > 0:
+			chatPlat = mcpbridge.ChatPlatformTeams
 		}
-		version := item.Spec.Version
-		if version == "" {
-			version = item.Spec.Deployment.Tag
-		}
+		version := item.Spec.Deployment.Tag
 		helmChart := ""
 		if item.Metadata.Labels != nil {
 			helmChart = strings.TrimSpace(item.Metadata.Labels["helm.sh/chart"])
@@ -273,10 +290,9 @@ func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bo
 			Location:             item.Spec.Harness.Location,
 			GitHubRepo:           item.Spec.Integration.GitHub.GitRepo,
 			ChatPlatform:         chatPlat,
-			NATSService:          paName + mcpbridge.NATSServiceSuffix,
-			NATSPort:             mcpbridge.DefaultNATSPort,
-			CredsObjectName:      paName + mcpbridge.CredsObjectSuffix,
-			BusUser:              mcpbridge.DefaultBusUser,
+			MCPService:           paName + mcpbridge.MCPServiceSuffix,
+			MCPPort:              mcpbridge.DefaultMCPPort,
+			TokenSecretName:      paName + mcpbridge.MCPTokenSecretSuffix,
 			Ready:                ready,
 			StatusMessage:        statusMsg,
 			AgentProfiles:        profilesByNS[ns],
@@ -286,26 +302,38 @@ func probeKubeContext(ctx context.Context, kubeCtx string, includeCredentials bo
 			RemediationsMerged:   item.Status.Usage.RemediationsMergedTotal,
 			LastDiscoveredAt:     now,
 		}
-		mcpbridge.EnrichDeploymentVersionStatus(ctx, &prof)
-		if includeCredentials {
-			_ = PopulateDeploymentCredentials(ctx, &prof)
-		}
 		discovered = append(discovered, prof)
 	}
-	return discovered
+	return discovered, nil
 }
 
-// PopulateDeploymentCredentials fetches the NATS console and gateway credentials
-// from the deployment's Kubernetes Secret if not already populated.
+func describeAPIError(err error, body []byte) string {
+	var st metav1.Status
+	if len(body) > 0 && json.Unmarshal(body, &st) == nil && strings.TrimSpace(st.Message) != "" {
+		return strings.TrimSpace(st.Message)
+	}
+	return err.Error()
+}
+
+// PopulateDeploymentCredentials reads the in-cluster a2a-mcp bearer token from
+// KUBE_AGENTS_MCP_TOKEN or the deployment's <agent>-a2a-mcp-token Secret (key "token")
+// into prof.MCPToken (held in memory only).
 func PopulateDeploymentCredentials(ctx context.Context, prof *mcpbridge.DeploymentProfile) error {
-	if prof == nil || prof.KubeContext == "" || prof.Namespace == "" {
+	if prof == nil {
 		return nil
 	}
-	credsName := prof.CredsObjectName
-	if credsName == "" && prof.PlatformAgentName != "" {
-		credsName = prof.PlatformAgentName + mcpbridge.CredsObjectSuffix
+	if envTok := strings.TrimSpace(os.Getenv(mcpbridge.EnvMCPToken)); envTok != "" {
+		prof.MCPToken = envTok
+		return nil
 	}
-	if credsName == "" {
+	if prof.KubeContext == "" || prof.Namespace == "" {
+		return nil
+	}
+	secretName := strings.TrimSpace(prof.TokenSecretName)
+	if secretName == "" && prof.PlatformAgentName != "" {
+		secretName = prof.PlatformAgentName + mcpbridge.MCPTokenSecretSuffix
+	}
+	if secretName == "" {
 		return nil
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, credsFetchTimeout)
@@ -320,18 +348,18 @@ func PopulateDeploymentCredentials(ctx context.Context, prof *mcpbridge.Deployme
 	if err != nil {
 		return fmt.Errorf("creating k8s client for %s: %w", prof.KubeContext, err)
 	}
-	secret, err := clientset.CoreV1().Secrets(prof.Namespace).Get(fetchCtx, credsName, metav1.GetOptions{})
+	secret, err := clientset.CoreV1().Secrets(prof.Namespace).Get(fetchCtx, secretName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("fetching credentials object %s/%s: %w", prof.Namespace, credsName, err)
+		return fmt.Errorf("fetching MCP token Secret %s/%s: %w", prof.Namespace, secretName, err)
 	}
-	if raw, ok := secret.Data[consoleAuthField]; ok {
-		prof.BusAuthValue = strings.TrimSpace(string(raw))
+	raw, ok := secret.Data[mcpbridge.MCPTokenSecretKey]
+	if !ok {
+		return fmt.Errorf("MCP token Secret %s/%s missing %q key: %w", prof.Namespace, secretName, mcpbridge.MCPTokenSecretKey, errEmptyMCPToken)
 	}
-	if raw, ok := secret.Data[gatewayAuthField]; ok {
-		prof.ObserverAuthValue = strings.TrimSpace(string(raw))
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return fmt.Errorf("MCP token Secret %s/%s has empty %q: %w", prof.Namespace, secretName, mcpbridge.MCPTokenSecretKey, errEmptyMCPToken)
 	}
-	if prof.BusUser == "" {
-		prof.BusUser = mcpbridge.DefaultBusUser
-	}
+	prof.MCPToken = token
 	return nil
 }

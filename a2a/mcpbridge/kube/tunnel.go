@@ -36,9 +36,9 @@ var (
 	errPortForwardTimedOut = errors.New("timed out waiting for port-forward to bind local port")
 )
 
-// PortForwardTunnel manages a persistent in-process SPDY port-forward to a service in the deployment
-// (the a2a-gateway MCP listener),
-// automatically restarting the tunnel on the same local port if the connection drops.
+// PortForwardTunnel manages a persistent in-process SPDY port-forward to the deployment's
+// <agent>-a2a-mcp Service, automatically restarting the tunnel on the same local port if
+// the connection drops.
 type PortForwardTunnel struct {
 	kubeContext string
 	namespace   string
@@ -56,17 +56,16 @@ type PortForwardTunnel struct {
 	readyCh      chan struct{}
 }
 
-// StartPortForward starts a supervised in-process SPDY port-forward to the service named by prof
-// and waits until the local TCP port is accepting connections. StartGatewayPortForward is the
-// entry point the bridge uses; this lower-level form is kept for callers that target another port.
+// StartPortForward starts a supervised in-process SPDY port-forward to the MCP service named by prof
+// and waits until the local TCP port is accepting connections.
 func StartPortForward(ctx context.Context, prof mcpbridge.DeploymentProfile) (*PortForwardTunnel, error) {
-	remotePort := prof.NATSPort
+	remotePort := prof.MCPPort
 	if remotePort <= 0 {
-		remotePort = mcpbridge.DefaultNATSPort
+		remotePort = mcpbridge.DefaultMCPPort
 	}
-	svc := prof.NATSService
-	if svc == "" {
-		svc = prof.PlatformAgentName + mcpbridge.NATSServiceSuffix
+	svc := prof.MCPService
+	if svc == "" && prof.PlatformAgentName != "" {
+		svc = prof.PlatformAgentName + mcpbridge.MCPServiceSuffix
 	}
 	localPort, err := allocateFreeLocalPort()
 	if err != nil {
@@ -98,20 +97,22 @@ func StartPortForward(ctx context.Context, prof mcpbridge.DeploymentProfile) (*P
 	}
 }
 
-// MCPURL returns the local http:// URL for the port-forwarded gateway MCP tunnel.
+// MCPURL returns the local http:// URL for the port-forwarded a2a-mcp tunnel.
 func (t *PortForwardTunnel) MCPURL() string {
 	return fmt.Sprintf("%s%s:%d", httpSchemePrefix, loopbackHost, t.localPort)
 }
 
 // StartGatewayPortForward starts a supervised in-process SPDY port-forward to the deployment's
-// a2a-gateway MCP HTTP listener (default port 8089) and waits until the local TCP port is ready.
+// <agent>-a2a-mcp HTTP listener (default port 8089) and waits until the local TCP port is ready.
 func StartGatewayPortForward(ctx context.Context, prof mcpbridge.DeploymentProfile) (*PortForwardTunnel, error) {
-	gwProf := prof
-	if gwProf.PlatformAgentName != "" {
-		gwProf.NATSService = gwProf.PlatformAgentName + mcpbridge.GatewayServiceSuffix
+	mcpProf := prof
+	if mcpProf.MCPService == "" && mcpProf.PlatformAgentName != "" {
+		mcpProf.MCPService = mcpProf.PlatformAgentName + mcpbridge.MCPServiceSuffix
 	}
-	gwProf.NATSPort = mcpbridge.DefaultMCPPort
-	return StartPortForward(ctx, gwProf)
+	if mcpProf.MCPPort <= 0 {
+		mcpProf.MCPPort = mcpbridge.DefaultMCPPort
+	}
+	return StartPortForward(ctx, mcpProf)
 }
 
 // Close stops the port-forward supervisor and closes any active tunnel stream.
@@ -133,8 +134,6 @@ func (t *PortForwardTunnel) Close() {
 
 // Restart terminates the current port-forward stream so the supervisor loop immediately
 // opens a fresh SPDY tunnel on the same local port.
-// Rate-limited to at most once every 3 seconds so concurrent NATS connections
-// (console + observer) do not double-restart the same tunnel.
 func (t *PortForwardTunnel) Restart() {
 	if t == nil {
 		return
@@ -171,7 +170,6 @@ func (t *PortForwardTunnel) supervise(ctx context.Context) {
 		if time.Since(startedAt) >= portForwardHealthyReset {
 			backoff = portForwardMinBackoff
 		}
-		// If Restart() explicitly triggered the close, reconnect immediately without sleeping.
 		select {
 		case <-ctx.Done():
 			return
